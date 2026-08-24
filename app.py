@@ -1321,13 +1321,15 @@ async def collect_stock_videos(
     else:
         pool = []
         origin = "live"
-        for query in (plan or stock_query_plan(keyword_data)):
+        plan_queries = plan or stock_query_plan(keyword_data)
+        query_total = max(1, len(plan_queries))
+        for q_idx, query in enumerate(plan_queries):
+            set_status(progress=5 + 20 * (q_idx / query_total), message=f"Searching stock ({q_idx + 1}/{query_total}): {query}")
             found, origin = await search_query(query, 0, broaden=False)
             pool.extend(found)
         pool = [candidate for candidate in pool if keep_candidate(candidate, 0)]
         pool = dedupe_candidates(pool)
-        print(f"  provider={source} origin={origin} pool={len(pool)} queries={len(plan or [])}")
-        plan_queries = plan or stock_query_plan(keyword_data)
+        print(f"  provider={source} origin={origin} pool={len(pool)} queries={len(plan_queries)}")
         for idx, item in enumerate(keyword_data):
             ranked = rank_scene_candidates(
                 pool,
@@ -1391,6 +1393,19 @@ async def collect_stock_videos(
                     return None
         return None
 
+    def report_download_progress(phase="required"):
+        kept = sum(len(group) for group in selected)
+        scene_n = max(1, len(keyword_data))
+        required_total = needed * scene_n
+        if phase == "spare":
+            extra = max(0, kept - required_total)
+            spare_total = SPARE_CLIPS_PER_SCENE * scene_n
+            frac = extra / max(1, spare_total)
+            set_status(progress=80 + 15 * frac, message=f"Downloading spare clips {extra}/{spare_total}...")
+            return
+        frac = min(1.0, kept / max(1, required_total))
+        set_status(progress=10 + 70 * frac, message=f"Downloading clips {kept}/{required_total}...")
+
     round_idx = 0
     while round_idx < needed and not abort_provider:
         progressed = False
@@ -1401,6 +1416,7 @@ async def collect_stock_videos(
             if chosen:
                 selected[scene_index].append(chosen)
                 progressed = True
+                report_download_progress()
             if abort_provider:
                 break
         if not progressed:
@@ -1433,6 +1449,7 @@ async def collect_stock_videos(
                 if not chosen:
                     break
                 selected[scene_index].append(chosen)
+                report_download_progress()
             if abort_provider:
                 return
 
@@ -1451,6 +1468,7 @@ async def collect_stock_videos(
                 if not chosen:
                     break
                 selected[scene_index].append(chosen)
+                report_download_progress("spare")
 
     visual_cap = needed * clip_duration
     scenes_for_coverage = []
@@ -1799,6 +1817,7 @@ async def run_scrape(request: ScrapeRequest):
                         topic=(request.query or script[:160]).strip(),
                         enable_fallback=bool(request.provider_fallback),
                     )
+                    result_rows = []
                     for item in keyword_data:
                         valid_paths = existing_media_paths(item.get("_files"))
                         rel_paths = []
@@ -1808,7 +1827,32 @@ async def run_scrape(request: ScrapeRequest):
                             except Exception:
                                 rel_paths.append(str(path))
                         if rel_paths:
-                            scraping_status["results"].append({"keyword": item["keyword"], "sentence": item["sentence"], "files": rel_paths})
+                            result_rows.append({"keyword": item["keyword"], "sentence": item["sentence"], "files": rel_paths})
+                    review_eligible = request.auto_video and use_stock_pipeline and len(scripts) == 1
+                    if review_eligible:
+                        validate_scene_images(keyword_data, project_path)
+                        pending_assembly[task_id] = {
+                            "keyword_data": keyword_data,
+                            "project_path": project_path,
+                            "project_name": project_name,
+                            "media_type": media_type,
+                            "settings": settings,
+                            "api_keys": api_keys,
+                            "vibe": request.vibe,
+                            "yt_upload": request.yt_upload,
+                            "publish_confirmed": request.publish_confirmed,
+                            "scene_pools": build_scene_pools(keyword_data),
+                            "count": count,
+                        }
+                        set_status(
+                            "awaiting_review",
+                            message=f"Scraping finished. Review {len(keyword_data)} scene(s) before voiceover, or continue with the default selection.",
+                            progress=100,
+                            results=result_rows,
+                            review=build_scene_review(keyword_data, count),
+                        )
+                        return
+                    scraping_status["results"] = result_rows
                     set_status(progress=((script_idx + 0.8) / len(scripts)) * 100)
                 else:
                     for idx, item in enumerate(keyword_data):
@@ -1845,33 +1889,7 @@ async def run_scrape(request: ScrapeRequest):
                             item["_error"] = describe_empty_media_result(source, media_type)
                         set_status(progress=((script_idx) / len(scripts)) * 100 + ((idx + 1) / total) * (100 / len(scripts)) * 0.8)
 
-                # Pause before assembly so the user can review/swap scraped clips first.
-                # Only offered for the common single-project stock-video path; batch
-                # script runs keep the original single-pass behavior.
-                review_eligible = request.auto_video and use_stock_pipeline and len(scripts) == 1
-                if review_eligible:
-                    validate_scene_images(keyword_data, project_path)
-                    pending_assembly[task_id] = {
-                        "keyword_data": keyword_data,
-                        "project_path": project_path,
-                        "project_name": project_name,
-                        "media_type": media_type,
-                        "settings": settings,
-                        "api_keys": api_keys,
-                        "vibe": request.vibe,
-                        "yt_upload": request.yt_upload,
-                        "publish_confirmed": request.publish_confirmed,
-                        "scene_pools": build_scene_pools(keyword_data),
-                        "count": count,
-                    }
-                    set_status(
-                        "awaiting_review",
-                        message=f"Review {len(keyword_data)} scene(s) or continue with the default selection",
-                        progress=90,
-                        review=build_scene_review(keyword_data, count),
-                    )
-                    return
-                elif request.auto_video:
+                if request.auto_video:
                     await run_video_assembly(
                         keyword_data, project_path, project_name, media_type, settings, api_keys,
                         request.vibe, yt_upload=request.yt_upload, publish_confirmed=request.publish_confirmed,

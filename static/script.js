@@ -942,8 +942,12 @@ document.addEventListener('DOMContentLoaded', () => {
                     finalVideoUrl = status.final_video;
                 }
                 candidateVideos = status.candidates || [];
-                if ((status.results && status.results.length > 0) || finalVideoUrl || candidateVideos.length) updateGallery(status.results || []);
-                if (!status.is_running) {
+                if (((status.results && status.results.length > 0) || finalVideoUrl || candidateVideos.length) && status.status !== 'awaiting_review') {
+                    updateGallery(status.results || []);
+                }
+                if (status.status === 'awaiting_review') {
+                    setLoading(true, 'Waiting for review');
+                } else if (!status.is_running) {
                     clearInterval(statusInterval);
                     statusInterval = null;
                     setLoading(false);
@@ -974,9 +978,9 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             candidateVideos = status.candidates || [];
 
-            if (status.results && status.results.length > 0) {
+            if (status.status !== 'awaiting_review' && status.results && status.results.length > 0) {
                 updateGallery(status.results);
-            } else if (finalVideoUrl || candidateVideos.length) {
+            } else if (status.status !== 'awaiting_review' && (finalVideoUrl || candidateVideos.length)) {
                 updateGallery([]);
             }
 
@@ -987,7 +991,7 @@ document.addEventListener('DOMContentLoaded', () => {
             maybeShowReviewPrompt(status);
 
             if (status.is_running) {
-                setLoading(true);
+                setLoading(true, status.status === 'awaiting_review' ? 'Waiting for review' : undefined);
                 startPollingStatus();
             } else {
                 setLoading(false);
@@ -1081,7 +1085,8 @@ document.addEventListener('DOMContentLoaded', () => {
     function renderStatus(status) {
         const progress = normalizeProgress(status.progress);
         const failed = isFailureStatus(status);
-        statusMsg.textContent = status.error || status.message || (failed ? 'Generation failed' : 'Working...');
+        const reviewing = status.status === 'awaiting_review';
+        statusMsg.textContent = status.error || status.message || (failed ? 'Generation failed' : reviewing ? 'Scraping finished. Waiting for review.' : 'Working...');
         statusCard.classList.toggle('status-error', failed);
         statusPercent.textContent = `${progress}%`;
         progressFill.style.width = `${progress}%`;
@@ -1099,13 +1104,13 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    function setLoading(loading) {
+    function setLoading(loading, label) {
         scrapeBtn.disabled = loading;
         const btnText = scrapeBtn.querySelector('.btn-text');
         const btnLoader = scrapeBtn.querySelector('.btn-loader');
         const btnIcon = scrapeBtn.querySelector('.fa-rocket');
         if (loading) {
-            btnText.textContent = 'Working...';
+            btnText.textContent = label || 'Working...';
             if (btnLoader) btnLoader.classList.remove('hidden');
             if (btnIcon) btnIcon.classList.add('hidden');
         } else {
@@ -1197,7 +1202,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (reviewSwap) reviewSwap.classList.add('hidden');
         const introText = document.getElementById('review-intro-text');
         if (introText) {
-            introText.textContent = `Scraping is done for ${review.scenes.length} scene(s). Review and swap clips before VUZA generates voiceover and assembles the video, or continue with the default pick.`;
+            introText.textContent = `All clips are downloaded for ${review.scenes.length} scene(s). Review and swap before voiceover, or continue with the default pick.`;
         }
         if (reviewOverlay) reviewOverlay.classList.remove('hidden');
     }
@@ -1255,10 +1260,11 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function maybeShowReviewPrompt(status) {
-        if (status && status.status === 'awaiting_review' && status.review && status.task_id && status.task_id !== reviewShownTaskId) {
-            reviewShownTaskId = status.task_id;
-            openReviewModal(status.review);
-        }
+        if (!status || status.status !== 'awaiting_review' || Number(status.progress) < 100 || !status.task_id || status.task_id === reviewShownTaskId) return;
+        const scenes = status.review && status.review.scenes;
+        if (!Array.isArray(scenes) || !scenes.length) return;
+        reviewShownTaskId = status.task_id;
+        openReviewModal(status.review);
     }
 
     function showToast(message, type = 'success') {

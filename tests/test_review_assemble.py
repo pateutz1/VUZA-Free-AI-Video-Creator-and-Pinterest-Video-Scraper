@@ -166,7 +166,7 @@ class StatusReviewStateTests(unittest.TestCase):
         )
 
     def test_awaiting_review_keeps_is_running_true(self):
-        app_module.set_status("awaiting_review", message="Review", progress=90, review={"scenes": []})
+        app_module.set_status("awaiting_review", message="Review", progress=100, review={"scenes": []})
         self.assertTrue(scraping_status["is_running"])
 
     def test_running_then_success_flips_is_running(self):

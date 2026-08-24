@@ -38,6 +38,19 @@ def get_async_playwright():
     return async_playwright
 
 PIN_HREF_RE = re.compile(r"/pin/([^/?#]+)", re.IGNORECASE)
+PROMO_PIN_RE = re.compile(
+    r"\b(follow|subscribe|shop now|link in bio|promo code|discount code|#ad|click here|tiktok|instagram)\b",
+    re.I,
+)
+
+
+def is_text_heavy_pin(item):
+    title = str((item or {}).get("title") or "")
+    if not title:
+        return False
+    if PROMO_PIN_RE.search(title):
+        return True
+    return any(mark in title for mark in ('"', "“", "”"))
 
 
 def parse_pinterest_pin_hrefs(hrefs):
@@ -159,6 +172,7 @@ def parse_pinterest_resource_results(data, want_video=False):
             "asset_id": pin_id,
             "url": (rendition or {}).get("url") or source_page,
             "source_page": source_page,
+            "title": str(item.get("grid_title") or item.get("title") or "")[:200],
             "creator": ((item.get("pinner") or {}).get("username") if isinstance(item.get("pinner"), dict) else "") or "",
             "duration": float((rendition or {}).get("duration") or 0),
             "width": int((rendition or {}).get("width") or 0),
@@ -403,6 +417,8 @@ class PinterestScraper:
         for item in items or []:
             url = item.get("url") or ""
             if not is_pinterest_direct_file_url(url):
+                continue
+            if is_text_heavy_pin(item):
                 continue
             videos.append(item)
         return videos
@@ -1405,35 +1421,42 @@ class LLMProcessor:
             print(f"❌ {self.last_error}")
             return None
 
-    def extract_keywords(self, script, vibe="aesthetic", language="", topic=""):
+    def extract_keywords(self, script, vibe="aesthetic", language="", topic="", scenes=None):
         if not self.api_key:
             self.last_error = "No AI API key was provided. Add one in API settings."
             print("⚠️ LLM API key not set! Please add your AI API key in settings.")
             return []
 
-        stock_rules = """Keywords are Pinterest/Pexels/Pixabay/Coverr SEARCH QUERIES, one per narration sentence, in narration order.
+        stock_rules = """Keywords are Pinterest/Pexels/Pixabay/Coverr SEARCH QUERIES in narration order.
 Rules:
-- Each query must be 2-4 concrete English words (up to 6 only if needed).
-- Include the main subject or global visual anchor from the VIDEO TOPIC.
-- Describe a visible subject, action, environment, or defining object.
-- Stay grounded in the complete topic AND the current narration sentence.
-- NEVER use abstract concepts, slogans, emotions, camera instructions, hashtags, or vibe suffixes (aesthetic, lofi, cinematic).
-- Do not invent a different setting than the topic.
+- Each query must be 3-5 concrete English words (2 only if needed).
+- Include a visible noun from the VIDEO TOPIC plus the action/object in that scene.
+- Stay in the topic's real setting. Do not illustrate slogans or metaphors as isolated body closeups.
+- No on-screen text, quotes, subtitles, logos, ads, camera instructions, hashtags, or vibe suffixes.
 Return format strictly: Sentence → keyword"""
+        if scenes:
+            stock_rules = """You will receive numbered narration scenes (already grouped phrases).
+Write exactly one stock-footage query per scene, same order.
+Rules:
+- 3-5 concrete English words (2 only if needed).
+- Include a visible noun from the VIDEO TOPIC plus the action in that scene.
+- Stay in the topic's real setting. Do not illustrate slogans or metaphors as isolated body closeups.
+- No on-screen text, quotes, subtitles, logos, ads, camera instructions, hashtags, or vibe suffixes.
+Return format strictly: <scene text> → keyword"""
         prompts = {
-            "aesthetic": f"Break the script into sentences in order. For each, give 1 concrete stock-footage query. {stock_rules}",
-            "lofi": f"Break the script into sentences in order. For each, give 1 concrete stock-footage query naming a real scene. {stock_rules}",
-            "general": f"Break this script into sentences in order. For each sentence, give 1 concrete English stock query. {stock_rules}",
-            "suspense_cn": """把中文悬疑短视频旁白按原句顺序拆开。
-对每一句生成 1 个英文素材搜索关键词，必须是 Pexels/Pixabay/Coverr 容易搜到的具体画面。
+            "aesthetic": f"Give concrete stock-footage queries. {stock_rules}",
+            "lofi": f"Give concrete stock-footage queries naming a real scene. {stock_rules}",
+            "general": f"Give concrete English stock queries. {stock_rules}",
+            "suspense_cn": """把旁白场景按顺序处理。
+对每一场生成 1 个英文素材搜索关键词，必须是 Pexels/Pixabay/Coverr 容易搜到的具体画面。
 规则:
-- 左边保留原中文旁白句子。
-- 右边只写英文关键词，2-4 个词（必要时最多 6 个），不要中文，不要抽象词，不要 hashtag，不要 cinematic/aesthetic 后缀。
-- 关键词要包含主题里的可见主体，并描述当前句子能拍到的主体、动作、环境或物体。
+- 左边保留原旁白。
+- 右边只写英文关键词，3-5 个词，不要中文，不要抽象词，不要 hashtag，不要 cinematic/aesthetic 后缀。
+- 关键词要包含主题里的可见主体，并描述当前场景能拍到的主体、动作、环境或物体。
 - 不要输出解释、编号、镜头指令或角色名。
 返回格式严格为: 中文句子 → english keyword""",
-            "futuristic": f"Break script into sentences in order. For each, give 1 concrete stock query of a visible futuristic scene. {stock_rules}",
-            "black_and_white": f"Break script into sentences in order. For each, give 1 concrete stock query of a visible noir/vintage scene. {stock_rules}",
+            "futuristic": f"Give concrete stock queries of a visible futuristic scene. {stock_rules}",
+            "black_and_white": f"Give concrete stock queries of a visible noir/vintage scene. {stock_rules}",
         }
         prompt = prompts.get(vibe, prompts["aesthetic"])
         lang = (language or "").strip()
@@ -1445,10 +1468,15 @@ Return format strictly: Sentence → keyword"""
                 f"\nNarration language: {lang}. Keep the left-side sentences in that language. "
                 "Do not translate them into Chinese unless the language is Chinese."
             )
-        user_content = script
         topic = (topic or "").strip()
-        if topic:
-            user_content = f"Video topic: {topic}\n\nScript:\n{script}"
+        if scenes:
+            numbered = "\n".join(f"{idx + 1}. {block}" for idx, block in enumerate(scenes))
+            user_content = f"Video topic: {topic or script[:160]}\n\nScenes:\n{numbered}"
+        else:
+            user_content = script
+            if topic:
+                user_content = f"Video topic: {topic}\n\nScript:\n{script}"
+        from semantic_media import fallback_stock_query, ground_query
         for m in self.models:
             print(f"🤖 LLM ({m}) | Vibe: {vibe}")
             content = self._chat(
@@ -1459,9 +1487,27 @@ Return format strictly: Sentence → keyword"""
             )
             if content:
                 parsed = self._parse(content)
-                if parsed:
+                if scenes:
+                    out = []
+                    for idx, sentence in enumerate(scenes):
+                        raw = parsed[idx]["keyword"] if parsed and idx < len(parsed) else ""
+                        keyword = ground_query(raw, sentence, topic)
+                        if not keyword:
+                            keyword = fallback_stock_query(sentence, topic)
+                        if keyword:
+                            out.append({"sentence": sentence, "keyword": keyword})
+                    if out:
+                        return out
+                elif parsed:
                     return parsed
                 self.last_error = f"AI returned content, but it was not in “sentence → keyword” format: {content[:200]}"
+        if scenes:
+            out = []
+            for sentence in scenes:
+                keyword = fallback_stock_query(sentence, topic)
+                if keyword:
+                    out.append({"sentence": sentence, "keyword": keyword})
+            return out
         return []
 
     def suggest_visual_query(self, sentence, topic="", failed_queries=None):
@@ -1482,8 +1528,12 @@ Return format strictly: Sentence → keyword"""
                 max_tokens=40,
             )
             if content:
-                from semantic_media import normalize_stock_query, is_concrete_query
-                query = normalize_stock_query(content.split("\n")[0].split("→")[-1].split("->")[-1])
+                from semantic_media import ground_query, is_concrete_query
+                query = ground_query(
+                    content.split("\n")[0].split("→")[-1].split("->")[-1],
+                    sentence,
+                    topic,
+                )
                 if is_concrete_query(query):
                     return query
         return ""

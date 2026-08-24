@@ -79,15 +79,56 @@ def normalize_stock_query(keyword):
             lowered = query.lower()
             break
     words = [word for word in query.split() if word]
-    if len(words) > 6:
-        query = " ".join(words[:6])
+    if len(words) > 5:
+        query = " ".join(words[:5])
     return query
+
+
+QUERY_STOP = {
+    "the", "and", "for", "you", "your", "are", "this", "that", "with", "from",
+    "have", "will", "just", "ever", "wonder", "because", "when", "into", "about",
+    "they", "them", "their", "what", "why", "how", "not", "but", "only", "like",
+    "feels", "feel", "make", "made", "become", "watch", "start", "ready", "crush",
+    "thing", "standing", "between", "remember", "yourself", "version", "wants",
+    "those", "care", "every", "against", "today", "lace", "crank", "turn",
+}
+
+COVERAGE_SLACK_SECONDS = 1.0
+
+
+def fallback_stock_query(sentence, topic=""):
+    topic_words = []
+    if len((topic or "").split()) <= 8:
+        topic_words = [
+            word.lower()
+            for word in re.findall(r"[A-Za-z]{3,}", topic or "")
+            if word.lower() not in QUERY_STOP
+        ][:2]
+    visual = [
+        word.lower()
+        for word in re.findall(r"[A-Za-z]{3,}", sentence or "")
+        if word.lower() not in QUERY_STOP
+    ]
+    words = []
+    for word in topic_words + visual:
+        if word not in words:
+            words.append(word)
+        if len(words) >= 5:
+            break
+    return " ".join(words[:5])
+
+
+def ground_query(keyword, sentence="", topic=""):
+    kw = normalize_stock_query(keyword)
+    if kw:
+        return kw
+    return fallback_stock_query(sentence, topic)
 
 
 def is_concrete_query(keyword):
     query = normalize_stock_query(keyword)
     words = [word for word in query.split() if word]
-    if not words or len(words) > 6:
+    if not words or len(words) > 5:
         return False
     if query.startswith("#"):
         return False
@@ -230,13 +271,12 @@ def adjacent_reuse(selected_by_scene):
 def coverage_failures(selected_by_scene, scenes, clip_duration, narration_duration, provider):
     failures = []
     unique_total = unique_usable_duration(selected_by_scene, clip_duration)
-    required_total = float(narration_duration or 0)
     for index, scene in enumerate(scenes or []):
         chosen = (selected_by_scene or [None])[index] if index < len(selected_by_scene or []) else []
         available = sum(usable_duration(item.duration, clip_duration) for item in (chosen or []))
         required = float(scene.get("required_duration") or clip_duration or 0)
         query = scene.get("keyword") or scene.get("query") or ""
-        if available + 1e-6 < required:
+        if available + COVERAGE_SLACK_SECONDS < required:
             failures.append(
                 {
                     "scene": index + 1,
@@ -246,22 +286,19 @@ def coverage_failures(selected_by_scene, scenes, clip_duration, narration_durati
                     "available_duration": available,
                 }
             )
-    if required_total and unique_total + 1e-6 < required_total:
-        first = failures[0] if failures else {
-            "scene": 1,
-            "query": (scenes[0].get("keyword") if scenes else ""),
-            "provider": provider,
-            "required_duration": required_total,
-            "available_duration": unique_total,
-        }
-        first = dict(first)
-        first["unique_usable_duration"] = unique_total
-        first["narration_duration"] = required_total
-        if not failures:
-            failures.append(first)
-        else:
-            failures[0]["unique_usable_duration"] = unique_total
-            failures[0]["narration_duration"] = required_total
+    scene_required_total = sum(float(scene.get("required_duration") or 0) for scene in (scenes or []))
+    if not failures and scene_required_total and unique_total + COVERAGE_SLACK_SECONDS < scene_required_total:
+        failures.append(
+            {
+                "scene": 1,
+                "query": (scenes[0].get("keyword") if scenes else ""),
+                "provider": provider,
+                "required_duration": scene_required_total,
+                "available_duration": unique_total,
+                "unique_usable_duration": unique_total,
+                "narration_duration": float(narration_duration or scene_required_total),
+            }
+        )
     if adjacent_reuse(selected_by_scene):
         failures.append({"reason": "adjacent source reuse"})
     return failures, unique_total

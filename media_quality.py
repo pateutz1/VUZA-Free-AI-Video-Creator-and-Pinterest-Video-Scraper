@@ -122,6 +122,66 @@ def probe_video(path):
         clip.close()
 
 
+def overlay_text_score(gray):
+    import numpy as np
+
+    gray = np.asarray(gray, dtype="float32")
+    if gray.ndim != 2 or gray.size == 0:
+        return 0.0
+    height, width = gray.shape
+    if height < 16 or width < 16:
+        return 0.0
+    dx = np.abs(np.diff(gray, axis=1))
+    dy = np.abs(np.diff(gray, axis=0))
+    height_e = min(dx.shape[0], dy.shape[0])
+    width_e = min(dx.shape[1], dy.shape[1])
+    edge = (dx[:height_e, :width_e] > 28) & (dy[:height_e, :width_e] > 18)
+
+    def band_frac(start, end):
+        region = edge[start:end]
+        if region.size == 0:
+            return 0.0
+        return float((region.mean(axis=1) > 0.07).mean())
+
+    top = band_frac(0, max(1, int(height * 0.18)))
+    mid = band_frac(int(height * 0.32), int(height * 0.68))
+    bottom = band_frac(int(height * 0.70), height)
+    return max(top, mid, bottom)
+
+
+def video_has_overlay_text(path):
+    try:
+        from moviepy import VideoFileClip
+        import numpy as np
+    except Exception:
+        return False
+    clip = None
+    try:
+        clip = VideoFileClip(str(path))
+        duration = float(clip.duration or 0)
+        if duration <= 0:
+            return False
+        times = [min(max(duration * 0.35, 0), max(duration - 0.05, 0))]
+        if duration > 2:
+            times.append(min(max(duration * 0.7, 0), max(duration - 0.05, 0)))
+        for stamp in times:
+            frame = clip.get_frame(stamp)
+            if frame is None:
+                continue
+            gray = np.mean(frame, axis=2)
+            if overlay_text_score(gray) >= 0.38:
+                return True
+        return False
+    except Exception:
+        return False
+    finally:
+        if clip is not None:
+            try:
+                clip.close()
+            except Exception:
+                pass
+
+
 def validate_downloaded_video(path, probe=None):
     path = Path(path)
     if not path.is_file() or path.stat().st_size < MIN_VIDEO_BYTES:
@@ -134,6 +194,8 @@ def validate_downloaded_video(path, probe=None):
     fps = float(info.get("fps") or 0)
     if duration <= 0 or fps <= 0:
         return False, "non-positive duration or fps"
+    if probe is None and video_has_overlay_text(path):
+        return False, "text overlay"
     return True, info
 
 

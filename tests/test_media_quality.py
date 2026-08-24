@@ -8,6 +8,7 @@ from media_quality import (
     delete_rejected_file,
     download_http,
     is_signed_url,
+    overlay_text_score,
     redact_secret,
     url_safe_to_cache,
     validate_downloaded_video,
@@ -65,3 +66,14 @@ class MediaQualityTests(unittest.TestCase):
             self.assertEqual(len(content_fingerprint(path)), 32)
             self.assertTrue(delete_rejected_file(path, newly_downloaded=True))
             self.assertFalse(path.exists())
+
+    def test_overlay_score_flags_dense_caption_edges(self):
+        import numpy as np
+
+        clean = np.full((90, 90), 40.0)
+        self.assertLess(overlay_text_score(clean), 0.1)
+        caption = np.full((90, 90), 40.0)
+        for y in range(32, 62):
+            for x in range(15, 75):
+                caption[y, x] = 220.0 if (x + y) % 2 == 0 else 8.0
+        self.assertGreaterEqual(overlay_text_score(caption), 0.38)

@@ -9,6 +9,8 @@ from semantic_media import (
     MediaCandidate,
     SearchCache,
     cache_key,
+    coverage_failures,
+    ground_query,
     parse_sentence_queries,
     search_with_cache,
     write_source_manifest,
@@ -31,7 +33,21 @@ class QueryParseTests(unittest.TestCase):
         self.assertEqual(rows[0]["keyword"], "mars canyon vista")
         self.assertEqual(rows[1]["keyword"], "astronaut red sand")
         self.assertEqual(rows[2]["keyword"], "rover dust ridge")
-        self.assertTrue(all(2 <= len(row["keyword"].split()) <= 6 for row in rows))
+        self.assertTrue(all(2 <= len(row["keyword"].split()) <= 5 for row in rows))
+
+    def test_ground_query_keeps_concrete_keyword(self):
+        self.assertEqual(
+            ground_query(
+                "gym barbell lift",
+                "Turn sweat into confidence and watch the world start to notice.",
+                "Ready to crush the thing standing between you and your goals",
+            ),
+            "gym barbell lift",
+        )
+        self.assertIn(
+            "dumbbells",
+            ground_query("", "Drop the excuses those dumbbells don't care", "gym workout"),
+        )
 
 
 class SearchCacheTests(unittest.TestCase):
@@ -144,6 +160,19 @@ class ManifestTests(unittest.TestCase):
             self.assertNotIn("jwt=secret-token", dumped)
             self.assertNotIn("download_url", dumped)
             self.assertEqual(data["scenes"][0]["source_page"], "https://coverr.co/videos/abc")
+
+
+class CoverageSlackTests(unittest.TestCase):
+    def test_three_clips_cover_capped_scene_budget(self):
+        selected = [[
+            MediaCandidate(provider="pinterest", asset_id="a", duration=8),
+            MediaCandidate(provider="pinterest", asset_id="b", duration=8),
+            MediaCandidate(provider="pinterest", asset_id="c", duration=8),
+        ]]
+        scenes = [{"keyword": "gym barbell lift", "required_duration": 15.0}]
+        failures, unique_total = coverage_failures(selected, scenes, 5, 15.2, "pinterest")
+        self.assertEqual(failures, [])
+        self.assertEqual(unique_total, 15.0)
 
 
 if __name__ == "__main__":

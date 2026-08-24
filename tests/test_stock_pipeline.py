@@ -9,11 +9,12 @@ from aesthetic_scraper import (
     LLMProcessor,
     PexelsScraper,
     PixabayScraper,
+    is_text_heavy_pin,
     parse_pinterest_pin_hrefs,
     parse_pinterest_resource_results,
     pick_pexels_rendition,
 )
-from app import collect_stock_videos, keep_visually_clean_media
+from app import collect_stock_videos, keep_visually_clean_media, group_scenes_to_clip_budget, split_script_sentences
 from semantic_media import CoverageError, MediaCandidate, dedupe_candidates, round_robin_order, unique_usable_duration
 
 
@@ -412,6 +413,11 @@ class PinterestParseTests(unittest.TestCase):
         )
         self.assertEqual(photo_only, [])
 
+    def test_skips_quote_and_promo_titles(self):
+        self.assertTrue(is_text_heavy_pin({"title": 'Follow for more "never quit"'}))
+        self.assertTrue(is_text_heavy_pin({"title": "Shop now gym program"}))
+        self.assertFalse(is_text_heavy_pin({"title": "barbell squat gym"}))
+
     def test_hls_only_converts_to_mp4(self):
         from aesthetic_scraper import pinterest_mp4_urls, pinterest_video_rendition
 
@@ -443,6 +449,26 @@ class KeywordParseHookTests(unittest.TestCase):
         processor = LLMProcessor(api_key="x")
         parsed = processor._parse("One. → mars rover dust\nTwo. → astronaut red sand")
         self.assertEqual([row["keyword"] for row in parsed], ["mars rover dust", "astronaut red sand"])
+
+    def test_assets_per_scene_compacts_narration_phrases(self):
+        script = (
+            "Ever wonder why the gym feels like a battlefield and you’re the only soldier? "
+            "Because every rep is a tiny war against the version of yourself that wants to quit. "
+            "Drop the excuses—those dumbbells don’t care about your schedule, they care about consistency. "
+            "Feel the burn? That’s not pain, that’s progress screaming, “I’m getting stronger!” "
+            "When the weights feel heavy, remember: your mind is the strongest muscle you’ll ever train. "
+            "Turn sweat into confidence and watch the world start to notice your unstoppable vibe. "
+            "One more set, one more push, and you’re rewriting your story in real time. "
+            "So lace up, crank the music, and make today the day you become your own legend."
+        )
+        sentences = split_script_sentences(script)
+        grouped = group_scenes_to_clip_budget(
+            [{"sentence": part, "keyword": "scene"} for part in sentences],
+            count=3,
+            clip_duration=5,
+        )
+        self.assertGreaterEqual(len(sentences), 7)
+        self.assertLess(len(grouped), len(sentences))
 
 
 if __name__ == "__main__":

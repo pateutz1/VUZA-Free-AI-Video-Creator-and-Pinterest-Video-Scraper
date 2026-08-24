@@ -468,6 +468,14 @@ def local_script_segments(script):
     ]
 
 SPEECH_WORDS_PER_SEC = 2.5
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def split_script_sentences(script):
+    text = re.sub(r"\s+", " ", (script or "").strip())
+    if not text:
+        return []
+    return [part.strip() for part in _SENTENCE_SPLIT_RE.split(text) if part.strip()]
 
 
 def estimated_speech_seconds(text):
@@ -885,6 +893,7 @@ async def collect_stock_videos(
     """Search selected provider, round-robin download, then enforce unique duration coverage."""
     clip_duration = max(2, min(12, float(clip_duration or 5)))
     needed = max(1, int(count or 1))
+    search_limit = max(8, min(20, needed * 4))
     cache = cache if cache is not None else get_search_cache()
     scraper = make_scraper(source, project_path, api_keys)
     rejection_log = {idx: [] for idx in range(len(keyword_data))}
@@ -904,7 +913,7 @@ async def collect_stock_videos(
                 raise RuntimeError("async finder must be awaited outside cache")
             return [
                 candidate_from_dict(raw, scene_index, query)
-                for raw in (finder(query, aspect=aspect, min_duration=clip_duration, limit=20) or [])
+                for raw in (finder(query, aspect=aspect, min_duration=clip_duration, limit=search_limit) or [])
             ]
 
         if search_fn:
@@ -918,7 +927,7 @@ async def collect_stock_videos(
         finder = getattr(scraper, "find_videos", None)
         if finder and inspect.iscoroutinefunction(finder):
             try:
-                raw = await finder(query, aspect=aspect, min_duration=clip_duration, limit=20)
+                raw = await finder(query, aspect=aspect, min_duration=clip_duration, limit=search_limit)
             except Exception as exc:
                 print(f"⚠️ Provider search failed ({source} {query!r}): {redact_secret(exc)}")
                 return [], "error"
@@ -972,7 +981,7 @@ async def collect_stock_videos(
         return None
 
     round_idx = 0
-    while round_idx < max(needed + 4, 1):
+    while round_idx < needed:
         progressed = False
         for scene_index, _group in enumerate(groups):
             if len(selected[scene_index]) > round_idx:
@@ -989,7 +998,7 @@ async def collect_stock_videos(
         if not llm:
             return
         for scene_index, item in enumerate(keyword_data):
-            if selected[scene_index]:
+            if len(selected[scene_index]) >= needed:
                 continue
             if len(alt_queries[scene_index]) >= MAX_ALT_QUERIES_PER_SCENE:
                 continue
@@ -1006,15 +1015,19 @@ async def collect_stock_videos(
             ranked = rank_scene_candidates(found, sentence=item.get("sentence") or "", keyword=alt)
             extra = dedupe_candidates(ranked, seen_keys)
             groups[scene_index].extend(extra)
-            chosen = await take_next(scene_index)
-            if chosen:
+            while len(selected[scene_index]) < needed:
+                chosen = await take_next(scene_index)
+                if not chosen:
+                    break
                 selected[scene_index].append(chosen)
 
     await fill_missing_with_alts()
 
+    visual_cap = needed * clip_duration
     scenes_for_coverage = []
     for item in keyword_data:
-        required = max(clip_duration, estimated_speech_seconds(item.get("sentence") or ""))
+        speech = estimated_speech_seconds(item.get("sentence") or "")
+        required = min(max(clip_duration, speech), visual_cap)
         scenes_for_coverage.append({
             "keyword": item.get("keyword"),
             "required_duration": required,
@@ -1116,22 +1129,41 @@ async def run_scrape(request: ScrapeRequest):
                     llm = None
                 else:
                     llm = LLMProcessor(api_key=api_keys.llm_key, api_url=api_keys.llm_url, model=api_keys.llm_model)
-                    keyword_data = llm.extract_keywords(
-                        script,
-                        vibe=request.vibe,
-                        language=settings.language,
-                        topic=(request.query or script[:160]).strip(),
-                    )
+                    use_stock_pipeline = media_type == "video" and source in STOCK_VIDEO_SOURCES
+                    if use_stock_pipeline:
+                        sentence_rows = [{"sentence": part, "keyword": "scene"} for part in split_script_sentences(script)]
+                        keyword_data = group_scenes_to_clip_budget(
+                            sentence_rows, count, settings.clip_duration
+                        )
+                        keyword_data = llm.extract_keywords(
+                            script,
+                            vibe=request.vibe,
+                            language=settings.language,
+                            topic=(request.query or script[:160]).strip(),
+                            scenes=[item["sentence"] for item in keyword_data],
+                        )
+                    else:
+                        keyword_data = llm.extract_keywords(
+                            script,
+                            vibe=request.vibe,
+                            language=settings.language,
+                            topic=(request.query or script[:160]).strip(),
+                        )
 
                 if not keyword_data:
                     raise RuntimeError((llm.last_error if llm else "") or "No usable scenes were generated. Check that the script is not empty.")
 
-                raw_scenes = len(keyword_data)
+                raw_scenes = len(split_script_sentences(script)) if script else len(keyword_data)
                 use_stock_pipeline = media_type == "video" and source in STOCK_VIDEO_SOURCES
                 if not use_stock_pipeline:
                     keyword_data = group_scenes_to_clip_budget(
                         keyword_data, count, settings.clip_duration
                     )
+                    print(
+                        f"🎞️ Scenes: {raw_scenes} sentences → {len(keyword_data)} "
+                        f"({count}×{settings.clip_duration}s per scene)"
+                    )
+                elif source != "local":
                     print(
                         f"🎞️ Scenes: {raw_scenes} sentences → {len(keyword_data)} "
                         f"({count}×{settings.clip_duration}s per scene)"
@@ -1151,13 +1183,6 @@ async def run_scrape(request: ScrapeRequest):
                         count=count,
                         llm=llm,
                         topic=(request.query or script[:160]).strip(),
-                    )
-                    keyword_data = group_scenes_to_clip_budget(
-                        keyword_data, count, settings.clip_duration
-                    )
-                    print(
-                        f"🎞️ Scenes: {raw_scenes} sentences → {len(keyword_data)} "
-                        f"({count}×{settings.clip_duration}s per scene)"
                     )
                     for item in keyword_data:
                         valid_paths = existing_media_paths(item.get("_files"))

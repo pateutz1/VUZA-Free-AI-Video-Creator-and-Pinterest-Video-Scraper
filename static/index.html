@@ -129,6 +129,9 @@
                         .provider-test-row { display: grid; grid-template-columns: 1.2fr 1.3fr auto; gap: 8px; align-items: end; margin-top: 10px; }
                         .provider-test-row .secondary-btn { height: 42px; white-space: nowrap; }
                         .provider-test-row .prov-status { grid-column: 1 / -1; margin: 4px 0 0; min-height: 1.1em; }
+                        .stock-test-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+                        .stock-test-row .secondary-btn { height: 36px; padding: 0 12px; white-space: nowrap; }
+                        .stock-test-row .prov-status { margin: 0; min-height: 1.1em; }
                         #llm-url-field.hidden { display: none; }
                         @media (max-width: 700px) { .provider-test-row { grid-template-columns: 1fr; } }
                     </style>
@@ -166,18 +169,30 @@
                                         class="get-key">Get free key →</a></label>
                                 <input type="password" id="pexels-key" placeholder="Pexels API key"
                                     autocomplete="off">
+                                <div class="stock-test-row">
+                                    <button type="button" class="secondary-btn" id="test-pexels-btn">Test API</button>
+                                    <p class="settings-note prov-status" id="pexels-test-status"></p>
+                                </div>
                             </div>
                             <div class="key-field">
                                 <label>Pixabay API key <a href="https://pixabay.com/api/docs/" target="_blank"
                                         class="get-key">Get free key →</a></label>
                                 <input type="password" id="pixabay-key" placeholder="Pixabay API key"
                                     autocomplete="off">
+                                <div class="stock-test-row">
+                                    <button type="button" class="secondary-btn" id="test-pixabay-btn">Test API</button>
+                                    <p class="settings-note prov-status" id="pixabay-test-status"></p>
+                                </div>
                             </div>
                             <div class="key-field">
                                 <label>Coverr API key <a href="https://coverr.co/" target="_blank"
                                         class="get-key">Get key →</a></label>
                                 <input type="password" id="coverr-key" placeholder="Optional Coverr API key"
                                     autocomplete="off">
+                                <div class="stock-test-row">
+                                    <button type="button" class="secondary-btn" id="test-coverr-btn">Test API</button>
+                                    <p class="settings-note prov-status" id="coverr-test-status"></p>
+                                </div>
                             </div>
                             <div class="key-field">
                                 <label>PiAPI key <a href="https://app.piapi.ai/" target="_blank"
@@ -665,7 +680,7 @@
     </div>
 
     <div id="toast" class="toast hidden"></div>
-    <script src="/static/script.js?v=6.8"></script>
+    <script src="/static/script.js?v=7.1"></script>
 </body>
 
 </html>

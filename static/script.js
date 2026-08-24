@@ -37,6 +37,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     let currentMode = 'single';
     let statusInterval = null;
+    let pollBusy = false;
+    let gallerySignature = '';
     let finalVideoUrl = '';
     let candidateVideos = [];
     let activeTaskId = '';
@@ -206,6 +208,52 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    async function testStockApi(provider, inputId, statusId, btnId, label) {
+        const statusEl = document.getElementById(statusId);
+        const btn = document.getElementById(btnId);
+        const key = (document.getElementById(inputId)?.value || '').trim();
+        if (statusEl) statusEl.textContent = 'Testing...';
+        if (btn) btn.disabled = true;
+        try {
+            const response = await fetch('/api/stock/test', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ provider, api_key: key }),
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                const message = typeof data.detail === 'string' ? data.detail : `${label} API test failed`;
+                if (statusEl) statusEl.textContent = message;
+                showToast(message, 'error');
+                return;
+            }
+            persistKeys(getKeys());
+            const okMsg = data.note
+                ? `OK · ${data.note}`
+                : `OK · ${data.hits || 0} result${data.hits === 1 ? '' : 's'}`;
+            if (statusEl) statusEl.textContent = okMsg;
+            showToast(`${label} ${okMsg}`, 'success');
+        } catch (error) {
+            const message = 'Could not reach VUZA to test this API';
+            if (statusEl) statusEl.textContent = message;
+            showToast(message, 'error');
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
+    function initStockApiTests() {
+        const targets = [
+            ['pexels', 'pexels-key', 'pexels-test-status', 'test-pexels-btn', 'Pexels'],
+            ['pixabay', 'pixabay-key', 'pixabay-test-status', 'test-pixabay-btn', 'Pixabay'],
+            ['coverr', 'coverr-key', 'coverr-test-status', 'test-coverr-btn', 'Coverr'],
+        ];
+        targets.forEach(([provider, inputId, statusId, btnId, label]) => {
+            const btn = document.getElementById(btnId);
+            if (btn) btn.addEventListener('click', () => testStockApi(provider, inputId, statusId, btnId, label));
+        });
+    }
+
     function saveKeys() {
         saveCurrentProvider();
         persistKeys(getKeys());
@@ -276,6 +324,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     initLlmProviders();
+    initStockApiTests();
 
     const saveBtn = document.getElementById('save-keys-btn');
     if (saveBtn) saveBtn.addEventListener('click', saveKeys);
@@ -654,6 +703,18 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    function currentNarrationScript() {
+        return ((scriptsContainer?.querySelector('.script-input') || scriptInput)?.value || '').trim();
+    }
+
+    function warnScriptVsAssets(label) {
+        if (!currentNarrationScript()) return;
+        showToast(`${label} changed. Generate script again so narration matches the scene length.`, 'error');
+    }
+
+    countInput?.addEventListener('change', () => warnScriptVsAssets('Assets per scene'));
+    document.getElementById('clip-duration')?.addEventListener('change', () => warnScriptVsAssets('Clip duration'));
+
     if (analyzeBtn) {
         analyzeBtn.addEventListener('click', async () => {
             const scripts = Array.from(document.querySelectorAll('.script-input'))
@@ -928,42 +989,56 @@ document.addEventListener('DOMContentLoaded', () => {
         return activeTaskId ? `/api/status?task_id=${encodeURIComponent(activeTaskId)}` : '/api/status';
     }
 
-    function startPollingStatus() {
-        statusCard.classList.remove('hidden');
-        if (statusInterval) clearInterval(statusInterval);
-        statusInterval = setInterval(async () => {
-            try {
-                const response = await fetch(statusUrl());
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                const status = await response.json();
-                renderStatus(status);
-                maybeShowReviewPrompt(status);
-                if (status.final_video) {
-                    finalVideoUrl = status.final_video;
-                }
-                candidateVideos = status.candidates || [];
-                if (((status.results && status.results.length > 0) || finalVideoUrl || candidateVideos.length) && status.status !== 'awaiting_review') {
-                    updateGallery(status.results || []);
-                }
-                if (status.status === 'awaiting_review') {
-                    setLoading(true, 'Waiting for review');
-                } else if (!status.is_running) {
-                    clearInterval(statusInterval);
-                    statusInterval = null;
-                    setLoading(false);
-                    if (isFailureStatus(status)) {
-                        showToast(status.error || status.message || 'Generation failed', 'error');
-                    } else {
-                        showToast('Done', 'success');
-                    }
-                }
-            } catch (err) {
+    function galleryKey(results) {
+        return JSON.stringify({
+            r: (results || []).map((item) => [item.keyword || '', item.sentence || '', item.files || []]),
+            f: finalVideoUrl || '',
+            c: candidateVideos || [],
+        });
+    }
+
+    async function pollStatusOnce() {
+        if (pollBusy) return;
+        pollBusy = true;
+        try {
+            const response = await fetch(statusUrl());
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const status = await response.json();
+            renderStatus(status);
+            maybeShowReviewPrompt(status);
+            if (status.final_video) {
+                finalVideoUrl = status.final_video;
+            }
+            candidateVideos = status.candidates || [];
+            if (((status.results && status.results.length > 0) || finalVideoUrl || candidateVideos.length) && status.status !== 'awaiting_review') {
+                updateGallery(status.results || []);
+            }
+            if (status.status === 'awaiting_review') {
+                setLoading(true, 'Waiting for review');
+            } else if (!status.is_running) {
                 clearInterval(statusInterval);
                 statusInterval = null;
                 setLoading(false);
-                showServiceConnectionError();
+                if (isFailureStatus(status)) {
+                    showToast(status.error || status.message || 'Generation failed', 'error');
+                } else {
+                    showToast('Done', 'success');
+                }
             }
-        }, 2000);
+        } catch (err) {
+            clearInterval(statusInterval);
+            statusInterval = null;
+            setLoading(false);
+            showServiceConnectionError();
+        } finally {
+            pollBusy = false;
+        }
+    }
+
+    function startPollingStatus() {
+        statusCard.classList.remove('hidden');
+        if (statusInterval) return;
+        statusInterval = setInterval(pollStatusOnce, 2000);
     }
 
     async function resumeCurrentJob() {
@@ -1002,6 +1077,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function updateGallery(results) {
+        const next = galleryKey(results);
+        if (next === gallerySignature) return;
+        gallerySignature = next;
         galleryContainer.innerHTML = '';
         renderFinalVideoCard();
         results.forEach(res => {
@@ -1049,6 +1127,7 @@ document.addEventListener('DOMContentLoaded', () => {
     clearBtn.addEventListener('click', () => {
         finalVideoUrl = '';
         candidateVideos = [];
+        gallerySignature = '';
         galleryContainer.innerHTML = '<div class="empty-state"><i class="fas fa-cloud-download-alt"></i><p>Gallery cleared.</p></div>';
         statusCard.classList.add('hidden');
     });
@@ -1224,8 +1303,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 showToast(await readErrorMessage(response, 'Could not resume assembly'), 'error');
                 return;
             }
+            const data = await response.json();
             closeReviewModal();
+            if (Array.isArray(data.results)) {
+                updateGallery(data.results);
+            }
             setLoading(true);
+            startPollingStatus();
             showToast('Resuming: generating voiceover and video...', 'success');
         } catch (error) {
             showToast('Network error while resuming assembly', 'error');

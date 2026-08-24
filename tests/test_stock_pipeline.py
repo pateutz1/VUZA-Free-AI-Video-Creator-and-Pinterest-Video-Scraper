@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 from aesthetic_scraper import (
     CoverrScraper,
     LLMProcessor,
+    MixkitScraper,
     PexelsScraper,
     PixabayScraper,
     is_text_heavy_pin,
@@ -30,6 +31,7 @@ from semantic_media import (
     dedupe_candidates,
     pinterest_query_variants,
     round_robin_order,
+    interleave_candidates_by_provider,
     stock_query_plan,
     unique_usable_duration,
 )
@@ -126,11 +128,39 @@ class ProviderFilterTests(unittest.TestCase):
         self.assertEqual([item["asset_id"] for item in items], ["10"])
         self.assertEqual(items[0]["rendition"]["id"], "large")
 
-    def test_coverr_uses_popular_vertical_and_requires_id_duration_mp4(self):
+    def test_mixkit_retries_shorter_slug_and_keeps_original_query(self):
+        scraper = MixkitScraper(output_dir=tempfile.mkdtemp())
+        calls = []
+        empty = '<script type="application/ld+json">{"@graph":[]}</script>'
+        hit = '<script type="application/ld+json">' + json.dumps({
+            "@graph": [{
+                "@type": "VideoObject",
+                "contentUrl": "https://assets.mixkit.co/videos/123/123-720.mp4",
+                "duration": "PT8S",
+                "name": "Gym",
+            }]
+        }) + "</script>"
+
+        def fake_fetch(url):
+            calls.append(url)
+            if "gym-transformation" in url:
+                return empty
+            return hit
+
+        with patch.object(scraper, "_fetch", side_effect=fake_fetch):
+            items = scraper.find_videos("gym transformation", min_duration=2)
+        self.assertTrue(any("gym-transformation" in url for url in calls))
+        self.assertTrue(any(url.rstrip("/").endswith("/gym") for url in calls))
+        self.assertEqual(items[0]["query"], "gym transformation")
+        self.assertEqual(items[0]["asset_id"], "123")
+
+    def test_coverr_uses_popular_sort_and_keeps_landscape(self):
         scraper = CoverrScraper(output_dir=tempfile.mkdtemp(), api_key="cv-test")
         captured = {}
 
         class FakeResponse:
+            status_code = 200
+            text = ""
             def json(self):
                 return {
                     "hits": [
@@ -149,9 +179,37 @@ class ProviderFilterTests(unittest.TestCase):
             items = scraper.find_videos("astronaut red sand", aspect="9:16", min_duration=2)
         self.assertIn("sort=popular", captured["url"])
         self.assertIn("urls=true", captured["url"])
-        self.assertIn("is_vertical%3Atrue", captured["url"].replace("%3A", ":") if False else captured["url"])
-        self.assertEqual([item["asset_id"] for item in items], ["ok"])
+        self.assertNotIn("is_vertical", captured["url"])
+        self.assertEqual([item["asset_id"] for item in items], ["ok", "wide"])
         self.assertTrue(items[0]["url"])
+
+    def test_coverr_retries_shorter_query_when_empty(self):
+        scraper = CoverrScraper(output_dir=tempfile.mkdtemp(), api_key="cv-test")
+        calls = []
+
+        class FakeResponse:
+            def __init__(self, hits):
+                self.status_code = 200
+                self.text = ""
+                self._hits = hits
+            def json(self):
+                return {"hits": self._hits}
+
+        def fake_get(url, **kwargs):
+            calls.append(url)
+            if "gym+transformation" in url or "gym%20transformation" in url:
+                return FakeResponse([])
+            return FakeResponse([{
+                "id": "gym1",
+                "duration": 8,
+                "urls": {"mp4_download": "https://cdn.coverr.co/gym.mp4"},
+                "is_vertical": True,
+            }])
+
+        with patch("aesthetic_scraper.requests.get", side_effect=fake_get):
+            items = scraper.find_videos("gym transformation", aspect="9:16", min_duration=5)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual([item["asset_id"] for item in items], ["gym1"])
 
     def test_pexels_rendition_prefers_target(self):
         best = pick_pexels_rendition(
@@ -184,6 +242,16 @@ class SelectionTests(unittest.TestCase):
         order = [(scene, cand.asset_id) for scene, cand in round_robin_order(groups)]
         self.assertEqual(order[:2], [(0, "a1"), (1, "b1")])
         self.assertEqual(order[2], (0, "a2"))
+
+    def test_interleave_by_provider_rotates_before_second_clip(self):
+        items = [
+            MediaCandidate(provider="pexels", asset_id="p1"),
+            MediaCandidate(provider="pexels", asset_id="p2"),
+            MediaCandidate(provider="mixkit", asset_id="m1"),
+            MediaCandidate(provider="pixabay", asset_id="x1"),
+        ]
+        mixed = interleave_candidates_by_provider(items, ["mixkit", "pexels", "pixabay", "coverr"])
+        self.assertEqual([item.asset_id for item in mixed], ["m1", "p1", "x1", "p2"])
 
     def test_pinterest_query_variants_never_shrink_to_one_generic_word(self):
         variants = pinterest_query_variants("gym", sentence="Sweat drips as she grinds through squats.", topic="gym workout motivation")
@@ -739,6 +807,22 @@ class KeywordParseHookTests(unittest.TestCase):
         processor = LLMProcessor(api_key="x")
         parsed = processor._parse("One. → mars rover dust\nTwo. → astronaut red sand")
         self.assertEqual([row["keyword"] for row in parsed], ["mars rover dust", "astronaut red sand"])
+
+    def test_generate_full_script_prompt_includes_asset_budget(self):
+        processor = LLMProcessor(api_key="x")
+        captured = {}
+
+        def fake_chat(model, messages, **kwargs):
+            captured["prompt"] = messages[0]["content"]
+            return "Hook line about the gym.\nSecond beat about consistency."
+
+        with patch.object(processor, "_chat", side_effect=fake_chat):
+            script = processor.generate_full_script(
+                "gym", vibe="motivational", assets_per_scene=3, clip_duration=5
+            )
+        self.assertIn("15 seconds", captured["prompt"])
+        self.assertIn("3 clips", captured["prompt"])
+        self.assertIn("Hook line about the gym", script)
 
     def test_assets_per_scene_compacts_narration_phrases(self):
         script = (

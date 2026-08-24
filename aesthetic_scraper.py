@@ -751,38 +751,45 @@ class PixabayScraper:
         if not self.api_key:
             print("⚠️ Pixabay API key not set")
             return []
+        original = (query or "").strip()
+        min_seconds = float(min_duration or 0)
+        cap = max(1, int(limit or 50))
         try:
-            params = {"q": query, "video_type": "all", "per_page": 50, "key": self.api_key}
-            url = f"https://pixabay.com/api/videos/?{urlencode(params)}"
-            data = requests.get(url, timeout=(30, 60), verify=True).json()
             candidates = []
-            for hit in data.get("hits") or []:
-                vid_id = hit.get("id")
-                if not vid_id or vid_id in self.seen_ids:
-                    continue
-                duration = float(hit.get("duration") or 0)
-                if duration < float(min_duration or 0):
-                    continue
-                rendition, rendition_id = pick_pixabay_rendition(hit.get("videos") or {}, aspect)
-                if not rendition:
-                    continue
-                width, height = int(rendition.get("width") or 0), int(rendition.get("height") or 0)
-                if aspect != "1:1" and not matches_orientation(width, height, aspect):
-                    continue
-                self.seen_ids.add(vid_id)
-                candidates.append({
-                    "provider": "pixabay",
-                    "asset_id": str(vid_id),
-                    "url": rendition.get("url") or "",
-                    "source_page": hit.get("pageURL") or "",
-                    "creator": hit.get("user") or "",
-                    "duration": duration,
-                    "width": width,
-                    "height": height,
-                    "query": query,
-                    "rendition": {"id": rendition_id, "width": width, "height": height},
-                })
-                if len(candidates) >= max(1, int(limit or 50)):
+            for variant in short_query_fallbacks(original) or [original]:
+                params = {"q": variant, "video_type": "all", "per_page": 50, "key": self.api_key}
+                url = f"https://pixabay.com/api/videos/?{urlencode(params)}"
+                data = requests.get(url, timeout=(30, 60), verify=True).json()
+                before = len(candidates)
+                for hit in data.get("hits") or []:
+                    vid_id = hit.get("id")
+                    if not vid_id or vid_id in self.seen_ids:
+                        continue
+                    duration = float(hit.get("duration") or 0)
+                    if duration and duration < min_seconds:
+                        continue
+                    rendition, rendition_id = pick_pixabay_rendition(hit.get("videos") or {}, aspect)
+                    if not rendition:
+                        continue
+                    width, height = int(rendition.get("width") or 0), int(rendition.get("height") or 0)
+                    if aspect != "1:1" and width and height and not matches_orientation(width, height, aspect):
+                        continue
+                    self.seen_ids.add(vid_id)
+                    candidates.append({
+                        "provider": "pixabay",
+                        "asset_id": str(vid_id),
+                        "url": rendition.get("url") or "",
+                        "source_page": hit.get("pageURL") or "",
+                        "creator": hit.get("user") or "",
+                        "duration": duration,
+                        "width": width,
+                        "height": height,
+                        "query": original or variant,
+                        "rendition": {"id": rendition_id, "width": width, "height": height},
+                    })
+                    if len(candidates) >= cap:
+                        break
+                if len(candidates) > before:
                     break
             print(f"  Pixabay candidates: {len(candidates)}")
             return candidates
@@ -925,6 +932,17 @@ def pexels_orientation(aspect="9:16"):
     return "portrait"
 
 
+def short_query_fallbacks(query):
+    text = (query or "").strip()
+    words = text.split()
+    ordered = []
+    for item in (text, " ".join(words[:2]) if len(words) > 2 else "", words[0] if len(words) > 1 else ""):
+        item = (item or "").strip()
+        if item and item not in ordered:
+            ordered.append(item)
+    return ordered
+
+
 class CoverrScraper:
     """Coverr stock video search. Pattern adapted from MoneyPrinterTurbo (MIT)."""
 
@@ -941,58 +959,98 @@ class CoverrScraper:
     async def search_images(self, query, num_images=5):
         return []
 
+    @staticmethod
+    def _hits_from_payload(data):
+        if isinstance(data, list):
+            return data
+        if not isinstance(data, dict):
+            return []
+        hits = data.get("hits") or data.get("videos")
+        if hits is None and isinstance(data.get("data"), dict):
+            hits = data["data"].get("hits") or data["data"].get("videos")
+        return hits if isinstance(hits, list) else []
+
+    @staticmethod
+    def _clip_url(item):
+        urls = item.get("urls") or {}
+        if isinstance(urls, str) and urls:
+            return urls
+        if isinstance(urls, dict):
+            for key in ("mp4_download", "mp4", "mp4_preview", "download"):
+                if urls.get(key):
+                    return urls[key]
+        return item.get("mp4") or item.get("mp4_url") or item.get("download_url") or ""
+
+    def _fetch_hits(self, query):
+        params = {
+            "query": query,
+            "page_size": 20,
+            "urls": "true",
+            "sort": "popular",
+        }
+        response = requests.get(
+            f"https://api.coverr.co/videos?{urlencode(params)}",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout=(30, 60),
+            verify=True,
+        )
+        try:
+            status = int(getattr(response, "status_code", 200) or 200)
+        except (TypeError, ValueError):
+            status = 200
+        if status != 200:
+            print(f"⚠️ Coverr HTTP {status} for {query!r}: {(getattr(response, 'text', '') or '')[:180]}")
+            return []
+        try:
+            payload = response.json()
+        except Exception:
+            print(f"⚠️ Coverr returned non-JSON for {query!r}")
+            return []
+        hits = self._hits_from_payload(payload)
+        print(f"  Coverr API {query!r}: {len(hits)} raw")
+        return hits
+
     def find_videos(self, query, aspect="9:16", min_duration=2, limit=20):
         if not self.api_key:
             print("⚠️ Coverr API key not set")
             return []
         try:
-            params = {
-                "query": query,
-                "page_size": 20,
-                "urls": "true",
-                "sort": "popular",
-            }
-            if aspect == "9:16":
-                params["filter"] = "is_vertical:true"
-            elif aspect == "16:9":
-                params["filter"] = "is_vertical:false"
-            url = f"https://api.coverr.co/videos?{urlencode(params)}"
-            data = requests.get(
-                url,
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=(30, 60),
-                verify=True,
-            ).json()
-            hits = data.get("hits") if isinstance(data, dict) else None
-            if not isinstance(hits, list):
-                print("⚠️ Coverr video search returned an unsupported response")
-                return []
+            hits = []
+            used_query = query
+            for variant in short_query_fallbacks(query):
+                hits = self._fetch_hits(variant)
+                if hits:
+                    used_query = variant
+                    break
             candidates = []
-            for item in hits:
-                vid_id = item.get("id") or item.get("_id")
+            min_seconds = float(min_duration or 0)
+
+            def vertical_rank(item):
+                flag = item.get("is_vertical")
+                width = item.get("max_width") or item.get("width") or 0
+                height = item.get("max_height") or item.get("height") or 0
+                if isinstance(flag, bool):
+                    return 0 if flag else 1
+                try:
+                    return 0 if int(height) > int(width) > 0 else 1
+                except (TypeError, ValueError):
+                    return 1
+
+            for item in sorted(hits, key=vertical_rank):
+                vid_id = item.get("id") or item.get("_id") or item.get("objectID")
                 if not vid_id or vid_id in self.seen_ids:
                     continue
                 try:
-                    duration = float(item.get("duration") or 0)
+                    duration = float(item.get("duration") or item.get("length") or item.get("video_length") or 0)
                 except (TypeError, ValueError):
                     continue
-                if duration < float(min_duration or 0):
+                if duration and duration < min_seconds:
                     continue
-                urls = item.get("urls") or {}
-                link = urls.get("mp4_download") or urls.get("mp4") or urls.get("mp4_preview") or item.get("mp4")
+                link = self._clip_url(item)
                 if not link:
                     continue
                 width = item.get("max_width") or item.get("width") or 0
                 height = item.get("max_height") or item.get("height") or 0
-                is_vertical = item.get("is_vertical")
-                if aspect != "1:1":
-                    if width and height and not matches_orientation(width, height, aspect):
-                        continue
-                    if (not width or not height) and isinstance(is_vertical, bool):
-                        if is_vertical != (aspect == "9:16"):
-                            continue
-                    elif not width or not height:
-                        continue
                 self.seen_ids.add(vid_id)
                 creator = item.get("creator") or item.get("author") or {}
                 creator_name = creator.get("name") if isinstance(creator, dict) else (creator or "")
@@ -1005,7 +1063,7 @@ class CoverrScraper:
                     "duration": duration,
                     "width": int(width or 0),
                     "height": int(height or 0),
-                    "query": query,
+                    "query": used_query,
                     "rendition": {"id": "mp4_download", "width": width, "height": height},
                 })
                 if len(candidates) >= max(1, int(limit or 20)):
@@ -1027,13 +1085,17 @@ class CoverrScraper:
 
     def download_file(self, url, path):
         try:
-            r = requests.get(url, timeout=60)
+            headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+            r = requests.get(url, headers=headers, timeout=60)
             if r.status_code == 200 and r.content and len(r.content) >= MIN_VIDEO_BYTES:
                 path.write_bytes(r.content)
                 return True
         except Exception:
             pass
         return False
+
+    async def download_bytes(self, url, path, min_bytes=None):
+        return await asyncio.to_thread(self.download_file, url, path)
 
 
 _MIXKIT_LD_JSON_RE = re.compile(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.S)
@@ -1092,17 +1154,11 @@ class MixkitScraper:
 
     def find_videos(self, query, aspect="9:16", min_duration=2, limit=20):
         limit = max(1, int(limit or 20))
-        slug = re.sub(r'[^\w]+', '-', (query or "").strip().lower()).strip('-') or "nature"
-        search_url = self.SEARCH_URL.format(slug=slug)
-        try:
-            html = self._fetch(search_url)
-        except Exception as exc:
-            print(f"⚠️ Mixkit search failed: {exc}")
-            return []
-
+        original = (query or "").strip()
+        min_seconds = float(min_duration or 0)
         candidates = []
 
-        def add_from_graph(graph):
+        def add_from_graph(graph, search_url):
             for item in graph:
                 if len(candidates) >= limit:
                     return
@@ -1116,7 +1172,7 @@ class MixkitScraper:
                 if vid_id in self.seen_ids:
                     continue
                 duration = mixkit_iso8601_duration_seconds(item.get("duration"))
-                if duration and duration < float(min_duration or 0):
+                if duration and duration < min_seconds:
                     continue
                 self.seen_ids.add(vid_id)
                 candidates.append({
@@ -1129,21 +1185,31 @@ class MixkitScraper:
                     "duration": duration,
                     "width": 0,
                     "height": 0,
-                    "query": query,
+                    "query": original or query,
                     "rendition": {"id": "720p"},
                 })
 
-        add_from_graph(mixkit_ld_json_graph(html))
-
-        if len(candidates) < limit:
-            for href in dict.fromkeys(_MIXKIT_DETAIL_HREF_RE.findall(html)):
-                if len(candidates) >= limit:
-                    break
-                try:
-                    detail_html = self._fetch(f"https://mixkit.co{href}")
-                except Exception:
-                    continue
-                add_from_graph(mixkit_ld_json_graph(detail_html))
+        for variant in short_query_fallbacks(original) or [original]:
+            slug = re.sub(r'[^\w]+', '-', variant.lower()).strip('-') or "nature"
+            search_url = self.SEARCH_URL.format(slug=slug)
+            try:
+                html = self._fetch(search_url)
+            except Exception as exc:
+                print(f"⚠️ Mixkit search failed ({variant!r}): {exc}")
+                continue
+            before = len(candidates)
+            add_from_graph(mixkit_ld_json_graph(html), search_url)
+            if len(candidates) < limit:
+                for href in dict.fromkeys(_MIXKIT_DETAIL_HREF_RE.findall(html)):
+                    if len(candidates) >= limit:
+                        break
+                    try:
+                        detail_html = self._fetch(f"https://mixkit.co{href}")
+                    except Exception:
+                        continue
+                    add_from_graph(mixkit_ld_json_graph(detail_html), search_url)
+            if len(candidates) > before:
+                break
 
         print(f"  Mixkit candidates: {len(candidates)}")
         return candidates
@@ -1895,12 +1961,15 @@ THUMBNAIL_PROMPT: [Your AI Image Prompt]"""
             except: continue
         return None
 
-    def generate_full_script(self, topic, vibe="general", language=""):
+    def generate_full_script(self, topic, vibe="general", language="", assets_per_scene=3, clip_duration=5):
         if not self.api_key:
             self.last_error = "No AI API key was provided. Add one in API settings."
             return None
         lang = (language or "").strip() or "en-US"
         chinese = lang.lower().startswith("zh")
+        count = max(1, min(15, int(assets_per_scene or 3)))
+        slot = max(2, min(12, int(clip_duration or 5)))
+        beat_seconds = count * slot
         if vibe == "suspense_cn" and chinese:
             is_long_source = len(topic) >= 600
             if is_long_source:
@@ -1958,9 +2027,17 @@ THUMBNAIL_PROMPT: [Your AI Image Prompt]"""
                 extra = "Keep the source plot. 45-80 spoken sentences. Strong hook, then scene-by-scene tension, then a cliffhanger."
         else:
             vibe_instr = "educational and informative" if vibe == "educational" else "inspiring and fast-paced" if vibe == "motivational" else "poetic and slow" if vibe == "lofi" else "engaging and viral"
-            extra = "Length: 5-10 punchy sentences."
+            extra = (
+                f"Length: 3-6 spoken scenes. Each scene is about {beat_seconds} seconds of narration "
+                f"so it covers {count} clips of {slot} seconds. Fold any CTA into the last full scene. "
+                "Never put a one-line CTA on its own as the final scene."
+            )
             if is_long_source:
-                extra = "Keep the source plot. 45-80 spoken sentences, one scene per line."
+                extra = (
+                    f"Keep the source plot. 45-80 spoken sentences, one line per sentence. "
+                    f"Group ideas into beats of about {beat_seconds} seconds ({count} clips × {slot}s). "
+                    "Fold any CTA into the last full beat."
+                )
         prompt = f"""Act as a professional viral script writer for TikTok/Reels/Shorts.
 Write a complete, high-retention spoken video script about the user's topic.
 The vibe should be {vibe_instr}.

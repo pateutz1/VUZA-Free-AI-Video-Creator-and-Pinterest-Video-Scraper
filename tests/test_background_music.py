@@ -330,6 +330,11 @@ class SourceContractTests(unittest.TestCase):
         self.assertIn("/api/generate_keywords", js)
         self.assertIn("keywords: readKeywords()", js)
         self.assertNotIn("volces.com", js)
+        self.assertIn('id="test-pexels-btn"', html)
+        self.assertIn('id="test-pixabay-btn"', html)
+        self.assertIn('id="test-coverr-btn"', html)
+        self.assertNotIn("test-piapi-btn", html)
+        self.assertIn("/api/stock/test", js)
 
 
 class LlmEndpointValidationTests(unittest.TestCase):
@@ -422,6 +427,66 @@ class LlmEndpointValidationTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(data["ok"])
         self.assertEqual(data["model"], "gpt-4o-mini")
+
+    def test_stock_test_requires_key(self):
+        status, data = asyncio.run(post_json("/api/stock/test", {"provider": "pexels", "api_key": ""}))
+        self.assertEqual(status, 400)
+        self.assertIn("API key", data["detail"])
+
+    def test_stock_test_rejects_piapi(self):
+        status, data = asyncio.run(post_json("/api/stock/test", {"provider": "piapi", "api_key": "x"}))
+        self.assertEqual(status, 400)
+        self.assertIn("Coverr", data["detail"])
+
+    def test_pexels_test_hits_real_search_endpoint(self):
+        captured = {}
+
+        class FakeResponse:
+            status_code = 200
+            def json(self):
+                return {"videos": [{"id": 1}]}
+
+        def fake_get(url, params=None, headers=None, timeout=None):
+            captured.update(url=url, params=params, headers=headers)
+            return FakeResponse()
+
+        with patch("requests.get", side_effect=fake_get):
+            status, data = asyncio.run(post_json("/api/stock/test", {"provider": "pexels", "api_key": "px-live"}))
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["hits"], 1)
+        self.assertEqual(captured["url"], "https://api.pexels.com/videos/search")
+        self.assertEqual(captured["headers"]["Authorization"], "px-live")
+
+    def test_pixabay_test_rejects_invalid_key_payload(self):
+        class FakeResponse:
+            status_code = 200
+            def json(self):
+                return {"error": "Invalid API key"}
+
+        with patch("requests.get", return_value=FakeResponse()):
+            status, data = asyncio.run(post_json("/api/stock/test", {"provider": "pixabay", "api_key": "bad"}))
+        self.assertEqual(status, 400)
+        self.assertIn("rejected", data["detail"])
+
+    def test_coverr_test_hits_real_search_endpoint(self):
+        captured = {}
+
+        class FakeResponse:
+            status_code = 200
+            def json(self):
+                return {"hits": []}
+
+        def fake_get(url, params=None, headers=None, timeout=None):
+            captured.update(url=url, params=params, headers=headers)
+            return FakeResponse()
+
+        with patch("requests.get", side_effect=fake_get):
+            status, data = asyncio.run(post_json("/api/stock/test", {"provider": "coverr", "api_key": "cv-live"}))
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        self.assertEqual(captured["url"], "https://api.coverr.co/videos")
+        self.assertEqual(captured["headers"]["Authorization"], "Bearer cv-live")
 
 
 class ScrapeRequestValidationTests(unittest.TestCase):

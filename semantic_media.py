@@ -406,17 +406,33 @@ def round_robin_order(groups):
 
 def interleave_candidates_by_query(candidates, queries):
     """One clip from each search query before a second clip from any query."""
+    keys = [normalize_stock_query(raw) for raw in (queries or [])]
+    return _interleave_by_key(candidates, keys, lambda item: normalize_stock_query(item.query))
+
+
+def interleave_candidates_by_provider(candidates, providers=None):
+    """One clip from each stock provider before a second clip from any provider."""
+    keys = [(name or "").strip().lower() for name in (providers or [])]
+    return _interleave_by_key(candidates, keys, lambda item: (item.provider or "").strip().lower())
+
+
+def _interleave_by_key(candidates, preferred_keys, item_key_fn):
     order = []
     seen = set()
-    for raw in queries or []:
-        key = normalize_stock_query(raw).lower()
+    for raw in preferred_keys or []:
+        key = (raw or "").strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            order.append(key)
+    for candidate in candidates or []:
+        key = (item_key_fn(candidate) or "").strip().lower()
         if key and key not in seen:
             seen.add(key)
             order.append(key)
     buckets = {key: [] for key in order}
     extra = []
     for candidate in candidates or []:
-        key = normalize_stock_query(candidate.query).lower()
+        key = (item_key_fn(candidate) or "").strip().lower()
         if key in buckets:
             buckets[key].append(candidate)
         else:

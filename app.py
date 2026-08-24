@@ -46,6 +46,7 @@ from semantic_media import (
     normalize_stock_query,
     rank_scene_candidates,
     interleave_candidates_by_query,
+    interleave_candidates_by_provider,
     search_with_cache,
     selected_record,
     unique_usable_duration,
@@ -156,6 +157,10 @@ class LlmTestRequest(BaseModel):
     api_url: str = ""
     model: str = ""
 
+class StockTestRequest(BaseModel):
+    provider: str = ""
+    api_key: str = ""
+
 LLM_PROVIDER_MODELS = {
     "openrouter": [
         "deepseek/deepseek-v4-pro",
@@ -237,6 +242,80 @@ async def test_llm(request: LlmTestRequest):
         reply = str(response.json()["choices"][0]["message"]["content"]).strip() or "ok"
     print(f"✅ LLM test ok: {provider or 'custom'} / {model_name}")
     return {"ok": True, "provider": provider or "custom", "model": model_name, "reply": reply[:80]}
+
+STOCK_TEST_LABELS = {"pexels": "Pexels", "pixabay": "Pixabay", "coverr": "Coverr"}
+
+def stock_test_call(provider, api_key):
+    if provider == "pexels":
+        return (
+            "https://api.pexels.com/videos/search",
+            {"query": "nature", "per_page": 1},
+            {"Authorization": api_key},
+            "videos",
+        )
+    if provider == "pixabay":
+        return (
+            "https://pixabay.com/api/videos/",
+            {"key": api_key, "q": "nature", "per_page": 3},
+            {},
+            "hits",
+        )
+    if provider == "coverr":
+        return (
+            "https://api.coverr.co/videos",
+            {"query": "nature", "page_size": 1, "urls": "true"},
+            {"Authorization": f"Bearer {api_key}"},
+            "hits",
+        )
+    raise ValueError(provider)
+
+def stock_test_error_text(payload):
+    if not isinstance(payload, dict):
+        return ""
+    err = payload.get("error") or payload.get("message") or payload.get("detail")
+    if isinstance(err, dict):
+        err = err.get("message") or err.get("error") or ""
+    return str(err or "").strip()
+
+@app.post("/api/stock/test")
+async def test_stock(request: StockTestRequest):
+    import requests as req
+    provider = (request.provider or "").strip().lower()
+    api_key = (request.api_key or "").strip()
+    label = STOCK_TEST_LABELS.get(provider)
+    if not label:
+        raise HTTPException(status_code=400, detail="Use Pexels, Pixabay, or Coverr.")
+    if not api_key:
+        raise HTTPException(status_code=400, detail=f"Enter a {label} API key first.")
+    url, params, headers, count_key = stock_test_call(provider, api_key)
+
+    def ping():
+        return req.get(url, params=params, headers=headers or None, timeout=(8, 15))
+
+    try:
+        response = await asyncio.to_thread(ping)
+    except req.RequestException as exc:
+        raise HTTPException(status_code=400, detail=f"Could not reach {label}: {exc}") from exc
+
+    payload = {}
+    with contextlib.suppress(Exception):
+        payload = response.json()
+    err = stock_test_error_text(payload)
+    auth_failed = response.status_code in (401, 403) or (
+        "invalid" in err.lower() and "key" in err.lower()
+    )
+    if auth_failed:
+        raise HTTPException(status_code=400, detail=f"{label} rejected this API key.")
+    if response.status_code == 429:
+        return {"ok": True, "provider": provider, "hits": 0, "note": "rate limited, key accepted"}
+    if response.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"{label}: {(err or f'HTTP {response.status_code}')[:300]}")
+    hits = payload.get(count_key) if isinstance(payload, dict) else None
+    if hits is None:
+        raise HTTPException(status_code=400, detail=f"{label} returned an unexpected response.")
+    count = len(hits) if isinstance(hits, list) else 0
+    print(f"✅ Stock test ok: {provider} hits={count}")
+    return {"ok": True, "provider": provider, "hits": count}
 
 @app.get("/api/music")
 async def list_music():
@@ -343,13 +422,18 @@ async def generate_script(request: GenerateScriptRequest):
     api_keys = request.api_keys or ApiKeys()
     require_llm_key(api_keys, "Script generation")
     llm = LLMProcessor(api_key=api_keys.llm_key, api_url=api_keys.llm_url, model=api_keys.llm_model)
-    script = llm.generate_full_script(request.topic, vibe=request.vibe, language=request.language)
+    count = max(1, min(15, int(request.count or 3)))
+    clip_duration = max(2, min(12, int(request.clip_duration or 5)))
+    script = llm.generate_full_script(
+        request.topic,
+        vibe=request.vibe,
+        language=request.language,
+        assets_per_scene=count,
+        clip_duration=clip_duration,
+    )
 
     if not script:
         raise HTTPException(status_code=500, detail=llm.last_error or "Script generation failed. Check your AI API key.")
-
-    count = max(1, min(15, int(request.count or 3)))
-    clip_duration = max(2, min(12, int(request.clip_duration or 5)))
     keywords = keywords_from_topic_and_script(
         llm, request.topic, script, request.vibe, request.language, count, clip_duration
     )
@@ -635,6 +719,14 @@ def group_scenes_to_clip_budget(keyword_data, count, clip_duration):
         spoken = extra
     if bucket:
         grouped.append(bucket)
+    if len(grouped) >= 2:
+        last_spoken = estimated_speech_seconds(grouped[-1].get("sentence") or "")
+        if last_spoken < budget * 0.5:
+            last = grouped.pop()
+            prev = grouped[-1]
+            prev["sentence"] = f"{prev['sentence']} {last['sentence']}".strip()
+            if last.get("_files"):
+                prev["_files"] = list(prev.get("_files") or []) + list(last["_files"])
     return grouped
 
 
@@ -821,6 +913,24 @@ def existing_media_paths(files):
         except OSError:
             continue
     return valid
+
+
+def keyword_data_result_rows(keyword_data):
+    rows = []
+    for item in keyword_data or []:
+        rel_paths = []
+        for path in existing_media_paths(item.get("_files")):
+            try:
+                rel_paths.append(relative_download_path(path))
+            except Exception:
+                rel_paths.append(str(path).replace("\\", "/"))
+        if rel_paths:
+            rows.append({
+                "keyword": item.get("keyword") or "scene",
+                "sentence": item.get("sentence") or "",
+                "files": rel_paths,
+            })
+    return rows
 
 def require_media_files(files, label):
     valid = existing_media_paths(files)
@@ -1337,6 +1447,7 @@ async def collect_stock_videos(
                 keyword=f"{item.get('keyword') or ''} {topic}",
             )
             mixed = interleave_candidates_by_query(ranked, plan_queries)
+            mixed = interleave_candidates_by_provider(mixed, list(scrapers.keys()))
             print(f"  mix scene {idx + 1}: " + ", ".join(f"{query!r}" for query in plan_queries))
             groups.append(mixed)
 
@@ -1817,17 +1928,7 @@ async def run_scrape(request: ScrapeRequest):
                         topic=(request.query or script[:160]).strip(),
                         enable_fallback=bool(request.provider_fallback),
                     )
-                    result_rows = []
-                    for item in keyword_data:
-                        valid_paths = existing_media_paths(item.get("_files"))
-                        rel_paths = []
-                        for path in valid_paths:
-                            try:
-                                rel_paths.append("/" + str(path.relative_to(BASE_DIR)).replace("\\", "/"))
-                            except Exception:
-                                rel_paths.append(str(path))
-                        if rel_paths:
-                            result_rows.append({"keyword": item["keyword"], "sentence": item["sentence"], "files": rel_paths})
+                    result_rows = keyword_data_result_rows(keyword_data)
                     review_eligible = request.auto_video and use_stock_pipeline and len(scripts) == 1
                     if review_eligible:
                         validate_scene_images(keyword_data, project_path)
@@ -1985,7 +2086,15 @@ async def start_assemble(request: AssembleRequest, background_tasks: BackgroundT
             keyword_data[idx]["_files"] = cleaned
 
     pending_assembly.pop(request.task_id, None)
-    set_status("running", message="Resuming after review...", task_id=request.task_id, error=None, review=None)
+    result_rows = keyword_data_result_rows(keyword_data)
+    set_status(
+        "running",
+        message="Resuming after review...",
+        task_id=request.task_id,
+        error=None,
+        review=None,
+        results=result_rows,
+    )
     background_tasks.add_task(
         run_assemble_phase,
         request.task_id,
@@ -1999,7 +2108,7 @@ async def start_assemble(request: AssembleRequest, background_tasks: BackgroundT
         pending["yt_upload"],
         pending["publish_confirmed"],
     )
-    return {"message": "Assembling", "task_id": request.task_id}
+    return {"message": "Assembling", "task_id": request.task_id, "results": result_rows}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

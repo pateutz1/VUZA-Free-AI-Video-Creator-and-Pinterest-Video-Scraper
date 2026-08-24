@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ from aesthetic_scraper import (
     pick_pexels_rendition,
 )
 from app import (
+    ApiKeys,
     apply_user_keywords,
     collect_stock_videos,
     group_scenes_to_clip_budget,
@@ -22,7 +24,15 @@ from app import (
     keywords_from_topic_and_script,
     split_script_sentences,
 )
-from semantic_media import CoverageError, MediaCandidate, dedupe_candidates, round_robin_order, stock_query_plan, unique_usable_duration
+from semantic_media import (
+    CoverageError,
+    MediaCandidate,
+    dedupe_candidates,
+    pinterest_query_variants,
+    round_robin_order,
+    stock_query_plan,
+    unique_usable_duration,
+)
 
 
 def _video(asset_id, duration, width, height, link="https://example.com/a.mp4"):
@@ -174,6 +184,22 @@ class SelectionTests(unittest.TestCase):
         order = [(scene, cand.asset_id) for scene, cand in round_robin_order(groups)]
         self.assertEqual(order[:2], [(0, "a1"), (1, "b1")])
         self.assertEqual(order[2], (0, "a2"))
+
+    def test_pinterest_query_variants_never_shrink_to_one_generic_word(self):
+        variants = pinterest_query_variants("gym", sentence="Sweat drips as she grinds through squats.", topic="gym workout motivation")
+        self.assertTrue(variants)
+        self.assertTrue(all(len(v.split()) >= 2 for v in variants))
+        self.assertIn("gym sweat", variants)
+
+    def test_pinterest_query_variants_add_sentence_detail_first(self):
+        variants = pinterest_query_variants("gym workout sweat", sentence="A rower pulls hard on the machine.", topic="gym workout")
+        self.assertEqual(variants[0], "gym workout sweat")
+        self.assertIn("gym workout sweat rower", variants)
+
+    def test_pinterest_query_variants_truncate_chain_stays_multi_word(self):
+        variants = pinterest_query_variants("intense gym floor workout session", topic="gym")
+        self.assertNotIn("intense", variants)
+        self.assertTrue(all(len(v.split()) >= 2 for v in variants))
 
     def test_keep_visually_clean_media_skips_tiny_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -346,6 +372,210 @@ class StockPipelineTests(unittest.TestCase):
         self.assertNotIn("pexels", created)
         self.assertNotIn("pixabay", created)
         self.assertNotIn("coverr", created)
+
+    def test_round_robin_blends_all_ready_providers(self):
+        rows = [{"sentence": "A rover climbs red dunes.", "keyword": "mars rover dust"}]
+        created = []
+
+        def fake_make(provider, *args, **kwargs):
+            created.append(provider)
+            scraper = Mock()
+            scraper.find_videos = Mock(return_value=[
+                {
+                    "provider": provider,
+                    "asset_id": f"{provider}-1",
+                    "url": f"https://example.com/{provider}.mp4",
+                    "duration": 5,
+                    "width": 1080,
+                    "height": 1920,
+                },
+            ])
+            return scraper
+
+        downloaded_providers = []
+
+        async def download_fn(candidate, project_path, source, probe=None):
+            downloaded_providers.append(source)
+            candidate.local_path = str(Path(project_path) / f"{candidate.asset_id}.mp4")
+            Path(candidate.local_path).write_bytes(b"0" * 50000)
+            return candidate.local_path, "ok"
+
+        api_keys = ApiKeys(pexels_key="px", pixabay_key="pb", coverr_key="cv")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("app.make_scraper", side_effect=fake_make):
+                asyncio.run(collect_stock_videos(
+                    rows,
+                    source="round_robin",
+                    project_path=tmp,
+                    api_keys=api_keys,
+                    clip_duration=2,
+                    count=4,
+                    narration_duration=8,
+                    download_fn=download_fn,
+                ))
+        self.assertEqual(set(created), {"mixkit", "pexels", "pixabay", "coverr"})
+        self.assertEqual(set(downloaded_providers), {"mixkit", "pexels", "pixabay", "coverr"})
+
+    def test_spares_download_two_extra_without_affecting_selection(self):
+        rows = [{"sentence": "A rower pulls hard on the machine.", "keyword": "gym workout sweat"}]
+
+        async def search_fn(query, scene_index):
+            return [
+                {
+                    "provider": "pexels",
+                    "asset_id": f"c{i}",
+                    "url": f"https://example.com/c{i}.mp4",
+                    "duration": 5,
+                    "width": 1080,
+                    "height": 1920,
+                }
+                for i in range(6)
+            ]
+
+        downloaded = []
+
+        async def download_fn(candidate, project_path, source, probe=None):
+            downloaded.append(candidate.asset_id)
+            candidate.local_path = str(Path(project_path) / f"{candidate.asset_id}.mp4")
+            Path(candidate.local_path).write_bytes(b"0" * 50000)
+            return candidate.local_path, "ok"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            asyncio.run(collect_stock_videos(
+                rows,
+                source="pexels",
+                project_path=tmp,
+                clip_duration=2,
+                count=2,
+                narration_duration=4,
+                search_fn=search_fn,
+                download_fn=download_fn,
+            ))
+            manifest = json.loads((Path(tmp) / "source_manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(rows[0]["_files"]), 2)
+        self.assertEqual(len(rows[0]["_alternates"]), 2)
+        self.assertEqual(len(downloaded), 4)
+        self.assertEqual(len(manifest["scenes"][0]["selected"]), 2)
+        self.assertEqual(len(manifest["scenes"][0]["spares"]), 2)
+
+    def test_spares_are_skipped_when_coverage_fails(self):
+        rows = [{
+            "sentence": "A rower pulls hard on the rowing machine through every single grueling rep of this workout.",
+            "keyword": "gym workout sweat",
+        }]
+
+        async def search_fn(query, scene_index):
+            return [
+                {
+                    "provider": "pexels",
+                    "asset_id": "only",
+                    "url": "https://example.com/only.mp4",
+                    "duration": 5,
+                    "width": 1080,
+                    "height": 1920,
+                },
+            ]
+
+        async def download_fn(candidate, project_path, source, probe=None):
+            candidate.local_path = str(Path(project_path) / f"{candidate.asset_id}.mp4")
+            Path(candidate.local_path).write_bytes(b"0" * 50000)
+            return candidate.local_path, "ok"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(CoverageError):
+                asyncio.run(collect_stock_videos(
+                    rows,
+                    source="pexels",
+                    project_path=tmp,
+                    clip_duration=2,
+                    count=2,
+                    narration_duration=4,
+                    search_fn=search_fn,
+                    download_fn=download_fn,
+                ))
+        self.assertNotIn("_alternates", rows[0])
+
+    def test_pinterest_infographic_titles_are_hard_filtered(self):
+        rows = [{"sentence": "A rower pulls hard on the machine.", "keyword": "gym workout sweat"}]
+
+        async def search_fn(query, scene_index):
+            return [
+                {
+                    "provider": "pinterest",
+                    "asset_id": "infographic",
+                    "url": "https://example.com/infographic.mp4",
+                    "title": "3D anatomical muscle diagram how to",
+                    "duration": 5,
+                    "width": 1080,
+                    "height": 1920,
+                },
+                {
+                    "provider": "pinterest",
+                    "asset_id": "real",
+                    "url": "https://example.com/real.mp4",
+                    "title": "gym workout sweat",
+                    "duration": 5,
+                    "width": 1080,
+                    "height": 1920,
+                },
+            ]
+
+        async def download_fn(candidate, project_path, source, probe=None):
+            candidate.local_path = str(Path(project_path) / f"{candidate.asset_id}.mp4")
+            Path(candidate.local_path).write_bytes(b"0" * 50000)
+            return candidate.local_path, "ok"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            asyncio.run(collect_stock_videos(
+                rows,
+                source="pinterest",
+                project_path=tmp,
+                clip_duration=2,
+                count=1,
+                narration_duration=2,
+                search_fn=search_fn,
+                download_fn=download_fn,
+            ))
+        self.assertTrue(rows[0]["_files"][0].endswith("real.mp4"))
+
+    def test_round_robin_skips_providers_without_api_keys(self):
+        rows = [{"sentence": "A rover climbs red dunes.", "keyword": "mars rover dust"}]
+        created = []
+
+        def fake_make(provider, *args, **kwargs):
+            created.append(provider)
+            scraper = Mock()
+            scraper.find_videos = Mock(return_value=[
+                {
+                    "provider": provider,
+                    "asset_id": f"{provider}-1",
+                    "url": f"https://example.com/{provider}.mp4",
+                    "duration": 5,
+                    "width": 1080,
+                    "height": 1920,
+                },
+            ])
+            return scraper
+
+        async def download_fn(candidate, project_path, source, probe=None):
+            candidate.local_path = str(Path(project_path) / f"{candidate.asset_id}.mp4")
+            Path(candidate.local_path).write_bytes(b"0" * 50000)
+            return candidate.local_path, "ok"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("app.make_scraper", side_effect=fake_make):
+                asyncio.run(collect_stock_videos(
+                    rows,
+                    source="round_robin",
+                    project_path=tmp,
+                    api_keys=ApiKeys(),
+                    clip_duration=2,
+                    count=1,
+                    narration_duration=2,
+                    download_fn=download_fn,
+                ))
+        self.assertEqual(created, ["mixkit"])
 
 
 class PinterestParseTests(unittest.TestCase):

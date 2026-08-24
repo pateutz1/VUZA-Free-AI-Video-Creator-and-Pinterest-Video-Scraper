@@ -182,6 +182,56 @@ def query_broaden_chain(query, topic=""):
     return chain
 
 
+PINTEREST_MIN_QUERY_WORDS = 2
+
+
+def pinterest_query_variants(query, sentence="", topic=""):
+    """Query chain tuned for Pinterest: stays multi-word and adds a concrete visual
+    detail from the sentence instead of shrinking toward a single generic word.
+    Single-word Pinterest searches tend to surface infographic/quote boards rather
+    than real footage."""
+    base = normalize_stock_query(query)
+    base_words = [w for w in base.split() if w]
+    base_lower = {w.lower() for w in base_words}
+    sentence_words = [
+        w.lower()
+        for w in re.findall(r"[A-Za-z]{4,}", sentence or "")
+        if w.lower() not in QUERY_STOP and w.lower() not in base_lower
+    ]
+    anchors = topic_anchor_words(topic)
+
+    variants = []
+    seen = set()
+
+    def add(text):
+        text = normalize_stock_query(text)
+        key = text.lower()
+        if text and key not in seen:
+            seen.add(key)
+            variants.append(text)
+
+    if len(base_words) >= PINTEREST_MIN_QUERY_WORDS:
+        add(base)
+    if sentence_words:
+        add(f"{base} {sentence_words[0]}".strip())
+
+    words = list(base_words)
+    while len(words) > PINTEREST_MIN_QUERY_WORDS:
+        words = words[:-1]
+        add(" ".join(words))
+
+    if len(base_words) < PINTEREST_MIN_QUERY_WORDS:
+        anchor = next((a for a in anchors if a not in base_lower), "")
+        if anchor:
+            add(f"{anchor} {base}".strip())
+
+    if anchors:
+        add(f"{anchors[0]} video")
+
+    multi_word = [v for v in variants if len(v.split()) >= PINTEREST_MIN_QUERY_WORDS]
+    return multi_word or variants or ([base] if base else [])
+
+
 def keyword_length_plan(count):
     count = max(4, int(count or 4))
     return [4 - (index % 4) for index in range(count)]

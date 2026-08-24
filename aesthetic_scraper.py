@@ -1036,6 +1036,176 @@ class CoverrScraper:
         return False
 
 
+_MIXKIT_LD_JSON_RE = re.compile(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.S)
+_MIXKIT_ISO8601_DURATION_RE = re.compile(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?')
+_MIXKIT_VIDEO_ID_RE = re.compile(r'/videos/(\d+)/')
+_MIXKIT_DETAIL_HREF_RE = re.compile(r'href="(/free-stock-video/[a-z0-9\-]+-\d+/)"')
+
+
+def mixkit_iso8601_duration_seconds(value):
+    match = _MIXKIT_ISO8601_DURATION_RE.fullmatch(value or "")
+    if not match:
+        return 0.0
+    hours, minutes, seconds = (int(g) if g else 0 for g in match.groups())
+    return float(hours * 3600 + minutes * 60 + seconds)
+
+
+def mixkit_ld_json_graph(html):
+    """Mixkit embeds one schema.org JSON-LD <script> per page with an @graph array
+    (VideoObject / MusicRecording / Thing entries). No official API exists."""
+    match = _MIXKIT_LD_JSON_RE.search(html or "")
+    if not match:
+        return []
+    try:
+        data = json.loads(match.group(1))
+    except (ValueError, TypeError):
+        return []
+    graph = data.get("@graph") if isinstance(data, dict) else data
+    return graph if isinstance(graph, list) else []
+
+
+class MixkitScraper:
+    """Mixkit (mixkit.co) free stock video search. No API key, no login, no
+    attribution required. No official API — this scrapes the schema.org
+    JSON-LD block that Mixkit embeds on search and detail pages, which
+    exposes a direct, hotlinkable CDN mp4 URL per clip (assets.mixkit.co)."""
+
+    SEARCH_URL = "https://mixkit.co/free-stock-video/{slug}/"
+    HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VUZA/1.0"}
+
+    def __init__(self, output_dir="downloads/mixkit", api_key=None):
+        self.output_dir = Path(output_dir)
+        self.seen_ids = set()
+
+    def _get_folder(self, query):
+        folder = self.output_dir / re.sub(r'[^\w\-]', '_', query)[:25]
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def _fetch(self, url):
+        resp = requests.get(url, timeout=(30, 60), headers=self.HEADERS)
+        resp.raise_for_status()
+        return resp.text
+
+    async def search_images(self, query, num_images=5):
+        return []  # Mixkit has no free stock photo library, video + music only
+
+    def find_videos(self, query, aspect="9:16", min_duration=2, limit=20):
+        limit = max(1, int(limit or 20))
+        slug = re.sub(r'[^\w]+', '-', (query or "").strip().lower()).strip('-') or "nature"
+        search_url = self.SEARCH_URL.format(slug=slug)
+        try:
+            html = self._fetch(search_url)
+        except Exception as exc:
+            print(f"⚠️ Mixkit search failed: {exc}")
+            return []
+
+        candidates = []
+
+        def add_from_graph(graph):
+            for item in graph:
+                if len(candidates) >= limit:
+                    return
+                if not isinstance(item, dict) or item.get("@type") != "VideoObject":
+                    continue
+                content_url = item.get("contentUrl") or ""
+                if not content_url:
+                    continue
+                id_match = _MIXKIT_VIDEO_ID_RE.search(content_url)
+                vid_id = id_match.group(1) if id_match else content_url
+                if vid_id in self.seen_ids:
+                    continue
+                duration = mixkit_iso8601_duration_seconds(item.get("duration"))
+                if duration and duration < float(min_duration or 0):
+                    continue
+                self.seen_ids.add(vid_id)
+                candidates.append({
+                    "provider": "mixkit",
+                    "asset_id": str(vid_id),
+                    "url": content_url,
+                    "source_page": item.get("@id") or search_url,
+                    "creator": "Mixkit",
+                    "title": item.get("name") or "",
+                    "duration": duration,
+                    "width": 0,
+                    "height": 0,
+                    "query": query,
+                    "rendition": {"id": "720p"},
+                })
+
+        add_from_graph(mixkit_ld_json_graph(html))
+
+        if len(candidates) < limit:
+            for href in dict.fromkeys(_MIXKIT_DETAIL_HREF_RE.findall(html)):
+                if len(candidates) >= limit:
+                    break
+                try:
+                    detail_html = self._fetch(f"https://mixkit.co{href}")
+                except Exception:
+                    continue
+                add_from_graph(mixkit_ld_json_graph(detail_html))
+
+        print(f"  Mixkit candidates: {len(candidates)}")
+        return candidates
+
+    async def search_videos(self, query, num_videos=3, aspect="9:16", min_duration=2):
+        folder = self._get_folder(query)
+        items = await asyncio.to_thread(self.find_videos, query, aspect, min_duration, max(20, num_videos))
+        valid = [(item["url"], item["asset_id"]) for item in items[:num_videos]]
+        return await download_id_files(self.download_file, valid, folder, "mk", "mp4", MIN_VIDEO_BYTES)
+
+    def download_file(self, url, path):
+        try:
+            r = requests.get(url, timeout=60, headers=self.HEADERS)
+            if r.status_code == 200 and r.content and len(r.content) >= MIN_VIDEO_BYTES:
+                path.write_bytes(r.content)
+                return True
+        except Exception:
+            pass
+        return False
+
+
+_MIXKIT_MUSIC_ID_RE = re.compile(r'/music/(\d+)/')
+MIXKIT_MUSIC_MOODS = ("cinematic", "ambient", "upbeat", "corporate", "inspirational", "lo-fi")
+
+
+def mixkit_music_tracks(mood, limit=6):
+    """Scrape one Mixkit free-stock-music mood page (schema.org MusicRecording
+    JSON-LD, same @graph convention as the video pages) for direct mp3 URLs."""
+    url = f"https://mixkit.co/free-stock-music/{mood}/"
+    try:
+        resp = requests.get(
+            url, timeout=(30, 60),
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VUZA/1.0"},
+        )
+        resp.raise_for_status()
+        html = resp.text
+    except Exception as exc:
+        print(f"⚠️ Mixkit music fetch failed ({mood}): {exc}")
+        return []
+
+    tracks = []
+    for item in mixkit_ld_json_graph(html):
+        if not isinstance(item, dict) or item.get("@type") != "MusicRecording":
+            continue
+        track_url = item.get("url") or ""
+        if not track_url:
+            continue
+        id_match = _MIXKIT_MUSIC_ID_RE.search(track_url)
+        track_id = id_match.group(1) if id_match else track_url
+        tracks.append({
+            "id": f"mixkit-{track_id}",
+            "title": item.get("name") or f"Mixkit track {track_id}",
+            "artist": item.get("byArtist") or "",
+            "genre": item.get("genre") or mood,
+            "duration": mixkit_iso8601_duration_seconds(item.get("duration")),
+            "url": track_url,
+        })
+        if len(tracks) >= limit:
+            break
+    return tracks
+
+
 class PiAPIScraper:
     """Generate clips via PiAPI Unified API. Docs: https://piapi.ai/docs/unified-api-schema"""
 

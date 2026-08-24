@@ -92,6 +92,13 @@ class MediaQualityTests(unittest.TestCase):
         self.assertGreaterEqual(caption_line_score(words), 0.05)
         self.assertLess(caption_line_score(clean), 0.05)
 
+        gym = np.full((200, 160, 3), 40, dtype="uint8")
+        for x0 in (20, 50, 80, 110):
+            gym[90:98, x0:x0 + 18] = 220
+        from media_quality import frame_has_overlay
+        self.assertLess(caption_line_score(np.mean(gym, axis=2)), 0.10)
+        self.assertFalse(frame_has_overlay(gym))
+
     def test_compact_caption_flags_small_center_text(self):
         import numpy as np
 

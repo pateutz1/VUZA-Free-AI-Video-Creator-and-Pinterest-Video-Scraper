@@ -295,9 +295,14 @@ document.addEventListener('DOMContentLoaded', () => {
             const response = await fetch('/api/music');
             const data = await response.json();
             const files = data.files || ['none'];
+            const mixkitLabels = {};
+            (data.mixkit_tracks || []).forEach(track => {
+                const genre = track.genre ? ` (${track.genre})` : '';
+                mixkitLabels[track.id] = `🎵 ${track.title}${genre} — Mixkit`;
+            });
             allowedMusic = new Set(files);
             musicSelect.innerHTML = files.map(name => {
-                const label = name === 'none' ? 'No music' : name;
+                const label = name === 'none' ? 'No music' : (mixkitLabels[name] || name);
                 return `<option value="${name}">${label}</option>`;
             }).join('');
             musicSelect.value = files.includes(current) ? current : 'none';
@@ -441,8 +446,8 @@ document.addEventListener('DOMContentLoaded', () => {
             if (el) el.checked = true;
         };
 
-        setChecked('src-pinterest');
-        setChecked('type-photo');
+        setChecked('src-mixkit');
+        setChecked('type-video');
         setChecked('ratio-9-16');
         setChecked('emoji-subs-off');
         setChecked('vibe-suspense');
@@ -471,9 +476,12 @@ document.addEventListener('DOMContentLoaded', () => {
     document.querySelectorAll('input[name="source"], input[name="auto_video"]').forEach(input => {
         input.addEventListener('change', () => {
             const source = document.querySelector('input[name="source"]:checked')?.value;
-            if (source === 'piapi') {
+            if (source === 'piapi' || source === 'round_robin' || source === 'mixkit') {
                 const videoType = document.getElementById('type-video');
                 if (videoType) videoType.checked = true;
+            }
+            if (source === 'round_robin') {
+                if (typeof switchMode === 'function') switchMode('script');
             }
             updateProviderFallbackVisibility();
             updatePrimaryButtonText();
@@ -482,10 +490,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function updateProviderFallbackVisibility() {
         const wrap = document.getElementById('provider-fallback-wrap');
-        if (!wrap) return;
+        const roundRobinNote = document.getElementById('round-robin-note');
+        const mixkitNote = document.getElementById('mixkit-note');
         const source = document.querySelector('input[name="source"]:checked')?.value;
-        const stock = source === 'pinterest' || source === 'pexels' || source === 'pixabay' || source === 'coverr';
-        wrap.style.display = stock ? '' : 'none';
+        const stock = source === 'mixkit' || source === 'pexels' || source === 'pixabay' || source === 'coverr';
+        if (wrap) wrap.style.display = stock ? '' : 'none';
+        if (roundRobinNote) roundRobinNote.style.display = source === 'round_robin' ? '' : 'none';
+        if (mixkitNote) mixkitNote.style.display = source === 'mixkit' ? '' : 'none';
     }
     updateProviderFallbackVisibility();
 
@@ -832,6 +843,7 @@ document.addEventListener('DOMContentLoaded', () => {
         finalVideoUrl = '';
         candidateVideos = [];
         pollConnectionErrorShown = false;
+        closeReviewModal();
         galleryContainer.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-spin"></i><p>VUZA is working...</p></div>';
 
         try {
@@ -925,6 +937,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 const status = await response.json();
                 renderStatus(status);
+                maybeShowReviewPrompt(status);
                 if (status.final_video) {
                     finalVideoUrl = status.final_video;
                 }
@@ -971,6 +984,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 statusCard.classList.remove('hidden');
                 renderStatus(status);
             }
+            maybeShowReviewPrompt(status);
 
             if (status.is_running) {
                 setLoading(true);
@@ -1098,6 +1112,152 @@ document.addEventListener('DOMContentLoaded', () => {
             updatePrimaryButtonText();
             if (btnLoader) btnLoader.classList.add('hidden');
             if (btnIcon) btnIcon.classList.remove('hidden');
+        }
+    }
+
+    // ── Review & swap (post-scrape, pre-assembly) ──
+    const reviewOverlay = document.getElementById('review-overlay');
+    const reviewIntro = document.getElementById('review-intro');
+    const reviewSwap = document.getElementById('review-swap');
+    const reviewScenesEl = document.getElementById('review-scenes');
+    const reviewUseDefaultBtn = document.getElementById('review-use-default-btn');
+    const reviewOpenBtn = document.getElementById('review-open-btn');
+    const reviewBackBtn = document.getElementById('review-back-btn');
+    const reviewContinueBtn = document.getElementById('review-continue-btn');
+
+    let reviewData = null;
+    let reviewSelections = [];
+    let reviewShownTaskId = '';
+
+    function isVideoUrl(url) {
+        return /\.(mp4|mov|webm)$/i.test(url || '');
+    }
+
+    function reviewThumbHtml(entry, idx, selected) {
+        const media = isVideoUrl(entry.url)
+            ? `<video src="${entry.url}" preload="metadata" muted loop onmouseover="this.play()" onmouseout="this.pause()"></video>`
+            : `<img src="${entry.url}" loading="lazy">`;
+        return `
+            <div class="review-thumb${selected ? ' selected' : ''}" data-scene="${idx}" data-path="${encodeURIComponent(entry.path)}">
+                ${media}
+                <span class="review-check"><i class="fas fa-check"></i></span>
+                ${entry.provider ? `<span class="review-provider">${entry.provider}</span>` : ''}
+            </div>
+        `;
+    }
+
+    function renderReviewScenes() {
+        if (!reviewData || !reviewScenesEl) return;
+        reviewScenesEl.innerHTML = reviewData.scenes.map((scene, idx) => {
+            const seen = new Set();
+            const pool = [...scene.selected, ...scene.alternates].filter((entry) => {
+                if (!entry.path || seen.has(entry.path)) return false;
+                seen.add(entry.path);
+                return true;
+            });
+            const selectedSet = reviewSelections[idx];
+            const thumbs = pool.map((entry) => reviewThumbHtml(entry, idx, selectedSet.has(entry.path))).join('');
+            const count = selectedSet.size;
+            const cap = reviewData.count;
+            return `
+                <div class="review-scene">
+                    <div class="review-scene-head">
+                        <strong>${scene.keyword || `Scene ${idx + 1}`}</strong>
+                        <span class="review-scene-cap${count >= cap ? ' limit-hit' : ''}">${count}/${cap} selected</span>
+                    </div>
+                    ${scene.sentence ? `<p class="review-scene-sentence">"${scene.sentence}"</p>` : ''}
+                    <div class="review-pool">${thumbs}</div>
+                </div>
+            `;
+        }).join('');
+
+        reviewScenesEl.querySelectorAll('.review-thumb').forEach((thumb) => {
+            thumb.addEventListener('click', () => {
+                const idx = Number(thumb.dataset.scene);
+                const path = decodeURIComponent(thumb.dataset.path);
+                const selectedSet = reviewSelections[idx];
+                const cap = reviewData.count;
+                if (selectedSet.has(path)) {
+                    selectedSet.delete(path);
+                } else if (selectedSet.size >= cap) {
+                    showToast(`Scene ${idx + 1}: assets-per-scene limit is ${cap}. Deselect a clip first.`, 'error');
+                    return;
+                } else {
+                    selectedSet.add(path);
+                }
+                renderReviewScenes();
+            });
+        });
+    }
+
+    function openReviewModal(review) {
+        reviewData = review;
+        reviewSelections = review.scenes.map((scene) => new Set(scene.selected.map((e) => e.path)));
+        if (reviewIntro) reviewIntro.classList.remove('hidden');
+        if (reviewSwap) reviewSwap.classList.add('hidden');
+        const introText = document.getElementById('review-intro-text');
+        if (introText) {
+            introText.textContent = `Scraping is done for ${review.scenes.length} scene(s). Review and swap clips before VUZA generates voiceover and assembles the video, or continue with the default pick.`;
+        }
+        if (reviewOverlay) reviewOverlay.classList.remove('hidden');
+    }
+
+    function closeReviewModal() {
+        if (reviewOverlay) reviewOverlay.classList.add('hidden');
+        reviewData = null;
+        reviewSelections = [];
+    }
+
+    async function submitAssemble(payload) {
+        try {
+            const response = await fetch('/api/assemble', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ task_id: activeTaskId, ...payload })
+            });
+            if (!response.ok) {
+                showToast(await readErrorMessage(response, 'Could not resume assembly'), 'error');
+                return;
+            }
+            closeReviewModal();
+            setLoading(true);
+            showToast('Resuming: generating voiceover and video...', 'success');
+        } catch (error) {
+            showToast('Network error while resuming assembly', 'error');
+        }
+    }
+
+    if (reviewUseDefaultBtn) {
+        reviewUseDefaultBtn.addEventListener('click', () => submitAssemble({ use_default: true }));
+    }
+    if (reviewOpenBtn) {
+        reviewOpenBtn.addEventListener('click', () => {
+            if (reviewIntro) reviewIntro.classList.add('hidden');
+            if (reviewSwap) reviewSwap.classList.remove('hidden');
+            renderReviewScenes();
+        });
+    }
+    if (reviewBackBtn) {
+        reviewBackBtn.addEventListener('click', () => {
+            if (reviewSwap) reviewSwap.classList.add('hidden');
+            if (reviewIntro) reviewIntro.classList.remove('hidden');
+        });
+    }
+    if (reviewContinueBtn) {
+        reviewContinueBtn.addEventListener('click', () => {
+            const emptyIdx = reviewSelections.findIndex((set) => set.size === 0);
+            if (emptyIdx !== -1) {
+                showToast(`Scene ${emptyIdx + 1} needs at least 1 clip selected.`, 'error');
+                return;
+            }
+            submitAssemble({ selections: reviewSelections.map((set) => Array.from(set)) });
+        });
+    }
+
+    function maybeShowReviewPrompt(status) {
+        if (status && status.status === 'awaiting_review' && status.review && status.task_id && status.task_id !== reviewShownTaskId) {
+            reviewShownTaskId = status.task_id;
+            openReviewModal(status.review);
         }
     }
 

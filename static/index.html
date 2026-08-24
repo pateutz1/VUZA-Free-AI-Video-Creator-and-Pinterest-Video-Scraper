@@ -9,7 +9,7 @@
         content="VUZA free AI video creator: turn a topic or script into stock footage, voiceover, subtitles, and a 9:16 short.">
     <meta name="keywords"
         content="VUZA, free ai video creator, faceless video generator, money printer tool, pinterest video scraper, pinterest scraper, free pictory ai alternative, free invideo alternative, moneyprinter turbo, pexels video downloader, pixabay scraper, edge tts, ai voiceover, auto subtitles, open source video tool, python video creator, script to video, tiktok video maker, youtube shorts creator, instagram reels, ai automation, free video generation, content creation tool">
-    <link rel="stylesheet" href="/static/style.css?v=5.0">
+    <link rel="stylesheet" href="/static/style.css?v=5.1">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap"
         rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
@@ -53,13 +53,13 @@
 
                 <div class="hero-highlight">
                     <i class="fas fa-trophy"></i>
-                    <span><strong>Defaults:</strong> Pinterest stock, Chinese suspense template still available, Edge TTS, high-retention captions, 9:16 output.</span>
+                    <span><strong>Defaults:</strong> Mixkit stock, Chinese suspense template still available, Edge TTS, high-retention captions, 9:16 output.</span>
                 </div>
 
                 <div class="hero-features">
                     <div class="feature-item"><i class="fas fa-robot"></i> AI scripts in multiple languages</div>
                     <div class="feature-item"><i class="fas fa-layer-group"></i> Batch multiple scripts</div>
-                    <div class="feature-item"><i class="fab fa-pinterest-p"></i> First-class Pinterest search</div>
+                    <div class="feature-item"><i class="fas fa-play-circle"></i> Mixkit free stock video + music</div>
                     <div class="feature-item"><i class="fas fa-image"></i> Pexels, Pixabay, and Coverr</div>
                     <div class="feature-item"><i class="fas fa-microphone"></i> Edge TTS + ElevenLabs</div>
                     <div class="feature-item"><i class="fas fa-closed-captioning"></i> High-retention captions</div>
@@ -287,8 +287,8 @@
                     <div class="setting-card">
                         <div class="setting-label"><i class="fas fa-globe"></i> Media source</div>
                         <div class="pill-group quad">
-                            <input type="radio" id="src-pinterest" name="source" value="pinterest" checked>
-                            <label for="src-pinterest"><i class="fab fa-pinterest-p"></i> Pinterest</label>
+                            <input type="radio" id="src-mixkit" name="source" value="mixkit" checked>
+                            <label for="src-mixkit"><i class="fas fa-play-circle"></i> Mixkit</label>
                             <input type="radio" id="src-pexels" name="source" value="pexels">
                             <label for="src-pexels"><i class="fas fa-camera"></i> Pexels</label>
                             <input type="radio" id="src-pixabay" name="source" value="pixabay">
@@ -299,8 +299,12 @@
                             <label for="src-local"><i class="fas fa-folder"></i> Local</label>
                              <input type="radio" id="src-piapi" name="source" value="piapi">
                              <label for="src-piapi"><i class="fas fa-bolt"></i> PiAPI</label>
+                             <input type="radio" id="src-round-robin" name="source" value="round_robin">
+                             <label for="src-round-robin"><i class="fas fa-sync-alt"></i> Round-Robin</label>
                          </div>
                          <p class="settings-note">PiAPI is paid. Hailuo creates one 6-second AI clip per detected script scene and asks for confirmation before every run.</p>
+                         <p class="settings-note" id="round-robin-note">Round-Robin searches Mixkit, Pexels, Pixabay, and Coverr together per scene and blends the best matches. Requires narration script mode + video type; add API keys for any providers you have.</p>
+                         <p class="settings-note" id="mixkit-note">Mixkit is free stock video (no API key). It has no photo library — Photos switches to Videos automatically.</p>
                          <div id="provider-fallback-wrap">
                             <div class="setting-label" style="margin-top:0.75rem">Provider fallback</div>
                             <div class="pill-group">
@@ -315,9 +319,9 @@
                     <div class="setting-card">
                         <div class="setting-label"><i class="fas fa-photo-video"></i> Media type</div>
                         <div class="pill-group">
-                            <input type="radio" id="type-photo" name="media_type" value="photo" checked>
+                            <input type="radio" id="type-photo" name="media_type" value="photo">
                             <label for="type-photo"><i class="fas fa-image"></i> Photos</label>
-                            <input type="radio" id="type-video" name="media_type" value="video">
+                            <input type="radio" id="type-video" name="media_type" value="video" checked>
                             <label for="type-video"><i class="fas fa-video"></i> Videos</label>
                         </div>
                     </div>
@@ -573,19 +577,19 @@
                 </div>
             </div>
 
-            <!-- ═══ PINTEREST SHOWCASE ═══ -->
+            <!-- ═══ MIXKIT SHOWCASE ═══ -->
             <div class="pinterest-showcase">
                 <div class="showcase-badge">First-class source</div>
-                <h3><i class="fab fa-pinterest"></i> Pinterest stock search</h3>
-                <p>VUZA keeps Pinterest, Pexels, Pixabay, Coverr, and local uploads. Default source is Pinterest. There is no AI-image generation mode.</p>
-                <p>If you use Pinterest, follow that platform’s terms and respect asset licenses.</p>
+                <h3><i class="fas fa-play-circle"></i> Mixkit stock search</h3>
+                <p>VUZA defaults to Mixkit, plus Pexels, Pixabay, Coverr, Round-Robin, and local uploads. Mixkit is free stock video and music (no API key). There is no AI-image generation mode.</p>
+                <p>If you reuse stock clips, follow each provider’s license terms.</p>
                 <div class="showcase-features">
                     <span><i class="fas fa-check-circle"></i> Keyword search</span>
-                    <span><i class="fas fa-check-circle"></i> Extracts Pinterest links</span>
-                    <span><i class="fas fa-check-circle"></i> Photos and videos</span>
-                    <span><i class="fas fa-check-circle"></i> Browser automation</span>
+                    <span><i class="fas fa-check-circle"></i> Direct CDN mp4</span>
+                    <span><i class="fas fa-check-circle"></i> Free stock music</span>
+                    <span><i class="fas fa-check-circle"></i> No API key</span>
                 </div>
-                <p class="showcase-credit"><i class="fas fa-heart"></i> If you reuse the Pinterest scraper in your own project, keep the original author credit.</p>
+                <p class="showcase-credit"><i class="fas fa-heart"></i> Mixkit clips are free for commercial use; keep Mixkit’s license terms if you redistribute.</p>
             </div>
 
             <!-- ═══ GALLERY ═══ -->
@@ -637,8 +641,31 @@
         </div>
     </div> <!-- end page-layout -->
 
+    <!-- ═══ REVIEW / SWAP MODAL ═══ -->
+    <div id="review-overlay" class="review-overlay hidden">
+        <div class="review-modal">
+            <div id="review-intro">
+                <h3><i class="fas fa-clapperboard"></i> Review scraped media?</h3>
+                <p id="review-intro-text">Scraping is done. Review and swap clips before VUZA generates voiceover and assembles the video, or continue with the default pick.</p>
+                <div class="review-modal-actions">
+                    <button type="button" id="review-use-default-btn" class="action-btn"><i class="fas fa-forward"></i> Use default selection</button>
+                    <button type="button" id="review-open-btn" class="secondary-btn"><i class="fas fa-sliders-h"></i> Review &amp; swap clips</button>
+                </div>
+            </div>
+            <div id="review-swap" class="hidden">
+                <h3><i class="fas fa-clapperboard"></i> Review &amp; swap clips</h3>
+                <p>Tap a clip to select or deselect it. Each scene keeps up to its "Assets per scene" limit.</p>
+                <div id="review-scenes"></div>
+                <div class="review-footer">
+                    <button type="button" id="review-back-btn" class="secondary-btn"><i class="fas fa-arrow-left"></i> Back</button>
+                    <button type="button" id="review-continue-btn" class="action-btn"><i class="fas fa-play"></i> Continue to voiceover &amp; assembly</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <div id="toast" class="toast hidden"></div>
-    <script src="/static/script.js?v=6.2"></script>
+    <script src="/static/script.js?v=6.5"></script>
 </body>
 
 </html>

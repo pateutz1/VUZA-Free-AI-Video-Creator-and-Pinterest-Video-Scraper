@@ -6,6 +6,7 @@ import inspect
 import json
 import random
 import sys
+import time
 import uuid
 from fastapi import FastAPI, HTTPException, BackgroundTasks, File, Form, UploadFile
 from fastapi.staticfiles import StaticFiles
@@ -24,7 +25,7 @@ for stream in (sys.stdout, sys.stderr):
 # Built by Ali R. | github.com/AliRash3ed
 # ═══════════════════════════════════════════════════════════════
 
-from aesthetic_scraper import PinterestScraper, PexelsScraper, PixabayScraper, CoverrScraper, PiAPIScraper, LLMProcessor, WebScraper, LLM_PROVIDER_PRESETS, pinterest_mp4_urls, pinterest_pin_page, download_pinterest_with_ytdlp
+from aesthetic_scraper import PinterestScraper, PexelsScraper, PixabayScraper, CoverrScraper, MixkitScraper, PiAPIScraper, LLMProcessor, WebScraper, LLM_PROVIDER_PRESETS, pinterest_mp4_urls, pinterest_pin_page, download_pinterest_with_ytdlp, mixkit_music_tracks, MIXKIT_MUSIC_MOODS
 from media_quality import content_fingerprint, delete_rejected_file, download_http, last_download_error, redact_secret, reset_download_fail_logs, validate_downloaded_video, MIN_VIDEO_BYTES
 from semantic_media import (
     CoverageError,
@@ -39,6 +40,7 @@ from semantic_media import (
     fit_keyword_length,
     fallback_stock_query,
     query_broaden_chain,
+    pinterest_query_variants,
     stock_query_plan,
     visual_query_plan,
     normalize_stock_query,
@@ -48,6 +50,7 @@ from semantic_media import (
     selected_record,
     unique_usable_duration,
     write_source_manifest,
+    UNREALISTIC_PIN_RE,
 )
 
 app = FastAPI(title="VUZA — Free AI Video Creator")
@@ -69,8 +72,12 @@ scraping_status = {
     "is_running": False, "progress": 0,
     "message": "Ready", "mode": "single", "results": [],
     "status": "idle", "final_video": None, "error": None,
-    "task_id": None, "candidates": [],
+    "task_id": None, "candidates": [], "review": None,
 }
+
+# Holds phase-2 inputs (keyword_data, project paths, settings) while a job is
+# paused for review. Keyed by task_id; single-job app, so at most one entry.
+pending_assembly = {}
 
 # ── Models ──
 class VideoSettings(BaseModel):
@@ -130,6 +137,11 @@ class ScrapeRequest(BaseModel):
     keywords: Optional[List[str]] = None
     provider_fallback: bool = False
 
+class AssembleRequest(BaseModel):
+    task_id: str
+    use_default: bool = False
+    selections: Optional[List[List[str]]] = None  # per-scene ordered local file paths, len <= assets/scene
+
 class VoicePreviewRequest(BaseModel):
     text: str = "This is a VUZA voice preview."
     voice: str = "en-US-ChristopherNeural"
@@ -159,7 +171,7 @@ LLM_PROVIDER_MODELS = {
     "oneapi": ["gpt-4o-mini", "deepseek-chat"],
 }
 
-VALID_SOURCES = {"pinterest", "pexels", "pixabay", "coverr", "piapi", "local"}
+VALID_SOURCES = {"pinterest", "pexels", "pixabay", "coverr", "mixkit", "piapi", "local", "round_robin"}
 VALID_MEDIA_TYPES = {"photo", "video"}
 VALID_MODES = {"single", "script"}
 VALID_TRANSITIONS = {"none", "fade", "zoom_in", "zoom_out", "slide"}
@@ -232,7 +244,13 @@ async def list_music():
     files = ["none"]
     if music_dir.exists():
         files.extend(sorted(p.name for p in music_dir.iterdir() if p.suffix.lower() in {".mp3", ".wav", ".m4a"} and p.stat().st_size > 0))
-    return {"files": files}
+    mixkit_tracks = []
+    try:
+        mixkit_tracks = await asyncio.to_thread(mixkit_music_catalog)
+    except Exception as exc:
+        print(f"⚠️ Mixkit music catalog unavailable: {exc}")
+    files.extend(track["id"] for track in mixkit_tracks)
+    return {"files": files, "mixkit_tracks": mixkit_tracks}
 
 @app.post("/api/analyze")
 async def analyze_script(request: ScrapeRequest):
@@ -448,6 +466,7 @@ def sanitize_upload_filename(filename):
 def make_scraper(src, output_dir, api_keys=None):
     keys = api_keys or ApiKeys()
     if src == "pinterest": return PinterestScraper(output_dir=output_dir)
+    if src == "mixkit": return MixkitScraper(output_dir=output_dir)
     if src == "pexels": return PexelsScraper(output_dir=output_dir, api_key=keys.pexels_key)
     if src == "pixabay": return PixabayScraper(output_dir=output_dir, api_key=keys.pixabay_key)
     if src == "coverr": return CoverrScraper(output_dir=output_dir, api_key=keys.coverr_key)
@@ -496,7 +515,9 @@ def normalize_scrape_request_options(request):
 def validate_scrape_request_options(request):
     normalize_scrape_request_options(request)
     if request.source not in VALID_SOURCES:
-        raise RuntimeError(f"Invalid media source: {request.source}. Choose pinterest, pexels, pixabay, coverr, piapi, or local.")
+        raise RuntimeError(f"Invalid media source: {request.source}. Choose mixkit, pexels, pixabay, coverr, pinterest, piapi, local, or round_robin.")
+    if request.source == "round_robin" and not (request.mode == "script" and request.media_type == "video"):
+        raise RuntimeError("Round-Robin requires script mode and video media type (it searches Mixkit, Pexels, Pixabay, and Coverr together per scene).")
     if request.media_type not in VALID_MEDIA_TYPES:
         raise RuntimeError(f"Invalid media type: {request.media_type}. Choose photo or video.")
     if request.mode not in VALID_MODES:
@@ -639,7 +660,9 @@ def normalize_status_progress(progress):
 def set_status(status=None, message=None, progress=None, error=_UNSET, final_video=_UNSET, **extra):
     if status:
         scraping_status["status"] = status
-        scraping_status["is_running"] = status == "running"
+        # awaiting_review pauses the job (not finished, not actively working) — keep
+        # is_running true so the UI keeps polling and a new job can't clobber it.
+        scraping_status["is_running"] = status in ("running", "awaiting_review")
     if message is not None:
         scraping_status["message"] = message
     if progress is not None:
@@ -805,10 +828,55 @@ def require_media_files(files, label):
         raise RuntimeError(f"No usable media found for: {label}. Try another keyword or source, or check the stock API key/network.")
     return valid
 
+MIXKIT_MUSIC_CACHE_TTL = 6 * 3600  # seconds
+MIXKIT_MUSIC_TRACKS_PER_MOOD = 6
+MIXKIT_MUSIC_DOWNLOAD_DIR = DOWNLOAD_DIR / "_mixkit_music"
+_mixkit_music_cache = {"tracks": [], "fetched_at": 0.0}
+
+
+def mixkit_music_catalog(force=False):
+    """In-memory cached catalog of Mixkit free-stock-music tracks (video+music
+    only provider; scraped, no API key). Refetched at most every MIXKIT_MUSIC_CACHE_TTL."""
+    now = time.time()
+    if not force and _mixkit_music_cache["tracks"] and (now - _mixkit_music_cache["fetched_at"]) < MIXKIT_MUSIC_CACHE_TTL:
+        return _mixkit_music_cache["tracks"]
+    tracks = []
+    seen_ids = set()
+    for mood in MIXKIT_MUSIC_MOODS:
+        for track in mixkit_music_tracks(mood, limit=MIXKIT_MUSIC_TRACKS_PER_MOOD):
+            if track["id"] in seen_ids:
+                continue
+            seen_ids.add(track["id"])
+            tracks.append(track)
+    if tracks:
+        _mixkit_music_cache["tracks"] = tracks
+        _mixkit_music_cache["fetched_at"] = now
+    return tracks or _mixkit_music_cache["tracks"]
+
+
+def resolve_mixkit_music_file(track_id):
+    numeric_id = track_id.split("-", 1)[1] if "-" in track_id else track_id
+    safe_id = re.sub(r"[^\w\-]", "_", numeric_id) or "track"
+    cache_path = MIXKIT_MUSIC_DOWNLOAD_DIR / f"{safe_id}.mp3"
+    if cache_path.exists() and cache_path.stat().st_size > 0:
+        return str(cache_path)
+
+    track = next((t for t in mixkit_music_catalog() if t["id"] == track_id), None)
+    if not track:
+        raise RuntimeError(f"Mixkit music track '{track_id}' is no longer available. Choose another track or “No music”.")
+    MIXKIT_MUSIC_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    ok = download_http(track["url"], cache_path, 60, 20000, True)
+    if not ok or not cache_path.exists() or cache_path.stat().st_size <= 0:
+        raise RuntimeError(f"Could not download Mixkit music track '{track.get('title') or track_id}'. Choose another track or “No music”.")
+    return str(cache_path)
+
+
 def resolve_background_music(settings):
     music = (settings.music or "none").strip()
     if not music or music.lower() == "none":
         return None
+    if music.startswith("mixkit-"):
+        return resolve_mixkit_music_file(music)
     if Path(music).name != music:
         raise RuntimeError("Background music filename is invalid. Choose a track from the dropdown.")
 
@@ -916,12 +984,15 @@ async def universal_search(keyword, media_type, count, primary_source, project_p
 
     return collected
 
-STOCK_VIDEO_SOURCES = {"pexels", "pixabay", "coverr", "pinterest"}
+STOCK_VIDEO_SOURCES = {"pexels", "pixabay", "coverr", "mixkit", "pinterest", "round_robin"}
+STOCK_ALL_PROVIDERS = ("mixkit", "pexels", "pixabay", "coverr")
+SPARE_CLIPS_PER_SCENE = 2
 STOCK_FALLBACK_CHAINS = {
+    "mixkit": ["pexels", "pixabay", "coverr"],
     "pinterest": ["pexels", "pixabay", "coverr"],
-    "pexels": ["pinterest", "pixabay", "coverr"],
-    "pixabay": ["pexels", "pinterest", "coverr"],
-    "coverr": ["pexels", "pixabay", "pinterest"],
+    "pexels": ["mixkit", "pixabay", "coverr"],
+    "pixabay": ["pexels", "mixkit", "coverr"],
+    "coverr": ["pexels", "pixabay", "mixkit"],
 }
 _SEARCH_CACHE = None
 
@@ -938,7 +1009,11 @@ def stock_fallback_providers(primary, enable_fallback=False):
 def stock_provider_ready(provider, api_keys=None):
     keys = api_keys or ApiKeys()
     provider = (provider or "").strip().lower()
+    if provider == "round_robin":
+        return True
     if provider == "pinterest":
+        return True
+    if provider == "mixkit":
         return True
     if provider == "pexels":
         return bool((keys.pexels_key or "").strip())
@@ -947,6 +1022,14 @@ def stock_provider_ready(provider, api_keys=None):
     if provider == "coverr":
         return bool((keys.coverr_key or "").strip())
     return False
+
+
+def resolve_stock_providers(source, api_keys=None):
+    """Round-Robin blends every ready stock provider; otherwise just the one picked source."""
+    if source == "round_robin":
+        ready = [p for p in STOCK_ALL_PROVIDERS if stock_provider_ready(p, api_keys)]
+        return ready or list(STOCK_ALL_PROVIDERS)
+    return [source]
 
 
 def seed_selected_from_keyword_data(keyword_data, clip_duration):
@@ -979,6 +1062,49 @@ def seed_selected_from_keyword_data(keyword_data, clip_duration):
     return selected, taken_keys
 
 
+def scene_review_entry(candidate_or_path, fallback_id=""):
+    if isinstance(candidate_or_path, MediaCandidate):
+        path = candidate_or_path.local_path
+        return {
+            "path": path,
+            "url": relative_download_path(path) if path else "",
+            "provider": candidate_or_path.provider,
+            "asset_id": candidate_or_path.asset_id,
+        }
+    path = str(candidate_or_path)
+    return {"path": path, "url": relative_download_path(path), "provider": "", "asset_id": fallback_id or Path(path).stem}
+
+
+def build_scene_review(keyword_data, count):
+    scenes = []
+    for idx, item in enumerate(keyword_data):
+        selected = [scene_review_entry(c) for c in (item.get("_candidates") or [])]
+        if not selected:
+            selected = [scene_review_entry(p) for p in existing_media_paths(item.get("_files"))]
+        alternates = [scene_review_entry(c) for c in (item.get("_alternates") or [])]
+        scenes.append({
+            "index": idx,
+            "keyword": item.get("keyword"),
+            "sentence": item.get("sentence"),
+            "selected": selected,
+            "alternates": alternates,
+        })
+    return {"scenes": scenes, "count": count}
+
+
+def build_scene_pools(keyword_data):
+    pools = {}
+    for idx, item in enumerate(keyword_data):
+        pool = set()
+        for candidate in (item.get("_candidates") or []) + (item.get("_alternates") or []):
+            if isinstance(candidate, MediaCandidate) and candidate.local_path:
+                pool.add(candidate.local_path)
+        if not pool:
+            pool = {str(p) for p in existing_media_paths(item.get("_files"))}
+        pools[idx] = pool
+    return pools
+
+
 def get_search_cache():
     global _SEARCH_CACHE
     if _SEARCH_CACHE is None:
@@ -1007,7 +1133,7 @@ def candidate_from_dict(item, scene_index, query):
 async def download_stock_candidate(candidate, project_path, source, probe=None, fetcher=None):
     folder = Path(project_path) / source / re.sub(r"[^\w\-]", "_", candidate.query or "scene")[:25]
     folder.mkdir(parents=True, exist_ok=True)
-    prefix = {"pexels": "vid", "pixabay": "v", "coverr": "c"}.get(source, "vid")
+    prefix = {"pexels": "vid", "pixabay": "v", "coverr": "c", "mixkit": "mk"}.get(source, "vid")
     safe_id = re.sub(r"[^\w\-]", "_", str(candidate.asset_id or "x"))[:48] or "x"
     path = folder / f"{prefix}_{safe_id}.mp4"
     existed = path.exists() and path.stat().st_size >= MIN_VIDEO_BYTES
@@ -1087,7 +1213,13 @@ async def collect_stock_videos(
     needed = max(1, int(count or 1))
     search_limit = max(12, min(24, needed * 6))
     cache = cache if cache is not None else get_search_cache()
-    scraper = make_scraper(source, project_path, api_keys)
+    providers = resolve_stock_providers(source, api_keys)
+    scrapers = {provider: make_scraper(provider, project_path, api_keys) for provider in providers}
+    scrapers = {provider: s for provider, s in scrapers.items() if s is not None}
+    if not scrapers and providers:
+        scrapers = {providers[0]: make_scraper(providers[0], project_path, api_keys)}
+    if len(providers) > 1:
+        print(f"🔀 Round-Robin providers: {', '.join(scrapers.keys())}")
     rejection_log = {idx: [] for idx in range(len(keyword_data))}
     alt_queries = {idx: [] for idx in range(len(keyword_data))}
     seen_keys = set()
@@ -1096,6 +1228,8 @@ async def collect_stock_videos(
     print("🧭 Query plan:")
     for idx, query in enumerate(plan or stock_query_plan(keyword_data)):
         print(f"  {idx + 1}. {query} ({len(query.split())} words)")
+
+    per_provider_limit = max(4, search_limit // max(1, len(scrapers)))
 
     async def search_query(query, scene_index, broaden=True):
         if search_fn:
@@ -1108,50 +1242,66 @@ async def collect_stock_videos(
 
         merged = []
         origin = "live"
-        finder = getattr(scraper, "find_videos", None)
-        chain = query_broaden_chain(query, topic) if broaden else [normalize_stock_query(query)]
-        for variant in chain:
-            if not variant:
+        scene_sentence = ""
+        if 0 <= scene_index < len(keyword_data):
+            scene_sentence = keyword_data[scene_index].get("sentence") or ""
+        for provider, provider_scraper in scrapers.items():
+            finder = getattr(provider_scraper, "find_videos", None)
+            if finder is None:
                 continue
-            if finder and inspect.iscoroutinefunction(finder):
-                try:
-                    raw = await finder(variant, aspect=aspect, min_duration=clip_duration, limit=search_limit)
-                except Exception as exc:
-                    print(f"⚠️ Provider search failed ({source} {variant!r}): {redact_secret(exc)}")
-                    origin = "error"
-                    continue
-                print(f"  🔎 {variant!r} → {len(raw or [])} hits")
-                for item in raw or []:
-                    merged.append(candidate_from_dict(item, scene_index, variant))
+            if not broaden:
+                chain = [normalize_stock_query(query)]
+            elif provider == "pinterest":
+                chain = pinterest_query_variants(query, scene_sentence, topic)
             else:
-                def live_search(variant=variant):
-                    inner = getattr(scraper, "find_videos", None)
-                    if inner is None:
-                        return []
-                    return [
-                        candidate_from_dict(raw, scene_index, variant)
-                        for raw in (inner(variant, aspect=aspect, min_duration=clip_duration, limit=search_limit) or [])
-                    ]
+                chain = query_broaden_chain(query, topic)
+            for variant in chain:
+                if not variant:
+                    continue
+                if inspect.iscoroutinefunction(finder):
+                    try:
+                        raw = await finder(variant, aspect=aspect, min_duration=clip_duration, limit=per_provider_limit)
+                    except Exception as exc:
+                        print(f"⚠️ Provider search failed ({provider} {variant!r}): {redact_secret(exc)}")
+                        origin = "error"
+                        continue
+                    print(f"  🔎 [{provider}] {variant!r} → {len(raw or [])} hits")
+                    for item in raw or []:
+                        merged.append(candidate_from_dict(item, scene_index, variant))
+                else:
+                    def live_search(variant=variant, provider_scraper=provider_scraper):
+                        inner = getattr(provider_scraper, "find_videos", None)
+                        if inner is None:
+                            return []
+                        return [
+                            candidate_from_dict(raw, scene_index, variant)
+                            for raw in (inner(variant, aspect=aspect, min_duration=clip_duration, limit=per_provider_limit) or [])
+                        ]
 
-                items, origin = await asyncio.to_thread(
-                    search_with_cache,
-                    cache,
-                    source,
-                    variant,
-                    int(clip_duration),
-                    aspect,
-                    live_search,
-                )
-                print(f"  🔎 {variant!r} → {len(items)} hits")
-                for item in items:
-                    item.scene_index = scene_index
-                    item.query = variant
-                merged.extend(items)
+                    items, item_origin = await asyncio.to_thread(
+                        search_with_cache,
+                        cache,
+                        provider,
+                        variant,
+                        int(clip_duration),
+                        aspect,
+                        live_search,
+                    )
+                    if item_origin == "error":
+                        origin = "error"
+                    print(f"  🔎 [{provider}] {variant!r} → {len(items)} hits")
+                    for item in items:
+                        item.scene_index = scene_index
+                        item.query = variant
+                    merged.extend(items)
         return merged, origin
 
     def keep_candidate(candidate, scene_index):
         if not candidate.url or not candidate.asset_id:
             rejection_log[scene_index].append({"asset_id": candidate.asset_id, "reason": "missing url or id"})
+            return False
+        if candidate.provider == "pinterest" and UNREALISTIC_PIN_RE.search(f"{candidate.title} {candidate.query}"):
+            rejection_log[scene_index].append({"asset_id": candidate.asset_id, "reason": "unrealistic pin"})
             return False
         if candidate.provider != "pinterest" and candidate.duration and candidate.duration < clip_duration:
             rejection_log[scene_index].append({"asset_id": candidate.asset_id, "reason": "too short"})
@@ -1192,9 +1342,11 @@ async def collect_stock_videos(
     pointers = [0] * len(keyword_data)
     download_fail_count = 0
     abort_provider = False
-    session_fetcher = None
-    if source == "pinterest" and hasattr(scraper, "download_bytes"):
-        session_fetcher = scraper.download_bytes
+    fetchers = {
+        provider: provider_scraper.download_bytes
+        for provider, provider_scraper in scrapers.items()
+        if hasattr(provider_scraper, "download_bytes")
+    }
     if any(selected):
         print(
             f"  📎 seeded {sum(len(group) for group in selected)} clip(s) from prior providers"
@@ -1212,12 +1364,13 @@ async def collect_stock_videos(
             if any(key in taken_keys for key in keys):
                 continue
             downloader = download_fn or download_stock_candidate
-            print(f"  ⬇️ scene {scene_index + 1} {candidate.query!r} id={candidate.asset_id}")
+            effective_provider = candidate.provider or source
+            print(f"  ⬇️ scene {scene_index + 1} [{effective_provider}] {candidate.query!r} id={candidate.asset_id}")
             if download_fn:
-                path, reason = await downloader(candidate, project_path, source, probe)
+                path, reason = await downloader(candidate, project_path, effective_provider, probe)
             else:
                 path, reason = await download_stock_candidate(
-                    candidate, project_path, source, probe, fetcher=session_fetcher
+                    candidate, project_path, effective_provider, probe, fetcher=fetchers.get(effective_provider)
                 )
             if path:
                 print(f"  ✅ kept {Path(path).name}")
@@ -1285,6 +1438,20 @@ async def collect_stock_videos(
 
     await fill_missing_with_alts()
 
+    async def collect_spares():
+        """Best-effort: download up to SPARE_CLIPS_PER_SCENE extra clips per scene
+        (same keyword pool) so the review step has something to swap in. Never
+        counted toward coverage — run only after the required count is met."""
+        spare_target = needed + SPARE_CLIPS_PER_SCENE
+        for scene_index in range(len(keyword_data)):
+            if abort_provider:
+                return
+            while len(selected[scene_index]) < spare_target:
+                chosen = await take_next(scene_index)
+                if not chosen:
+                    break
+                selected[scene_index].append(chosen)
+
     visual_cap = needed * clip_duration
     scenes_for_coverage = []
     for item in keyword_data:
@@ -1307,15 +1474,25 @@ async def collect_stock_videos(
         f"clip={clip_duration}s rejections={sum(len(v) for v in rejection_log.values())}"
     )
 
+    if not failures:
+        await collect_spares()
+        spare_count = sum(max(0, len(group) - needed) for group in selected)
+        if spare_count:
+            print(f"  🎞️ downloaded {spare_count} spare clip(s) for review/swap")
+
     manifest_scenes = []
     for idx, item in enumerate(keyword_data):
-        chosen = selected[idx]
+        chosen_all = selected[idx]
+        chosen = chosen_all[:needed]
+        alternates = chosen_all[needed:]
         paths = [c.local_path for c in chosen if c.local_path]
         if paths:
             item["_files"] = paths
             item["_candidates"] = chosen
         else:
             item["_error"] = describe_empty_media_result(source, "video")
+        if alternates:
+            item["_alternates"] = alternates
         manifest_scenes.append({
             "index": idx,
             "sentence": item.get("sentence"),
@@ -1323,6 +1500,7 @@ async def collect_stock_videos(
             "alternatives": alt_queries[idx],
             "provider": source,
             "selected": [selected_record(c) for c in chosen],
+            "spares": [selected_record(c) for c in alternates],
             "rejections": rejection_log[idx],
             "reused": False,
         })
@@ -1334,16 +1512,18 @@ async def collect_stock_videos(
         "scenes": manifest_scenes,
     })
 
+    async def close_scrapers():
+        for provider_scraper in scrapers.values():
+            closer = getattr(provider_scraper, "aclose", None)
+            if inspect.iscoroutinefunction(closer):
+                await closer()
+
     if failures:
-        closer = getattr(scraper, "aclose", None)
-        if inspect.iscoroutinefunction(closer):
-            await closer()
+        await close_scrapers()
         raise CoverageError(
             format_coverage_error(failures, source, clip_duration, estimated_narration, unique_total)
         )
-    closer = getattr(scraper, "aclose", None)
-    if inspect.iscoroutinefunction(closer):
-        await closer()
+    await close_scrapers()
     return selected
 
 
@@ -1409,6 +1589,108 @@ async def collect_stock_videos_with_fallback(
     return None
 
 
+async def run_video_assembly(
+    keyword_data,
+    project_path,
+    project_name,
+    media_type,
+    settings,
+    api_keys,
+    vibe,
+    yt_upload=False,
+    publish_confirmed=False,
+    progress_label="",
+):
+    """Voiceover + create_video + thumbnail + optional YouTube upload for one project.
+    Shared by the single-pass flow and the post-review /api/assemble phase."""
+    label = f" {progress_label}" if progress_label else ""
+    validate_scene_images(keyword_data, project_path)
+    scraping_status["message"] = f"Generating voiceover{label}..."
+    engine = load_video_engine()(output_dir=project_path.parent)
+    if api_keys.eleven_key:
+        engine.set_eleven_key(api_keys.eleven_key)
+    voice = settings.voice if settings.voice != "none" else None
+    if not voice:
+        raise RuntimeError("Auto video requires a TTS voice; voice=none cannot produce one narration file per scene.")
+
+    sem = asyncio.Semaphore(3)
+
+    async def sem_voiceover(text, i):
+        async with sem:
+            return await engine.generate_voiceover(
+                text, i, voice=voice, language=settings.language,
+                voice_rate=settings.voice_rate, voice_volume=settings.voice_volume,
+            )
+    await asyncio.gather(*[sem_voiceover(item["sentence"], idx) for idx, item in enumerate(keyword_data)])
+    validate_tts_files(engine, len(keyword_data))
+
+    settings.vibe = vibe
+    bg_music = resolve_background_music(settings)
+    candidate_count = max(1, min(5, int(settings.video_count or 1)))
+    candidates = []
+    video_path = None
+    video_file = None
+    for candidate_idx in range(candidate_count):
+        scraping_status["message"] = f"Assembling video{label} candidate {candidate_idx+1}/{candidate_count}..."
+        video_file = await asyncio.to_thread(
+            engine.create_video, keyword_data, project_path, media_type,
+            bg_music=bg_music, settings=settings,
+            output_name=f"final_aesthetic_video_{candidate_idx+1}.mp4" if candidate_count > 1 else "final_aesthetic_video.mp4",
+        )
+        video_path = validate_final_video(video_file)
+        video_rel = relative_download_path(video_path)
+        candidates.append(video_rel)
+        scraping_status["results"].append({"keyword": f"Assembled video {candidate_idx+1}", "files": [video_rel]})
+        if candidate_idx == 0:
+            set_status(final_video=video_rel)
+    set_status(candidates=candidates)
+
+    thumb_file = engine.generate_thumbnail(str(video_path), project_name.replace("_", " ").title())
+    if thumb_file:
+        with contextlib.suppress(Exception):
+            thumb_rel = "/" + str(Path(thumb_file).relative_to(BASE_DIR)).replace("\\", "/")
+            scraping_status["results"].append({"keyword": "Thumbnail", "files": [thumb_rel]})
+
+    scraping_status["message"] = f"Video ready: {project_name}/final_aesthetic_video.mp4"
+
+    if yt_upload and publish_confirmed and video_file and api_keys.yt_client_id and api_keys.yt_client_secret:
+        scraping_status["message"] = "Uploading to YouTube..."
+        try:
+            uploader = load_youtube_uploader()(api_keys.yt_client_id, api_keys.yt_client_secret)
+            title = project_name.replace("_", " ").title()
+            await asyncio.to_thread(uploader.upload_video, str(video_path), title, "Automated video created with VUZA.", [])
+            scraping_status["message"] += " (uploaded to YouTube)"
+        except Exception as e:
+            scraping_status["message"] += f" (upload failed: {e})"
+
+
+async def run_assemble_phase(
+    task_id,
+    keyword_data,
+    project_path,
+    project_name,
+    media_type,
+    settings,
+    api_keys,
+    vibe,
+    yt_upload,
+    publish_confirmed,
+):
+    """Background task for POST /api/assemble: resumes a paused (awaiting_review) job."""
+    try:
+        await run_video_assembly(
+            keyword_data, project_path, project_name, media_type, settings, api_keys, vibe,
+            yt_upload=yt_upload, publish_confirmed=publish_confirmed,
+        )
+        set_status("success", progress=100)
+    except Exception as e:
+        set_status("error", message=f"Error: {str(e)}", progress=100, error=str(e))
+        import traceback
+        traceback.print_exc()
+    finally:
+        scraping_status["is_running"] = False
+
+
 # ── Main Scraping ──
 async def run_scrape(request: ScrapeRequest):
     global scraping_status
@@ -1421,9 +1703,11 @@ async def run_scrape(request: ScrapeRequest):
         final_video=None,
         results=[],
         candidates=[],
+        review=None,
         mode=request.mode,
         task_id=task_id,
     )
+    pending_assembly.pop(task_id, None)
 
     try:
         validate_scrape_request_options(request)
@@ -1561,62 +1845,38 @@ async def run_scrape(request: ScrapeRequest):
                             item["_error"] = describe_empty_media_result(source, media_type)
                         set_status(progress=((script_idx) / len(scripts)) * 100 + ((idx + 1) / total) * (100 / len(scripts)) * 0.8)
 
-                if request.auto_video:
+                # Pause before assembly so the user can review/swap scraped clips first.
+                # Only offered for the common single-project stock-video path; batch
+                # script runs keep the original single-pass behavior.
+                review_eligible = request.auto_video and use_stock_pipeline and len(scripts) == 1
+                if review_eligible:
                     validate_scene_images(keyword_data, project_path)
-                    scraping_status["message"] = f"Generating voiceover {script_idx+1}/{len(scripts)}..."
-                    engine = load_video_engine()(output_dir=project_path.parent)
-                    if api_keys.eleven_key:
-                        engine.set_eleven_key(api_keys.eleven_key)
-                    voice = settings.voice if settings.voice != "none" else None
-                    if not voice:
-                        raise RuntimeError("Auto video requires a TTS voice; voice=none cannot produce one narration file per scene.")
-
-                    sem = asyncio.Semaphore(3)
-                    async def sem_voiceover(text, i):
-                        async with sem:
-                            return await engine.generate_voiceover(
-                                text, i, voice=voice, language=settings.language,
-                                voice_rate=settings.voice_rate, voice_volume=settings.voice_volume,
-                            )
-                    await asyncio.gather(*[sem_voiceover(item["sentence"], idx) for idx, item in enumerate(keyword_data)])
-                    validate_tts_files(engine, len(keyword_data))
-
-                    settings.vibe = request.vibe
-                    bg_music = resolve_background_music(settings)
-                    candidate_count = max(1, min(5, int(settings.video_count or 1)))
-                    candidates = []
-                    for candidate_idx in range(candidate_count):
-                        scraping_status["message"] = f"Assembling video {script_idx+1}/{len(scripts)} candidate {candidate_idx+1}/{candidate_count}..."
-                        video_file = await asyncio.to_thread(
-                            engine.create_video, keyword_data, project_path, media_type,
-                            bg_music=bg_music, settings=settings,
-                            output_name=f"final_aesthetic_video_{candidate_idx+1}.mp4" if candidate_count > 1 else "final_aesthetic_video.mp4",
-                        )
-                        video_path = validate_final_video(video_file)
-                        video_rel = relative_download_path(video_path)
-                        candidates.append(video_rel)
-                        scraping_status["results"].append({"keyword": f"Assembled video {candidate_idx+1}", "files": [video_rel]})
-                        if candidate_idx == 0:
-                            set_status(final_video=video_rel)
-                    set_status(candidates=candidates)
-
-                    thumb_file = engine.generate_thumbnail(str(video_path), project_name.replace("_", " ").title())
-                    if thumb_file:
-                        with contextlib.suppress(Exception):
-                            thumb_rel = "/" + str(Path(thumb_file).relative_to(BASE_DIR)).replace("\\", "/")
-                            scraping_status["results"].append({"keyword": "Thumbnail", "files": [thumb_rel]})
-
-                    scraping_status["message"] = f"Video ready: {project_name}/final_aesthetic_video.mp4"
-
-                    if request.yt_upload and request.publish_confirmed and video_file and api_keys.yt_client_id and api_keys.yt_client_secret:
-                        scraping_status["message"] = "Uploading to YouTube..."
-                        try:
-                            uploader = load_youtube_uploader()(api_keys.yt_client_id, api_keys.yt_client_secret)
-                            title = project_name.replace("_", " ").title()
-                            await asyncio.to_thread(uploader.upload_video, str(video_path), title, "Automated video created with VUZA.", [])
-                            scraping_status["message"] += " (uploaded to YouTube)"
-                        except Exception as e:
-                            scraping_status["message"] += f" (upload failed: {e})"
+                    pending_assembly[task_id] = {
+                        "keyword_data": keyword_data,
+                        "project_path": project_path,
+                        "project_name": project_name,
+                        "media_type": media_type,
+                        "settings": settings,
+                        "api_keys": api_keys,
+                        "vibe": request.vibe,
+                        "yt_upload": request.yt_upload,
+                        "publish_confirmed": request.publish_confirmed,
+                        "scene_pools": build_scene_pools(keyword_data),
+                        "count": count,
+                    }
+                    set_status(
+                        "awaiting_review",
+                        message=f"Review {len(keyword_data)} scene(s) or continue with the default selection",
+                        progress=90,
+                        review=build_scene_review(keyword_data, count),
+                    )
+                    return
+                elif request.auto_video:
+                    await run_video_assembly(
+                        keyword_data, project_path, project_name, media_type, settings, api_keys,
+                        request.vibe, yt_upload=request.yt_upload, publish_confirmed=request.publish_confirmed,
+                        progress_label=f"{script_idx+1}/{len(scripts)}",
+                    )
                 else:
                     validate_scene_images(keyword_data, project_path)
                     scraping_status["message"] = f"Assets saved to {project_name}/ (video assembly off)"
@@ -1650,7 +1910,10 @@ async def run_scrape(request: ScrapeRequest):
         import traceback
         traceback.print_exc()
     finally:
-        scraping_status["is_running"] = False
+        # awaiting_review is a deliberate pause, not completion — leave is_running
+        # true so /api/scrape keeps rejecting new jobs until /api/assemble resumes it.
+        if scraping_status.get("status") != "awaiting_review":
+            scraping_status["is_running"] = False
 
 @app.post("/api/scrape")
 async def start_scrape(request: ScrapeRequest, background_tasks: BackgroundTasks):
@@ -1674,9 +1937,51 @@ async def start_scrape(request: ScrapeRequest, background_tasks: BackgroundTasks
         )
         raise HTTPException(status_code=400, detail=detail) from exc
     task_id = uuid.uuid4().hex[:12]
-    set_status(task_id=task_id, status="queued", message="Queued", progress=0, error=None, results=[], candidates=[], final_video=None, mode=request.mode)
+    set_status(task_id=task_id, status="queued", message="Queued", progress=0, error=None, results=[], candidates=[], final_video=None, review=None, mode=request.mode)
     background_tasks.add_task(run_scrape, request)
     return {"message": "Started", "task_id": task_id}
+
+@app.post("/api/assemble")
+async def start_assemble(request: AssembleRequest, background_tasks: BackgroundTasks):
+    pending = pending_assembly.get(request.task_id)
+    if not pending:
+        raise HTTPException(
+            status_code=404,
+            detail="No pending review for this task. It may have already been assembled or expired.",
+        )
+
+    keyword_data = pending["keyword_data"]
+    if request.selections:
+        if len(request.selections) != len(keyword_data):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Expected {len(keyword_data)} scene selection(s), got {len(request.selections)}.",
+            )
+        pools = pending["scene_pools"]
+        cap = pending["count"]
+        for idx, paths in enumerate(request.selections):
+            pool = pools.get(idx, set())
+            cleaned = [p for p in (paths or []) if p in pool][:cap]
+            if not cleaned:
+                raise HTTPException(status_code=400, detail=f"Scene {idx + 1} has no valid selection.")
+            keyword_data[idx]["_files"] = cleaned
+
+    pending_assembly.pop(request.task_id, None)
+    set_status("running", message="Resuming after review...", task_id=request.task_id, error=None, review=None)
+    background_tasks.add_task(
+        run_assemble_phase,
+        request.task_id,
+        keyword_data,
+        pending["project_path"],
+        pending["project_name"],
+        pending["media_type"],
+        pending["settings"],
+        pending["api_keys"],
+        pending["vibe"],
+        pending["yt_upload"],
+        pending["publish_confirmed"],
+    )
+    return {"message": "Assembling", "task_id": request.task_id}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

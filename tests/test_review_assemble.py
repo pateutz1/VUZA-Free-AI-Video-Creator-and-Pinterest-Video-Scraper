@@ -1,0 +1,180 @@
+import shutil
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+from fastapi.testclient import TestClient
+
+import app as app_module
+from app import (
+    ApiKeys,
+    DOWNLOAD_DIR,
+    VideoSettings,
+    app as fastapi_app,
+    build_scene_pools,
+    build_scene_review,
+    pending_assembly,
+    scraping_status,
+)
+from semantic_media import MediaCandidate
+
+
+def _candidate(provider, asset_id, path):
+    return MediaCandidate(provider=provider, asset_id=asset_id, local_path=str(path))
+
+
+class ReviewPayloadTests(unittest.TestCase):
+    def setUp(self):
+        self.project_dir = Path(tempfile.mkdtemp(dir=DOWNLOAD_DIR))
+        self.addCleanup(shutil.rmtree, self.project_dir, ignore_errors=True)
+
+    def _touch(self, name):
+        path = self.project_dir / name
+        path.write_bytes(b"0" * 10)
+        return path
+
+    def test_build_scene_review_lists_selected_and_alternates(self):
+        selected = [_candidate("pexels", "a1", self._touch("a1.mp4"))]
+        alternates = [
+            _candidate("pixabay", "a2", self._touch("a2.mp4")),
+            _candidate("coverr", "a3", self._touch("a3.mp4")),
+        ]
+        keyword_data = [{
+            "keyword": "gym workout sweat",
+            "sentence": "A rower pulls hard.",
+            "_candidates": selected,
+            "_alternates": alternates,
+        }]
+
+        review = build_scene_review(keyword_data, count=1)
+
+        self.assertEqual(len(review["scenes"]), 1)
+        scene = review["scenes"][0]
+        self.assertEqual(scene["keyword"], "gym workout sweat")
+        self.assertEqual(len(scene["selected"]), 1)
+        self.assertEqual(len(scene["alternates"]), 2)
+        self.assertEqual(scene["selected"][0]["provider"], "pexels")
+        self.assertTrue(scene["selected"][0]["url"].startswith("/downloads/"))
+        self.assertEqual(review["count"], 1)
+
+    def test_build_scene_review_falls_back_to_files_without_candidates(self):
+        path = self._touch("plain.mp4")
+        keyword_data = [{"keyword": "k", "sentence": "s", "_files": [str(path)]}]
+
+        review = build_scene_review(keyword_data, count=2)
+
+        scene = review["scenes"][0]
+        self.assertEqual(len(scene["selected"]), 1)
+        self.assertEqual(scene["selected"][0]["path"], str(path))
+        self.assertEqual(scene["alternates"], [])
+
+    def test_build_scene_pools_includes_selected_and_alternates(self):
+        selected = [_candidate("pexels", "a1", self._touch("a1.mp4"))]
+        alternates = [_candidate("pixabay", "a2", self._touch("a2.mp4"))]
+        keyword_data = [{"_candidates": selected, "_alternates": alternates}]
+
+        pools = build_scene_pools(keyword_data)
+
+        self.assertEqual(pools[0], {selected[0].local_path, alternates[0].local_path})
+
+
+class AssembleEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(fastapi_app)
+        self.project_dir = Path(tempfile.mkdtemp(dir=DOWNLOAD_DIR))
+        self.addCleanup(shutil.rmtree, self.project_dir, ignore_errors=True)
+        self.addCleanup(pending_assembly.clear)
+
+    def _touch(self, name):
+        path = self.project_dir / name
+        path.write_bytes(b"0" * 10)
+        return str(path)
+
+    def _seed_pending(self, task_id, cap=2):
+        path_a, path_b, path_c = (self._touch(f"{n}.mp4") for n in "abc")
+        keyword_data = [{"keyword": "k", "sentence": "s", "_files": [path_a]}]
+        pending_assembly[task_id] = {
+            "keyword_data": keyword_data,
+            "project_path": self.project_dir,
+            "project_name": "proj",
+            "media_type": "video",
+            "settings": VideoSettings(),
+            "api_keys": ApiKeys(),
+            "vibe": "aesthetic",
+            "yt_upload": False,
+            "publish_confirmed": False,
+            "scene_pools": {0: {path_a, path_b, path_c}},
+            "count": cap,
+        }
+        return keyword_data, [path_a, path_b, path_c]
+
+    def test_assemble_missing_task_returns_404(self):
+        response = self.client.post("/api/assemble", json={"task_id": "missing"})
+        self.assertEqual(response.status_code, 404)
+
+    @patch("app.run_assemble_phase", new_callable=AsyncMock)
+    def test_assemble_uses_default_when_no_selections(self, mock_phase):
+        keyword_data, paths = self._seed_pending("t1")
+        response = self.client.post("/api/assemble", json={"task_id": "t1", "use_default": True})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(keyword_data[0]["_files"], [paths[0]])
+        self.assertNotIn("t1", pending_assembly)
+
+    @patch("app.run_assemble_phase", new_callable=AsyncMock)
+    def test_assemble_applies_valid_swap_selection(self, mock_phase):
+        keyword_data, paths = self._seed_pending("t2")
+        response = self.client.post(
+            "/api/assemble", json={"task_id": "t2", "selections": [[paths[1], paths[2]]]}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(keyword_data[0]["_files"], [paths[1], paths[2]])
+
+    @patch("app.run_assemble_phase", new_callable=AsyncMock)
+    def test_assemble_rejects_path_outside_scene_pool(self, mock_phase):
+        keyword_data, paths = self._seed_pending("t3")
+        response = self.client.post(
+            "/api/assemble", json={"task_id": "t3", "selections": [["/etc/passwd"]]}
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("t3", pending_assembly)
+        self.assertEqual(keyword_data[0]["_files"], [paths[0]])
+
+    @patch("app.run_assemble_phase", new_callable=AsyncMock)
+    def test_assemble_caps_selection_to_assets_per_scene(self, mock_phase):
+        keyword_data, paths = self._seed_pending("t4", cap=2)
+        response = self.client.post("/api/assemble", json={"task_id": "t4", "selections": [paths]})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(keyword_data[0]["_files"]), 2)
+
+    @patch("app.run_assemble_phase", new_callable=AsyncMock)
+    def test_assemble_rejects_scene_count_mismatch(self, mock_phase):
+        keyword_data, paths = self._seed_pending("t5")
+        response = self.client.post(
+            "/api/assemble",
+            json={"task_id": "t5", "selections": [[paths[0]], [paths[1]]]},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("t5", pending_assembly)
+
+
+class StatusReviewStateTests(unittest.TestCase):
+    def tearDown(self):
+        app_module.set_status(
+            "idle", message="Ready", progress=0, error=None,
+            results=[], candidates=[], review=None, final_video=None,
+        )
+
+    def test_awaiting_review_keeps_is_running_true(self):
+        app_module.set_status("awaiting_review", message="Review", progress=90, review={"scenes": []})
+        self.assertTrue(scraping_status["is_running"])
+
+    def test_running_then_success_flips_is_running(self):
+        app_module.set_status("running")
+        self.assertTrue(scraping_status["is_running"])
+        app_module.set_status("success")
+        self.assertFalse(scraping_status["is_running"])
+
+
+if __name__ == "__main__":
+    unittest.main()

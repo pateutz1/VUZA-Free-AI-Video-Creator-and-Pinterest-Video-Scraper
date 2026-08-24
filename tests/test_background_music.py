@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -12,6 +13,8 @@ from fastapi import BackgroundTasks, HTTPException
 from app import (
     ALLOWED_UPLOAD_SUFFIXES,
     ApiKeys,
+    MIXKIT_MUSIC_DOWNLOAD_DIR,
+    MIXKIT_MUSIC_MOODS,
     ScrapeRequest,
     UPLOAD_DIR,
     VALID_SOURCES,
@@ -20,6 +23,7 @@ from app import (
     group_scenes_to_clip_budget,
     is_fatal_scene_media_error,
     local_script_segments,
+    mixkit_music_catalog,
     normalized_script_inputs,
     resolve_path_within_directory,
     set_status,
@@ -32,6 +36,7 @@ from app import (
     validate_scrape_request_options,
     validate_script_keyword_key,
 )
+import app as app_module
 from aesthetic_scraper import CoverrScraper, PiAPIScraper, LLMProcessor, LLM_PROVIDER_PRESETS, is_hd_resolution, matches_video_aspect
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -198,6 +203,80 @@ class BackgroundMusicResolutionTests(unittest.TestCase):
             resolve_background_music(settings)
 
 
+class MixkitMusicTests(unittest.TestCase):
+    def setUp(self):
+        app_module._mixkit_music_cache["tracks"] = []
+        app_module._mixkit_music_cache["fetched_at"] = 0.0
+
+    tearDown = setUp
+
+    def test_catalog_dedupes_across_moods_and_caches(self):
+        track = {
+            "id": "mixkit-1", "title": "Track", "artist": "A",
+            "genre": "Ambient", "duration": 60.0, "url": "https://assets.mixkit.co/music/1/1.mp3",
+        }
+        with patch("app.mixkit_music_tracks", return_value=[track]) as fake_fetch:
+            tracks = mixkit_music_catalog()
+        self.assertEqual(tracks, [track])
+        self.assertEqual(fake_fetch.call_count, len(MIXKIT_MUSIC_MOODS))
+
+        with patch("app.mixkit_music_tracks") as fake_fetch_again:
+            tracks_again = mixkit_music_catalog()
+        fake_fetch_again.assert_not_called()
+        self.assertEqual(tracks_again, [track])
+
+    def test_resolve_mixkit_music_downloads_and_caches_locally(self):
+        track = {
+            "id": "mixkit-999", "title": "Test Track", "artist": "A",
+            "genre": "Ambient", "duration": 60.0, "url": "https://assets.mixkit.co/music/999/999.mp3",
+        }
+        app_module._mixkit_music_cache["tracks"] = [track]
+        app_module._mixkit_music_cache["fetched_at"] = time.time()
+        cache_path = MIXKIT_MUSIC_DOWNLOAD_DIR / "999.mp3"
+        self.addCleanup(lambda: cache_path.unlink(missing_ok=True))
+
+        def fake_download(url, path, timeout, min_bytes, verify):
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_bytes(b"x" * 30000)
+            return True
+
+        with patch("app.download_http", side_effect=fake_download):
+            resolved = resolve_background_music(VideoSettings(music="mixkit-999"))
+
+        self.assertEqual(resolved, str(cache_path))
+        self.assertTrue(cache_path.exists())
+
+    def test_resolve_mixkit_music_missing_track_raises(self):
+        with patch("app.mixkit_music_catalog", return_value=[]):
+            with self.assertRaisesRegex(RuntimeError, "no longer available"):
+                resolve_background_music(VideoSettings(music="mixkit-doesnotexist"))
+
+    def test_resolve_mixkit_music_download_failure_raises(self):
+        track = {
+            "id": "mixkit-777", "title": "Broken Track", "artist": "A",
+            "genre": "Ambient", "duration": 60.0, "url": "https://assets.mixkit.co/music/777/777.mp3",
+        }
+        app_module._mixkit_music_cache["tracks"] = [track]
+        app_module._mixkit_music_cache["fetched_at"] = time.time()
+        cache_path = MIXKIT_MUSIC_DOWNLOAD_DIR / "777.mp3"
+        self.addCleanup(lambda: cache_path.unlink(missing_ok=True))
+
+        with patch("app.download_http", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "Could not download Mixkit music track"):
+                resolve_background_music(VideoSettings(music="mixkit-777"))
+
+    def test_api_music_includes_mixkit_tracks(self):
+        track = {
+            "id": "mixkit-42", "title": "Chill", "artist": "A",
+            "genre": "Lo-fi", "duration": 90.0, "url": "https://assets.mixkit.co/music/42/42.mp3",
+        }
+        with patch("app.mixkit_music_catalog", return_value=[track]):
+            status, data = asyncio.run(get_json("/api/music"))
+        self.assertEqual(status, 200)
+        self.assertIn("mixkit-42", data["files"])
+        self.assertEqual(data["mixkit_tracks"], [track])
+
+
 class SourceContractTests(unittest.TestCase):
     def test_default_source_is_pinterest(self):
         self.assertEqual(ScrapeRequest().source, "pinterest")
@@ -216,7 +295,7 @@ class SourceContractTests(unittest.TestCase):
         self.assertIn("piapi_model", ApiKeys.model_fields)
 
     def test_valid_sources_exclude_ai(self):
-        self.assertEqual(VALID_SOURCES, {"pinterest", "pexels", "pixabay", "coverr", "piapi", "local"})
+        self.assertEqual(VALID_SOURCES, {"pinterest", "pexels", "pixabay", "coverr", "mixkit", "piapi", "local", "round_robin"})
         self.assertNotIn("ai", VALID_SOURCES)
 
     def test_api_scrape_rejects_ai_source_with_english_detail(self):
@@ -233,13 +312,15 @@ class SourceContractTests(unittest.TestCase):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         js = (ROOT / "static" / "script.js").read_text(encoding="utf-8")
         self.assertIn('id="script"', html)
-        self.assertIn('id="src-pinterest"', html)
-        self.assertIn("checked", html.split('id="src-pinterest"', 1)[1][:80])
+        self.assertIn('id="src-mixkit"', html)
+        self.assertIn("checked", html.split('id="src-mixkit"', 1)[1][:80])
+        self.assertNotIn('id="src-pinterest"', html)
         self.assertNotIn("src-ai", html)
         self.assertNotIn("seedream", html.lower())
         self.assertIn("getElementById('script')", js)
         self.assertNotIn("src-ai", js)
-        self.assertIn("src-pinterest", js)
+        self.assertIn("src-mixkit", js)
+        self.assertNotIn("src-pinterest", js)
         self.assertIn('id="src-piapi"', html)
         self.assertIn("PiAPI is paid", html)
         self.assertIn("window.confirm", js)

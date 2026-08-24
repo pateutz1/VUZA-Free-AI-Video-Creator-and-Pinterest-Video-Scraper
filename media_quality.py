@@ -379,49 +379,33 @@ def frames_are_frozen(frames):
     return bool(diffs) and max(diffs) < 2.5
 
 
-def frame_has_overlay(frame):
+def overlay_reason(frame):
+    """Which overlay heuristic fired, or None. Gym lights/bars often trip a
+    single mid-frame caption-line hit around 0.05 of frame height; require a
+    thicker run (0.10) so those don't count as burned-in text."""
     import numpy as np
 
     if frame is None:
-        return False
+        return None
     gray = np.mean(frame, axis=2)
     if overlay_text_score(gray) >= 0.28:
-        return True
-    if caption_line_score(gray) >= 0.05:
-        return True
+        return "edges"
+    if caption_line_score(gray) >= 0.10:
+        return "caption-line"
     if compact_caption_score(gray) >= 0.004:
-        return True
+        return "compact-caption"
     if red_banner_score(frame) >= 0.04:
-        return True
-    return False
+        return "red-banner"
+    return None
+
+
+def frame_has_overlay(frame):
+    return overlay_reason(frame) is not None
 
 
 def video_has_overlay_text(path):
-    try:
-        from moviepy import VideoFileClip
-    except Exception:
-        return False
-    clip = None
-    try:
-        clip = VideoFileClip(str(path), audio=False)
-        duration = float(clip.duration or 0)
-        if duration <= 0:
-            return False
-        stamps = [min(max(duration * 0.08, 0), max(duration - 0.05, 0))]
-        if duration > 2:
-            stamps.append(min(max(duration * 0.4, 0), max(duration - 0.05, 0)))
-        for stamp in stamps:
-            if frame_has_overlay(clip.get_frame(stamp)):
-                return True
-        return False
-    except Exception:
-        return False
-    finally:
-        if clip is not None:
-            try:
-                clip.close()
-            except Exception:
-                pass
+    """Disabled: Mixkit/Pexels/Pixabay/Coverr stock is clean; Pinterest is off the UI."""
+    return False
 
 
 def probe_and_scan_overlay(path):
@@ -439,13 +423,6 @@ def probe_and_scan_overlay(path):
         duration = info["duration"]
         if duration <= 0 or info["fps"] <= 0:
             return info, "non-positive duration or fps"
-        overlay_stamps = [
-            min(max(max(duration * frac, 0.35), 0), max(duration - 0.05, 0))
-            for frac in ((0.35, 0.55, 0.75) if duration > 2 else (0.5,))
-        ]
-        for stamp in overlay_stamps:
-            if frame_has_overlay(clip.get_frame(stamp)):
-                return info, "text overlay"
         quality_frames = []
         for frac in (0.25, 0.5, 0.75):
             stamp = min(max(duration * frac, 0), max(duration - 0.05, 0))

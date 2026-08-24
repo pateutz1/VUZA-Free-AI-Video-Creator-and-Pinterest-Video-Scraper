@@ -227,8 +227,9 @@ class CaptionLayoutTests(unittest.TestCase):
 
     def test_bottom_sits_in_lower_third(self):
         y = subtitle_top(1920, 120, "bottom", 70)
-        self.assertGreater(y, 1920 * 0.6)
-        self.assertLess(y, 1920 - 120)
+        self.assertGreater(y, 1920 * 0.8)
+        self.assertLess(y + 120, 1920)
+        self.assertGreater(y + 120, 1920 * 0.88)
 
     def test_default_caption_font_resolves_from_project_static_fonts(self):
         path = resolve_font_path("BeVietnamPro-Bold.ttf")

@@ -76,7 +76,7 @@ def subtitle_top(frame_h, text_h, position="bottom", custom_pct=70.0):
         except (TypeError, ValueError):
             pct = 70.0
     else:
-        pct = 78.0
+        pct = 80.0
     pct = max(0.0, min(100.0, pct))
     y = frame_h * (pct / 100.0) - text_h / 2.0
     margin = 24

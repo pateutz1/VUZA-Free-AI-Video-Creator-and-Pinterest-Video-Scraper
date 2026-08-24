@@ -9,7 +9,7 @@
         content="VUZA free AI video creator: turn a topic or script into stock footage, voiceover, subtitles, and a 9:16 short.">
     <meta name="keywords"
         content="VUZA, free ai video creator, faceless video generator, money printer tool, pinterest video scraper, pinterest scraper, free pictory ai alternative, free invideo alternative, moneyprinter turbo, pexels video downloader, pixabay scraper, edge tts, ai voiceover, auto subtitles, open source video tool, python video creator, script to video, tiktok video maker, youtube shorts creator, instagram reels, ai automation, free video generation, content creation tool">
-    <link rel="stylesheet" href="/static/style.css?v=5.3">
+    <link rel="stylesheet" href="/static/style.css?v=5.5">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap"
         rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
@@ -282,14 +282,21 @@
                 <div class="settings-grid source-type-grid">
                     <div class="setting-card source-card">
                         <div class="setting-label"><i class="fas fa-globe"></i> Media source</div>
-                        <select id="source-select" class="custom-select" name="source">
-                            <option value="mixkit" selected>Mixkit</option>
-                            <option value="pexels">Pexels</option>
-                            <option value="pixabay">Pixabay</option>
-                            <option value="coverr">Coverr</option>
-                            <option value="local">Local</option>
-                            <option value="round_robin">Round-Robin</option>
-                        </select>
+                        <div class="source-dropdown" id="source-dropdown">
+                            <select id="source-select" class="source-select-native" name="source" tabindex="-1" aria-hidden="true">
+                                <option value="mixkit" selected>Mixkit</option>
+                                <option value="pexels">Pexels</option>
+                                <option value="pixabay">Pixabay</option>
+                                <option value="coverr">Coverr</option>
+                                <option value="local">Local</option>
+                                <option value="round_robin">Round-Robin</option>
+                            </select>
+                            <button type="button" class="source-dropdown-toggle" id="source-dropdown-toggle" aria-expanded="false" aria-haspopup="listbox">
+                                <span id="source-dropdown-label">Mixkit</span>
+                                <i class="fas fa-chevron-down source-dropdown-caret"></i>
+                            </button>
+                            <ul class="source-dropdown-menu" id="source-dropdown-menu" role="listbox" hidden></ul>
+                        </div>
                         <p class="settings-note" id="round-robin-note">Round-Robin searches Mixkit, Pexels, Pixabay, and Coverr together per scene and blends the best matches. Requires narration script mode + video type; add API keys for any providers you have.</p>
                         <p class="settings-note" id="mixkit-note">Mixkit is free stock video (no API key). It has no photo library — Photos switches to Videos automatically.</p>
                         <div id="provider-fallback-wrap">
@@ -667,7 +674,7 @@
     </div>
 
     <div id="toast" class="toast hidden"></div>
-    <script src="/static/script.js?v=7.4"></script>
+    <script src="/static/script.js?v=7.6"></script>
 </body>
 
 </html>

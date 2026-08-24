@@ -202,7 +202,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (testBtn) testBtn.addEventListener('click', testProviderApi);
         ['llm-key', 'llm-model', 'llm-url'].forEach((id) => {
             const el = document.getElementById(id);
-            if (el) el.addEventListener('input', saveCurrentProvider);
+            if (el) el.addEventListener('input', persistKeysSoon);
         });
     }
 
@@ -249,6 +249,8 @@ document.addEventListener('DOMContentLoaded', () => {
         targets.forEach(([provider, inputId, statusId, btnId, label]) => {
             const btn = document.getElementById(btnId);
             if (btn) btn.addEventListener('click', () => testStockApi(provider, inputId, statusId, btnId, label));
+            const keyEl = document.getElementById(inputId);
+            if (keyEl) keyEl.addEventListener('input', persistKeysSoon);
         });
     }
 
@@ -294,6 +296,73 @@ document.addEventListener('DOMContentLoaded', () => {
         localStorage.setItem('vuza_api_keys', JSON.stringify(clean));
     }
 
+    let keysSaveTimer = null;
+    function persistKeysSoon() {
+        saveCurrentProvider();
+        clearTimeout(keysSaveTimer);
+        keysSaveTimer = setTimeout(() => persistKeys(getKeys()), 200);
+    }
+
+    const PANEL_SETTINGS_KEY = 'vuza_panel_settings';
+    const PANEL_SKIP_IDS = new Set([
+        'llm-key', 'llm-url', 'llm-model', 'llm-preset',
+        'pexels-key', 'pixabay-key', 'coverr-key',
+        'yt-client-id', 'yt-client-secret', 'eleven-key',
+        'query', 'url-input', 'topic-input', 'keywords-input', 'script',
+        'local-files', 'ai-title', 'ai-desc', 'ai-hashtags', 'ai-thumb-prompt',
+    ]);
+    const RANGE_LABELS = {
+        count: ['count-val', (v) => v],
+        'bgm-volume': ['bgm-vol-val', (v) => v],
+        'clip-duration': ['clip-dur-val', (v) => v],
+        'video-count': ['video-count-val', (v) => v],
+        'voice-rate': ['voice-rate-val', (v) => (Number(v) / 100).toFixed(1)],
+        'voice-volume': ['voice-vol-val', (v) => v],
+        'font-size': ['font-size-val', (v) => v],
+        'stroke-width': ['stroke-width-val', (v) => v],
+    };
+    let restoringPanel = false;
+    let panelSaveTimer = null;
+
+    function syncRangeLabel(el) {
+        const spec = RANGE_LABELS[el.id];
+        if (!spec) return;
+        const span = document.getElementById(spec[0]);
+        if (span) span.innerText = spec[1](el.value);
+    }
+
+    function collectPanelSettings() {
+        const radios = {};
+        document.querySelectorAll('input[type="radio"]:checked').forEach((el) => {
+            if (el.name) radios[el.name] = el.value;
+        });
+        const fields = {};
+        document.querySelectorAll('select, input[type="range"], input[type="number"], input[type="color"], input[type="checkbox"]').forEach((el) => {
+            if (!el.id || PANEL_SKIP_IDS.has(el.id)) return;
+            fields[el.id] = el.type === 'checkbox' ? el.checked : el.value;
+        });
+        return { radios, fields, mode: typeof currentMode === 'string' ? currentMode : 'script' };
+    }
+
+    function savePanelSettings() {
+        if (restoringPanel) return;
+        try {
+            localStorage.setItem(PANEL_SETTINGS_KEY, JSON.stringify(collectPanelSettings()));
+        } catch (error) { /* ignore quota */ }
+    }
+
+    function scheduleSavePanelSettings() {
+        if (restoringPanel) return;
+        clearTimeout(panelSaveTimer);
+        panelSaveTimer = setTimeout(savePanelSettings, 150);
+    }
+
+    function isPanelSettingControl(el) {
+        if (!el || el.closest('#settings-body')) return false;
+        if (el.id && PANEL_SKIP_IDS.has(el.id)) return false;
+        return el.matches('select, input[type="radio"], input[type="checkbox"], input[type="range"], input[type="number"], input[type="color"]');
+    }
+
     async function readErrorMessage(response, fallback) {
         try {
             const err = await response.json();
@@ -324,6 +393,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const saveBtn = document.getElementById('save-keys-btn');
     if (saveBtn) saveBtn.addEventListener('click', saveKeys);
+    ['eleven-key', 'yt-client-id', 'yt-client-secret'].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('input', persistKeysSoon);
+    });
 
     if (llmPreset) {
         llmPreset.addEventListener('change', () => {
@@ -374,8 +447,8 @@ document.addEventListener('DOMContentLoaded', () => {
         updatePrimaryButtonText();
     }
 
-    tabSingle.addEventListener('click', () => switchMode('single'));
-    tabScript.addEventListener('click', () => switchMode('script'));
+    tabSingle.addEventListener('click', () => { switchMode('single'); savePanelSettings(); });
+    tabScript.addEventListener('click', () => { switchMode('script'); savePanelSettings(); });
 
     if (addScriptBtn) {
         addScriptBtn.addEventListener('click', () => {
@@ -425,6 +498,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 document.getElementById('subtitle-style').value = 'bold_outline';
             }
             if (template) showToast('Template loaded', 'success');
+            savePanelSettings();
         });
     }
 
@@ -492,7 +566,10 @@ document.addEventListener('DOMContentLoaded', () => {
         };
 
         const sourceSelect = document.getElementById('source-select');
-        if (sourceSelect) sourceSelect.value = 'mixkit';
+        if (sourceSelect) {
+            sourceSelect.value = 'mixkit';
+            sourceSelect.dispatchEvent(new Event('change'));
+        }
         setChecked('type-video');
         setChecked('ratio-9-16');
         setChecked('emoji-subs-off');
@@ -527,7 +604,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     switchMode('script');
-    refreshMusicOptions();
     resumeCurrentJob();
 
     function getSelectedSource() {
@@ -552,6 +628,52 @@ document.addEventListener('DOMContentLoaded', () => {
         input.addEventListener('change', onSourceOrAutoVideoChange);
     });
 
+    function initSourceDropdown() {
+        const select = document.getElementById('source-select');
+        const wrap = document.getElementById('source-dropdown');
+        const toggle = document.getElementById('source-dropdown-toggle');
+        const label = document.getElementById('source-dropdown-label');
+        const menu = document.getElementById('source-dropdown-menu');
+        if (!select || !wrap || !toggle || !label || !menu) return;
+
+        function syncLabel() {
+            const opt = select.options[select.selectedIndex];
+            label.textContent = opt ? opt.textContent : '';
+            menu.querySelectorAll('[role="option"]').forEach((item) => {
+                item.classList.toggle('is-selected', item.dataset.value === select.value);
+            });
+        }
+
+        function setOpen(open) {
+            wrap.classList.toggle('is-open', open);
+            toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+            menu.hidden = !open;
+        }
+
+        menu.innerHTML = Array.from(select.options).map((opt) => (
+            `<li role="option" data-value="${opt.value}">${opt.textContent}</li>`
+        )).join('');
+        syncLabel();
+
+        toggle.addEventListener('click', (event) => {
+            event.stopPropagation();
+            setOpen(menu.hidden);
+        });
+        menu.addEventListener('click', (event) => {
+            const item = event.target.closest('[data-value]');
+            if (!item) return;
+            select.value = item.dataset.value;
+            select.dispatchEvent(new Event('change'));
+            setOpen(false);
+        });
+        select.addEventListener('change', syncLabel);
+        document.addEventListener('click', () => setOpen(false));
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape') setOpen(false);
+        });
+    }
+    initSourceDropdown();
+
     function updateProviderFallbackVisibility() {
         const wrap = document.getElementById('provider-fallback-wrap');
         const roundRobinNote = document.getElementById('round-robin-note');
@@ -563,6 +685,67 @@ document.addEventListener('DOMContentLoaded', () => {
         if (mixkitNote) mixkitNote.style.display = source === 'mixkit' ? '' : 'none';
     }
     updateProviderFallbackVisibility();
+
+    function restorePanelSettings() {
+        let saved;
+        try {
+            saved = JSON.parse(localStorage.getItem(PANEL_SETTINGS_KEY) || 'null');
+        } catch (error) {
+            return;
+        }
+        if (!saved || typeof saved !== 'object') return;
+        restoringPanel = true;
+        try {
+            Object.entries(saved.radios || {}).forEach(([name, value]) => {
+                const el = document.querySelector(`input[type="radio"][name="${name}"][value="${value}"]`);
+                if (el) el.checked = true;
+            });
+            const fields = saved.fields || {};
+            Object.entries(fields).forEach(([id, value]) => {
+                if (id === 'voice-select') return;
+                const el = document.getElementById(id);
+                if (!el || PANEL_SKIP_IDS.has(id)) return;
+                if (el.tagName === 'SELECT') {
+                    const ok = Array.from(el.options).some((opt) => opt.value === value);
+                    if (ok) el.value = value;
+                } else if (el.type === 'checkbox') {
+                    el.checked = Boolean(value);
+                } else {
+                    el.value = value;
+                    if (el.type === 'range' || el.type === 'number') syncRangeLabel(el);
+                }
+            });
+            if (typeof updateVoices === 'function') updateVoices();
+            const voiceEl = document.getElementById('voice-select');
+            if (voiceEl && fields['voice-select']) {
+                const ok = Array.from(voiceEl.options).some((opt) => opt.value === fields['voice-select']);
+                if (ok) voiceEl.value = fields['voice-select'];
+            }
+            if (saved.mode === 'single' || saved.mode === 'script') switchMode(saved.mode);
+            const sourceSelect = document.getElementById('source-select');
+            const sourceLabel = document.getElementById('source-dropdown-label');
+            if (sourceSelect && sourceLabel) {
+                const opt = sourceSelect.options[sourceSelect.selectedIndex];
+                if (opt) sourceLabel.textContent = opt.textContent;
+            }
+            updateCaptionPositionUi();
+            updateProviderFallbackVisibility();
+            updatePrimaryButtonText();
+        } finally {
+            restoringPanel = false;
+        }
+    }
+
+    document.addEventListener('change', (event) => {
+        if (isPanelSettingControl(event.target)) scheduleSavePanelSettings();
+    });
+    document.addEventListener('input', (event) => {
+        const el = event.target;
+        if (!isPanelSettingControl(el)) return;
+        if (el.type === 'range' || el.type === 'number' || el.type === 'color') scheduleSavePanelSettings();
+    });
+
+    refreshMusicOptions().finally(() => restorePanelSettings());
 
     if (scrapeUrlBtn) {
         scrapeUrlBtn.addEventListener('click', async () => {

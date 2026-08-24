@@ -12,6 +12,18 @@ import requests
 
 MIN_VIDEO_BYTES = 40000
 MIN_IMAGE_BYTES = 8000
+_DOWNLOAD_FAIL_LOG_MAX = 5
+_download_fail_logs = 0
+DEFAULT_DOWNLOAD_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+}
 
 _URL_USERINFO_RE = re.compile(
     r"((?:https?|wss?)://)([^/\s?#@]*:[^/\s?#@]*@)",
@@ -90,19 +102,55 @@ def content_fingerprint(path):
     return digest.hexdigest()
 
 
+def reset_download_fail_logs():
+    global _download_fail_logs
+    _download_fail_logs = 0
+
+
+def download_headers_for(url):
+    headers = dict(DEFAULT_DOWNLOAD_HEADERS)
+    lowered = str(url or "").lower()
+    if "pinimg.com" in lowered or "pinterest." in lowered:
+        headers["Referer"] = "https://www.pinterest.com/"
+        headers["Origin"] = "https://www.pinterest.com"
+    return headers
+
+
+def _log_download_fail(url, reason):
+    global _download_fail_logs
+    if _download_fail_logs >= _DOWNLOAD_FAIL_LOG_MAX:
+        return
+    _download_fail_logs += 1
+    msg = f"  download fail {_download_fail_logs}/{_DOWNLOAD_FAIL_LOG_MAX}: {reason} | {redact_secret(url)}"
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        print(msg.encode("ascii", "replace").decode("ascii"))
+
+
 def download_http(url, path, timeout=60, min_bytes=MIN_VIDEO_BYTES, verify=True):
     """Download url to path. Returns True on non-empty valid HTTP body."""
     path = Path(path)
     try:
-        response = requests.get(url, timeout=timeout, verify=verify)
+        response = requests.get(
+            url,
+            timeout=timeout,
+            verify=verify,
+            headers=download_headers_for(url),
+            allow_redirects=True,
+        )
         if response.status_code != 200 or not response.content:
+            size = len(response.content or b"")
+            _log_download_fail(url, f"HTTP {response.status_code} bytes={size}")
             return False
         if len(response.content) < min_bytes:
+            _log_download_fail(url, f"too small {len(response.content)}B (need {min_bytes})")
             return False
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(response.content)
         return path.exists() and path.stat().st_size >= min_bytes
-    except Exception:
+    except Exception as exc:
+        _log_download_fail(url, f"{type(exc).__name__}: {redact_secret(exc)}")
         return False
 
 

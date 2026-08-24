@@ -440,6 +440,10 @@ class PinterestParseTests(unittest.TestCase):
         urls = pinterest_mp4_urls(hls)
         self.assertIn("https://v1.pinimg.com/videos/mc/720p/ab/cd/ef/clip_v2.mp4", urls)
         self.assertIn("https://v1.pinimg.com/videos/mc/720p/ab/cd/ef/clip.mp4", urls)
+        iht = "https://v1.pinimg.com/videos/iht/720p/3d/7c/cb/clip.mp4"
+        iht_urls = pinterest_mp4_urls(iht)
+        self.assertIn("https://v1.pinimg.com/videos/mc/720p/3d/7c/cb/clip.mp4", iht_urls)
+        self.assertIn("https://v1.pinimg.com/videos/ml/480p/3d/7c/cb/clip.mp4", iht_urls)
         rendition = pinterest_video_rendition({
             "id": "555",
             "videos": {"video_list": {"V_HLS": {"url": hls, "width": 720, "height": 1280}}},

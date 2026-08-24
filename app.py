@@ -25,7 +25,7 @@ for stream in (sys.stdout, sys.stderr):
 # ═══════════════════════════════════════════════════════════════
 
 from aesthetic_scraper import PinterestScraper, PexelsScraper, PixabayScraper, CoverrScraper, PiAPIScraper, LLMProcessor, WebScraper, LLM_PROVIDER_PRESETS, pinterest_mp4_urls
-from media_quality import content_fingerprint, delete_rejected_file, download_http, redact_secret, validate_downloaded_video, MIN_VIDEO_BYTES
+from media_quality import content_fingerprint, delete_rejected_file, download_http, redact_secret, reset_download_fail_logs, validate_downloaded_video, MIN_VIDEO_BYTES
 from semantic_media import (
     CoverageError,
     MAX_ALT_QUERIES_PER_SCENE,
@@ -128,6 +128,7 @@ class ScrapeRequest(BaseModel):
     local_files: Optional[List[str]] = None
     api_keys: Optional[ApiKeys] = None
     keywords: Optional[List[str]] = None
+    provider_fallback: bool = False
 
 class VoicePreviewRequest(BaseModel):
     text: str = "This is a VUZA voice preview."
@@ -830,7 +831,7 @@ async def try_search(scraper, keyword, media_type, count, aspect="9:16"):
     except Exception:
         return []
 
-async def universal_search(keyword, media_type, count, primary_source, project_path, api_keys=None, vibe="aesthetic", sentence="", llm=None, aspect="9:16", local_files=None, seen_hashes=None):
+async def universal_search(keyword, media_type, count, primary_source, project_path, api_keys=None, vibe="aesthetic", sentence="", llm=None, aspect="9:16", local_files=None, seen_hashes=None, enable_fallback=False):
     if primary_source == "local":
         return [str(path) for path in (local_files or [])]
 
@@ -849,55 +850,133 @@ async def universal_search(keyword, media_type, count, primary_source, project_p
 
     keywords = stock_keyword_variants(keyword)
     seen_hashes = seen_hashes if seen_hashes is not None else set()
-
-    if primary_source == "coverr" and media_type != "video":
-        return []
+    providers = stock_fallback_providers(primary_source, enable_fallback)
+    ready = []
+    for provider in providers:
+        if provider == "coverr" and media_type != "video":
+            continue
+        if stock_provider_ready(provider, api_keys):
+            ready.append(provider)
+        elif enable_fallback:
+            print(f"  ⏭️ skip fallback {provider}: missing API key")
+    if not ready:
+        ready = [primary_source]
 
     collected = []
-    scraper = make_scraper(primary_source, project_path, api_keys)
-    for k in keywords:
-        remaining = max(0, count - len(collected))
-        if remaining == 0:
-            return collected[:count]
-        res = await try_search(scraper, k, media_type, remaining, aspect=aspect)
-        picked = keep_visually_clean_media(res, seen_hashes, sentence=sentence, keyword=k, limit=remaining)
-        if picked:
-            print(f"  ✅ [{primary_source}:{k}] kept {len(picked)} unique clips")
-            collected.extend(picked)
-            if len(collected) >= count:
+    for provider in ready:
+        if provider == "coverr" and media_type != "video":
+            continue
+        scraper = make_scraper(provider, project_path, api_keys)
+        if scraper is None:
+            continue
+        if collected and provider != primary_source:
+            print(f"↪️ Fallback search → {provider}")
+        for k in keywords:
+            remaining = max(0, count - len(collected))
+            if remaining == 0:
                 return collected[:count]
+            res = await try_search(scraper, k, media_type, remaining, aspect=aspect)
+            picked = keep_visually_clean_media(res, seen_hashes, sentence=sentence, keyword=k, limit=remaining)
+            if picked:
+                print(f"  ✅ [{provider}:{k}] kept {len(picked)} unique clips")
+                collected.extend(picked)
+                if len(collected) >= count:
+                    return collected[:count]
 
-    if llm and sentence and llm.api_key:
-        print(f"  🧠 AI Re-Ask for '{keyword}'...")
-        try:
-            new_kw = llm.suggest_visual_query(sentence, topic=keyword, failed_queries=keywords)
-            if not new_kw:
-                import requests as req
-                r = req.post(llm.api_url,
-                    headers={"Authorization": f"Bearer {llm.api_key}", "Content-Type": "application/json"},
-                    data=json.dumps({
-                        "model": llm.models[0],
-                        "messages": [
-                            {"role": "system", "content": "Give ONE 2-3 word stock-footage search query that matches the sentence visually. Concrete objects/actions only."},
-                            {"role": "user", "content": f"Sentence: {sentence}\nFailed: {', '.join(keywords)}\nNew keyword:"}
-                        ]
-                    }), timeout=15)
-                if r.status_code == 200:
-                    new_kw = r.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'").lower()
-            if new_kw:
-                print(f"  🆕 AI suggested: '{new_kw}'")
-                remaining = max(1, count - len(collected))
-                res = await try_search(scraper, new_kw, media_type, remaining, aspect=aspect)
-                picked = keep_visually_clean_media(res, seen_hashes, sentence=sentence, keyword=new_kw, limit=remaining)
-                if picked:
-                    return picked
-        except Exception as e:
-            print(f"  ⚠️ AI Re-Ask failed: {redact_secret(e)}")
+        if len(collected) >= count:
+            return collected[:count]
+
+        if provider == ready[-1] and llm and sentence and llm.api_key and len(collected) < count:
+            print(f"  🧠 AI Re-Ask for '{keyword}'...")
+            try:
+                new_kw = llm.suggest_visual_query(sentence, topic=keyword, failed_queries=keywords)
+                if not new_kw:
+                    import requests as req
+                    r = req.post(llm.api_url,
+                        headers={"Authorization": f"Bearer {llm.api_key}", "Content-Type": "application/json"},
+                        data=json.dumps({
+                            "model": llm.models[0],
+                            "messages": [
+                                {"role": "system", "content": "Give ONE 2-3 word stock-footage search query that matches the sentence visually. Concrete objects/actions only."},
+                                {"role": "user", "content": f"Sentence: {sentence}\nFailed: {', '.join(keywords)}\nNew keyword:"}
+                            ]
+                        }), timeout=15)
+                    if r.status_code == 200:
+                        new_kw = r.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'").lower()
+                if new_kw:
+                    print(f"  🆕 AI suggested: '{new_kw}'")
+                    remaining = max(1, count - len(collected))
+                    res = await try_search(scraper, new_kw, media_type, remaining, aspect=aspect)
+                    picked = keep_visually_clean_media(res, seen_hashes, sentence=sentence, keyword=new_kw, limit=remaining)
+                    if picked:
+                        collected.extend(picked)
+                        return collected[:count]
+            except Exception as e:
+                print(f"  ⚠️ AI Re-Ask failed: {redact_secret(e)}")
 
     return collected
 
 STOCK_VIDEO_SOURCES = {"pexels", "pixabay", "coverr", "pinterest"}
+STOCK_FALLBACK_CHAINS = {
+    "pinterest": ["pexels", "pixabay", "coverr"],
+    "pexels": ["pinterest", "pixabay", "coverr"],
+    "pixabay": ["pexels", "pinterest", "coverr"],
+    "coverr": ["pexels", "pixabay", "pinterest"],
+}
 _SEARCH_CACHE = None
+
+
+def stock_fallback_providers(primary, enable_fallback=False):
+    primary = (primary or "").strip().lower()
+    if primary not in STOCK_VIDEO_SOURCES:
+        return [primary] if primary else []
+    if not enable_fallback:
+        return [primary]
+    return [primary] + [p for p in STOCK_FALLBACK_CHAINS.get(primary, []) if p != primary]
+
+
+def stock_provider_ready(provider, api_keys=None):
+    keys = api_keys or ApiKeys()
+    provider = (provider or "").strip().lower()
+    if provider == "pinterest":
+        return True
+    if provider == "pexels":
+        return bool((keys.pexels_key or "").strip())
+    if provider == "pixabay":
+        return bool((keys.pixabay_key or "").strip())
+    if provider == "coverr":
+        return bool((keys.coverr_key or "").strip())
+    return False
+
+
+def seed_selected_from_keyword_data(keyword_data, clip_duration):
+    selected = [[] for _ in keyword_data]
+    taken_keys = set()
+    for idx, item in enumerate(keyword_data or []):
+        for candidate in item.get("_candidates") or []:
+            if not isinstance(candidate, MediaCandidate) or not candidate.local_path:
+                continue
+            if not Path(candidate.local_path).is_file():
+                continue
+            selected[idx].append(candidate)
+            for key in candidate.identity_keys():
+                taken_keys.add(key)
+        if selected[idx]:
+            continue
+        for path in existing_media_paths(item.get("_files")):
+            stub = MediaCandidate(
+                provider=str(getattr(item, "provider", "") or path.parent.name),
+                asset_id=path.stem,
+                url="",
+                local_path=str(path),
+                duration=float(clip_duration or 5),
+                query=item.get("keyword") or "",
+                scene_index=idx,
+            )
+            selected[idx].append(stub)
+            for key in stub.identity_keys():
+                taken_keys.add(key)
+    return selected, taken_keys
 
 
 def get_search_cache():
@@ -925,7 +1004,7 @@ def candidate_from_dict(item, scene_index, query):
     )
 
 
-async def download_stock_candidate(candidate, project_path, source, probe=None):
+async def download_stock_candidate(candidate, project_path, source, probe=None, fetcher=None):
     folder = Path(project_path) / source / re.sub(r"[^\w\-]", "_", candidate.query or "scene")[:25]
     folder.mkdir(parents=True, exist_ok=True)
     prefix = {"pexels": "vid", "pixabay": "v", "coverr": "c"}.get(source, "vid")
@@ -934,14 +1013,17 @@ async def download_stock_candidate(candidate, project_path, source, probe=None):
     existed = path.exists() and path.stat().st_size >= MIN_VIDEO_BYTES
     try:
         if source == "pinterest":
-            urls = pinterest_mp4_urls(candidate.url or "")
+            urls = pinterest_mp4_urls(candidate.url or "")[:4]
             if not urls:
                 return None, "no direct video url"
             newly = not existed
             if not existed:
                 ok = False
                 for media_url in urls:
-                    ok = await asyncio.to_thread(download_http, media_url, path, 60, MIN_VIDEO_BYTES, True)
+                    if fetcher:
+                        ok = await fetcher(media_url, path)
+                    else:
+                        ok = await asyncio.to_thread(download_http, media_url, path, 60, MIN_VIDEO_BYTES, True)
                     if ok:
                         break
                 if not ok:
@@ -950,7 +1032,10 @@ async def download_stock_candidate(candidate, project_path, source, probe=None):
         else:
             newly = not existed
             if not existed:
-                ok = await asyncio.to_thread(download_http, candidate.url, path, 60, MIN_VIDEO_BYTES, True)
+                if fetcher:
+                    ok = await fetcher(candidate.url, path)
+                else:
+                    ok = await asyncio.to_thread(download_http, candidate.url, path, 60, MIN_VIDEO_BYTES, True)
                 if not ok:
                     delete_rejected_file(path, newly_downloaded=True)
                     return None, "download failed"
@@ -991,6 +1076,7 @@ async def collect_stock_videos(
     download_fn=None,
 ):
     """Search selected provider, round-robin download, then enforce unique duration coverage."""
+    reset_download_fail_logs()
     clip_duration = max(2, min(12, float(clip_duration or 5)))
     needed = max(1, int(count or 1))
     search_limit = max(12, min(24, needed * 6))
@@ -1096,11 +1182,22 @@ async def collect_stock_videos(
             print(f"  mix scene {idx + 1}: " + ", ".join(f"{query!r}" for query in plan_queries))
             groups.append(mixed)
 
-    selected = [[] for _ in keyword_data]
+    selected, taken_keys = seed_selected_from_keyword_data(keyword_data, clip_duration)
     pointers = [0] * len(keyword_data)
-    taken_keys = set()
+    download_fail_count = 0
+    abort_provider = False
+    session_fetcher = None
+    if source == "pinterest" and hasattr(scraper, "download_bytes"):
+        session_fetcher = scraper.download_bytes
+    if any(selected):
+        print(
+            f"  📎 seeded {sum(len(group) for group in selected)} clip(s) from prior providers"
+        )
 
     async def take_next(scene_index):
+        nonlocal download_fail_count, abort_provider
+        if abort_provider:
+            return None
         group = groups[scene_index]
         while pointers[scene_index] < len(group):
             candidate = group[pointers[scene_index]]
@@ -1110,7 +1207,12 @@ async def collect_stock_videos(
                 continue
             downloader = download_fn or download_stock_candidate
             print(f"  ⬇️ scene {scene_index + 1} {candidate.query!r} id={candidate.asset_id}")
-            path, reason = await downloader(candidate, project_path, source, probe)
+            if download_fn:
+                path, reason = await downloader(candidate, project_path, source, probe)
+            else:
+                path, reason = await download_stock_candidate(
+                    candidate, project_path, source, probe, fetcher=session_fetcher
+                )
             if path:
                 print(f"  ✅ kept {Path(path).name}")
                 for key in keys:
@@ -1118,10 +1220,20 @@ async def collect_stock_videos(
                 return candidate
             print(f"  🚫 skip {candidate.asset_id}: {reason}")
             rejection_log[scene_index].append({"asset_id": candidate.asset_id, "reason": reason})
+            if reason == "download failed":
+                download_fail_count += 1
+                kept = sum(len(group) for group in selected)
+                if download_fail_count >= 20 and kept < max(1, needed):
+                    print(
+                        f"  ⚠️ aborting {source} after {download_fail_count} download fails "
+                        f"(kept {kept})"
+                    )
+                    abort_provider = True
+                    return None
         return None
 
     round_idx = 0
-    while round_idx < needed:
+    while round_idx < needed and not abort_provider:
         progressed = False
         for scene_index, _group in enumerate(groups):
             if len(selected[scene_index]) > round_idx:
@@ -1130,12 +1242,14 @@ async def collect_stock_videos(
             if chosen:
                 selected[scene_index].append(chosen)
                 progressed = True
+            if abort_provider:
+                break
         if not progressed:
             break
         round_idx += 1
 
     async def fill_missing_with_alts():
-        if not llm:
+        if not llm or abort_provider:
             return
         for scene_index, item in enumerate(keyword_data):
             if len(selected[scene_index]) >= needed:
@@ -1160,6 +1274,8 @@ async def collect_stock_videos(
                 if not chosen:
                     break
                 selected[scene_index].append(chosen)
+            if abort_provider:
+                return
 
     await fill_missing_with_alts()
 
@@ -1223,6 +1339,68 @@ async def collect_stock_videos(
     if inspect.iscoroutinefunction(closer):
         await closer()
     return selected
+
+
+async def collect_stock_videos_with_fallback(
+    keyword_data,
+    source,
+    project_path,
+    api_keys=None,
+    aspect="9:16",
+    clip_duration=5,
+    count=1,
+    llm=None,
+    topic="",
+    narration_duration=None,
+    cache=None,
+    probe=None,
+    search_fn=None,
+    download_fn=None,
+    enable_fallback=False,
+):
+    providers = stock_fallback_providers(source, enable_fallback)
+    ready = []
+    for provider in providers:
+        if stock_provider_ready(provider, api_keys):
+            ready.append(provider)
+        else:
+            print(f"  ⏭️ skip fallback {provider}: missing API key")
+    if not ready:
+        ready = [source]
+
+    last_error = None
+    extra = 0
+    for index, provider in enumerate(ready):
+        target_count = max(1, int(count or 1) + extra)
+        if index > 0:
+            print(f"↪️ Fallback → {provider} (assets/scene={target_count})")
+            scraping_status["message"] = f"Fallback searching {provider}..."
+        try:
+            return await collect_stock_videos(
+                keyword_data,
+                source=provider,
+                project_path=project_path,
+                api_keys=api_keys,
+                aspect=aspect,
+                clip_duration=clip_duration,
+                count=target_count,
+                llm=llm,
+                topic=topic,
+                narration_duration=narration_duration,
+                cache=cache,
+                probe=probe,
+                search_fn=search_fn,
+                download_fn=download_fn,
+            )
+        except CoverageError as exc:
+            last_error = exc
+            if index + 1 >= len(ready):
+                raise
+            extra = min(6, extra + 2)
+            print(f"  ⚠️ {provider} coverage short → next provider")
+    if last_error:
+        raise last_error
+    return None
 
 
 # ── Main Scraping ──
@@ -1319,7 +1497,7 @@ async def run_scrape(request: ScrapeRequest):
                 seen_hashes = set()
                 if use_stock_pipeline:
                     scraping_status["message"] = f"Searching {source} media {script_idx+1}/{len(scripts)}..."
-                    await collect_stock_videos(
+                    await collect_stock_videos_with_fallback(
                         keyword_data,
                         source=source,
                         project_path=project_path,
@@ -1329,6 +1507,7 @@ async def run_scrape(request: ScrapeRequest):
                         count=count,
                         llm=llm,
                         topic=(request.query or script[:160]).strip(),
+                        enable_fallback=bool(request.provider_fallback),
                     )
                     for item in keyword_data:
                         valid_paths = existing_media_paths(item.get("_files"))
@@ -1350,6 +1529,7 @@ async def run_scrape(request: ScrapeRequest):
                                 primary_source=source, project_path=project_path, api_keys=api_keys,
                                 vibe=request.vibe, sentence=item["sentence"], llm=llm,
                                 aspect=settings.ratio, local_files=local_files, seen_hashes=seen_hashes,
+                                enable_fallback=bool(request.provider_fallback),
                             )
                         except asyncio.CancelledError:
                             raise
@@ -1446,6 +1626,7 @@ async def run_scrape(request: ScrapeRequest):
                 primary_source=source, project_path=project_path, api_keys=api_keys,
                 llm=None, sentence=query or "", aspect=settings.ratio, local_files=local_files,
                 seen_hashes=set(),
+                enable_fallback=bool(request.provider_fallback),
             )
             valid_paths = require_media_files(res_files, query or "local uploads")
             rel_paths = []

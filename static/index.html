@@ -301,6 +301,16 @@
                              <label for="src-piapi"><i class="fas fa-bolt"></i> PiAPI</label>
                          </div>
                          <p class="settings-note">PiAPI is paid. Hailuo creates one 6-second AI clip per detected script scene and asks for confirmation before every run.</p>
+                         <div id="provider-fallback-wrap">
+                            <div class="setting-label" style="margin-top:0.75rem">Provider fallback</div>
+                            <div class="pill-group">
+                                <input type="radio" id="fallback-on" name="provider_fallback" value="true" checked>
+                                <label for="fallback-on"><i class="fas fa-random"></i> On</label>
+                                <input type="radio" id="fallback-off" name="provider_fallback" value="false">
+                                <label for="fallback-off"><i class="fas fa-ban"></i> Off</label>
+                            </div>
+                            <p class="settings-note">Off = only the source you picked. On = if that source cannot cover narration, try the next stock provider in order.</p>
+                         </div>
                      </div>
                     <div class="setting-card">
                         <div class="setting-label"><i class="fas fa-photo-video"></i> Media type</div>
@@ -628,7 +638,7 @@
     </div> <!-- end page-layout -->
 
     <div id="toast" class="toast hidden"></div>
-    <script src="/static/script.js?v=6.0"></script>
+    <script src="/static/script.js?v=6.2"></script>
 </body>
 
 </html>

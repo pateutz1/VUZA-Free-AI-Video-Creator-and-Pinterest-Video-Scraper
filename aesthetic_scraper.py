@@ -129,6 +129,14 @@ def pinterest_mp4_urls(url):
         add(re.sub(r"(?i)_(t\d+|v\d+)\.mp4$", ".mp4", converted))
         for quality in ("720p", "480p", "360p"):
             add(re.sub(r"(?i)/(720p|480p|360p)/", f"/{quality}/", converted))
+    # Hotlink-blocked /iht/ progressive files often also exist under /mc/ or /ml/.
+    if "/iht/" in lowered or "/videos/" in lowered:
+        for folder in ("mc", "ml", "iht"):
+            alt = re.sub(r"(?i)/videos/(iht|mc|ml)/", f"/videos/{folder}/", raw)
+            add(alt)
+            for quality in ("720p", "480p", "360p"):
+                add(re.sub(r"(?i)/(720p|480p|360p)/", f"/{quality}/", alt))
+            add(re.sub(r"(?i)_(t\d+|v\d+)\.mp4$", ".mp4", alt))
     return urls
 
 
@@ -493,11 +501,40 @@ class PinterestScraper:
 
     def download_file(self, url, path):
         try:
-            r = requests.get(url, timeout=15)
-            if r.status_code == 200:
-                path.write_bytes(r.content); return True
-        except: pass
+            from media_quality import download_headers_for, MIN_VIDEO_BYTES
+            r = requests.get(url, timeout=15, headers=download_headers_for(url))
+            if r.status_code == 200 and len(r.content or b"") >= MIN_VIDEO_BYTES:
+                path.write_bytes(r.content)
+                return True
+        except Exception:
+            pass
         return False
+
+    async def download_bytes(self, url, path, min_bytes=None):
+        """Fetch a pinimg URL using the warmed Playwright session cookies."""
+        from media_quality import MIN_VIDEO_BYTES, download_headers_for
+
+        min_bytes = int(min_bytes or MIN_VIDEO_BYTES)
+        path = Path(path)
+        await self._warm_session()
+        if self._context is None:
+            return False
+        try:
+            resp = await self._context.request.get(
+                str(url),
+                headers=download_headers_for(url),
+                timeout=60000,
+            )
+            if int(resp.status or 0) != 200:
+                return False
+            body = await resp.body()
+            if len(body or b"") < min_bytes:
+                return False
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(body)
+            return path.exists() and path.stat().st_size >= min_bytes
+        except Exception:
+            return False
 
 # ═══════════════════════════════════════════════════════════════
 # PEXELS SCRAPER (PARALLEL)

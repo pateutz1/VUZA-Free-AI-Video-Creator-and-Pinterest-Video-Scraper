@@ -475,9 +475,19 @@ document.addEventListener('DOMContentLoaded', () => {
                 const videoType = document.getElementById('type-video');
                 if (videoType) videoType.checked = true;
             }
+            updateProviderFallbackVisibility();
             updatePrimaryButtonText();
         });
     });
+
+    function updateProviderFallbackVisibility() {
+        const wrap = document.getElementById('provider-fallback-wrap');
+        if (!wrap) return;
+        const source = document.querySelector('input[name="source"]:checked')?.value;
+        const stock = source === 'pinterest' || source === 'pexels' || source === 'pixabay' || source === 'coverr';
+        wrap.style.display = stock ? '' : 'none';
+    }
+    updateProviderFallbackVisibility();
 
     if (scrapeUrlBtn) {
         scrapeUrlBtn.addEventListener('click', async () => {
@@ -765,6 +775,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const emojiSubtitles = document.querySelector('input[name="emoji_subtitles"]:checked').value === 'true';
         const watermark = document.querySelector('input[name="watermark"]:checked').value === 'true';
         const publishConfirmed = document.getElementById('publish-confirm')?.checked === true;
+        const providerFallback = document.querySelector('input[name="provider_fallback"]:checked')?.value === 'true';
 
         if (currentMode === 'single' && source !== 'local' && !query) { showToast('Enter a stock search term', 'error'); return; }
         if (currentMode === 'script' && scripts.length === 0) { showToast('Enter at least one script', 'error'); return; }
@@ -846,6 +857,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     source,
                     media_type: mediaType, count,
                     mode: currentMode, vibe,
+                    provider_fallback: providerFallback,
                     local_files: localFiles,
                     video_settings: {
                         ratio, voice, subtitles, language,

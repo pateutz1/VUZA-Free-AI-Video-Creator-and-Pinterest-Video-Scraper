@@ -24,8 +24,8 @@ for stream in (sys.stdout, sys.stderr):
 # Built by Ali R. | github.com/AliRash3ed
 # ═══════════════════════════════════════════════════════════════
 
-from aesthetic_scraper import PinterestScraper, PexelsScraper, PixabayScraper, CoverrScraper, PiAPIScraper, LLMProcessor, WebScraper, LLM_PROVIDER_PRESETS, pinterest_mp4_urls
-from media_quality import content_fingerprint, delete_rejected_file, download_http, redact_secret, reset_download_fail_logs, validate_downloaded_video, MIN_VIDEO_BYTES
+from aesthetic_scraper import PinterestScraper, PexelsScraper, PixabayScraper, CoverrScraper, PiAPIScraper, LLMProcessor, WebScraper, LLM_PROVIDER_PRESETS, pinterest_mp4_urls, pinterest_pin_page, download_pinterest_with_ytdlp
+from media_quality import content_fingerprint, delete_rejected_file, download_http, last_download_error, redact_secret, reset_download_fail_logs, validate_downloaded_video, MIN_VIDEO_BYTES
 from semantic_media import (
     CoverageError,
     MAX_ALT_QUERIES_PER_SCENE,
@@ -1013,22 +1013,28 @@ async def download_stock_candidate(candidate, project_path, source, probe=None, 
     existed = path.exists() and path.stat().st_size >= MIN_VIDEO_BYTES
     try:
         if source == "pinterest":
-            urls = pinterest_mp4_urls(candidate.url or "")[:4]
-            if not urls:
-                return None, "no direct video url"
             newly = not existed
             if not existed:
+                pin_page = pinterest_pin_page(
+                    pin_id=candidate.asset_id,
+                    source_page=candidate.source_page,
+                    url=candidate.url,
+                )
                 ok = False
-                for media_url in urls:
-                    if fetcher:
-                        ok = await fetcher(media_url, path)
-                    else:
-                        ok = await asyncio.to_thread(download_http, media_url, path, 60, MIN_VIDEO_BYTES, True)
-                    if ok:
-                        break
+                if pin_page:
+                    ok = await asyncio.to_thread(download_pinterest_with_ytdlp, pin_page, path)
+                if not ok:
+                    urls = pinterest_mp4_urls(candidate.url or "")[:2]
+                    for media_url in urls:
+                        if fetcher:
+                            ok = await fetcher(media_url, path)
+                        else:
+                            ok = await asyncio.to_thread(download_http, media_url, path, 60, MIN_VIDEO_BYTES, True)
+                        if ok:
+                            break
                 if not ok:
                     delete_rejected_file(path, newly_downloaded=True)
-                    return None, "download failed"
+                    return None, last_download_error() or "download failed"
         else:
             newly = not existed
             if not existed:
@@ -1038,7 +1044,7 @@ async def download_stock_candidate(candidate, project_path, source, probe=None, 
                     ok = await asyncio.to_thread(download_http, candidate.url, path, 60, MIN_VIDEO_BYTES, True)
                 if not ok:
                     delete_rejected_file(path, newly_downloaded=True)
-                    return None, "download failed"
+                    return None, last_download_error() or "download failed"
         valid, info = await asyncio.to_thread(validate_downloaded_video, path, probe)
         if not valid:
             delete_rejected_file(path, newly_downloaded=not existed)
@@ -1056,7 +1062,7 @@ async def download_stock_candidate(candidate, project_path, source, probe=None, 
         return str(path), "ok"
     except Exception as exc:
         print(f"  ⚠️ Download failed: {redact_secret(exc)}")
-        return None, "download failed"
+        return None, f"download failed: {type(exc).__name__}"
 
 
 async def collect_stock_videos(
@@ -1220,7 +1226,7 @@ async def collect_stock_videos(
                 return candidate
             print(f"  🚫 skip {candidate.asset_id}: {reason}")
             rejection_log[scene_index].append({"asset_id": candidate.asset_id, "reason": reason})
-            if reason == "download failed":
+            if reason not in {"text overlay", "dark or frozen"} and not str(reason).startswith("undecodable"):
                 download_fail_count += 1
                 kept = sum(len(group) for group in selected)
                 if download_fail_count >= 20 and kept < max(1, needed):

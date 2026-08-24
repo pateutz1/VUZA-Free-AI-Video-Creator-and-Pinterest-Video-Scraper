@@ -451,6 +451,47 @@ class PinterestParseTests(unittest.TestCase):
         self.assertTrue(rendition["url"].endswith(".mp4"))
         self.assertIn("/720p/", rendition["url"])
 
+    def test_pinterest_pin_page_from_id(self):
+        from aesthetic_scraper import pinterest_pin_page
+
+        self.assertEqual(
+            pinterest_pin_page(pin_id="769411917630087421"),
+            "https://www.pinterest.com/pin/769411917630087421/",
+        )
+        self.assertEqual(
+            pinterest_pin_page(source_page="https://www.pinterest.com/pin/abc/?utm=1"),
+            "https://www.pinterest.com/pin/abc/",
+        )
+
+    def test_ytdlp_download_writes_mp4(self):
+        from aesthetic_scraper import download_pinterest_with_ytdlp
+
+        class FakeYDL:
+            def __init__(self, opts):
+                self.opts = opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def extract_info(self, url, download=True):
+                dest = Path(self.opts["outtmpl"].replace(".%(ext)s", ".mp4"))
+                dest.write_bytes(b"0" * 50000)
+                self._name = str(dest)
+                return {"id": "1", "ext": "mp4"}
+
+            def prepare_filename(self, info):
+                return self._name
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "vid_1.mp4"
+            with patch("aesthetic_scraper.yt_dlp.YoutubeDL", FakeYDL):
+                self.assertTrue(download_pinterest_with_ytdlp("https://www.pinterest.com/pin/1/", dest))
+            self.assertTrue(dest.is_file())
+            self.assertGreaterEqual(dest.stat().st_size, 40000)
+
     def test_href_parser_accepts_non_numeric_pin_ids(self):
         pins = parse_pinterest_pin_hrefs([
             "https://www.pinterest.com/pin/123456789/",

@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from media_quality import (
+    compact_caption_score,
     caption_line_score,
     content_fingerprint,
     delete_rejected_file,
@@ -40,6 +41,8 @@ class MediaQualityTests(unittest.TestCase):
 
             with patch("media_quality.requests.get", return_value=FakeResponse()):
                 self.assertFalse(download_http("https://example.com/a.mp4", path, min_bytes=10))
+            from media_quality import last_download_error
+            self.assertIn("403", last_download_error())
 
             class OkResponse:
                 status_code = 200
@@ -88,6 +91,26 @@ class MediaQualityTests(unittest.TestCase):
             words[78:102, x0:x0 + 12] = 220.0
         self.assertGreaterEqual(caption_line_score(words), 0.05)
         self.assertLess(caption_line_score(clean), 0.05)
+
+    def test_compact_caption_flags_small_center_text(self):
+        import numpy as np
+
+        from media_quality import compact_caption_score, frame_has_overlay
+
+        frame = np.full((240, 140, 3), 28, dtype="uint8")
+        for y in range(108, 122):
+            for x in range(42, 98):
+                if (x // 6) % 2 == 0:
+                    frame[y, x] = 255
+        gray = np.mean(frame, axis=2)
+        self.assertGreaterEqual(compact_caption_score(gray), 0.004)
+        self.assertTrue(frame_has_overlay(frame))
+        blob = np.full((240, 140, 3), 28, dtype="uint8")
+        blob[110:125, 50:95] = 255
+        self.assertLess(compact_caption_score(np.mean(blob, axis=2)), 0.004)
+        clean = np.full((240, 140, 3), 28, dtype="uint8")
+        clean[40:200, 20:120] = 220
+        self.assertLess(compact_caption_score(np.mean(clean, axis=2)), 0.004)
 
     def test_dark_and_frozen_frames(self):
         import numpy as np

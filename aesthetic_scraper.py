@@ -140,6 +140,73 @@ def pinterest_mp4_urls(url):
     return urls
 
 
+def pinterest_pin_page(pin_id="", source_page="", url=""):
+    for raw in (source_page, url):
+        text = str(raw or "").strip()
+        lowered = text.lower()
+        if "pinterest." in lowered and "/pin/" in lowered:
+            return text.split("?", 1)[0].rstrip("/") + "/"
+    pid = str(pin_id or "").strip()
+    if pid and pid.lower() not in {"x", "pin", ""}:
+        return f"https://www.pinterest.com/pin/{pid}/"
+    return ""
+
+
+def download_pinterest_with_ytdlp(pin_page, dest, min_bytes=None):
+    """Download a Pinterest pin page to dest using yt-dlp (HLS/real rendition)."""
+    from media_quality import MIN_VIDEO_BYTES, download_headers_for, set_download_error
+
+    min_bytes = int(min_bytes or MIN_VIDEO_BYTES)
+    dest = Path(dest)
+    pin_page = str(pin_page or "").strip()
+    if not pin_page:
+        set_download_error("no pin page")
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    headers = download_headers_for(pin_page)
+    opts = {
+        "format": "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best",
+        "outtmpl": str(dest.with_name(dest.stem + ".%(ext)s")),
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "noprogress": True,
+        "noplaylist": True,
+        "ignoreerrors": False,
+        "retries": 2,
+        "socket_timeout": 30,
+        "http_headers": headers,
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(pin_page, download=True)
+            if not info:
+                set_download_error("yt-dlp no info")
+                return False
+            produced = Path(ydl.prepare_filename(info))
+    except Exception as exc:
+        set_download_error(f"yt-dlp {type(exc).__name__}")
+        return False
+    picked = None
+    for candidate in [dest, produced, *dest.parent.glob(dest.stem + ".*")]:
+        try:
+            if candidate.is_file() and candidate.stat().st_size >= min_bytes:
+                if picked is None or candidate.stat().st_size > picked.stat().st_size:
+                    picked = candidate
+        except OSError:
+            continue
+    if picked is None:
+        set_download_error("yt-dlp empty file")
+        return False
+    if picked.resolve() != dest.resolve():
+        if dest.exists():
+            dest.unlink()
+        picked.replace(dest)
+    if dest.suffix.lower() != ".mp4" or dest.stat().st_size < min_bytes:
+        set_download_error("yt-dlp not mp4")
+        return False
+    return True
+
+
 def collect_pinterest_video_specs(node, found=None):
     found = found if found is not None else []
     if isinstance(node, dict):
@@ -512,12 +579,13 @@ class PinterestScraper:
 
     async def download_bytes(self, url, path, min_bytes=None):
         """Fetch a pinimg URL using the warmed Playwright session cookies."""
-        from media_quality import MIN_VIDEO_BYTES, download_headers_for
+        from media_quality import MIN_VIDEO_BYTES, download_headers_for, set_download_error
 
         min_bytes = int(min_bytes or MIN_VIDEO_BYTES)
         path = Path(path)
         await self._warm_session()
         if self._context is None:
+            set_download_error("no pinterest session")
             return False
         try:
             resp = await self._context.request.get(
@@ -525,15 +593,22 @@ class PinterestScraper:
                 headers=download_headers_for(url),
                 timeout=60000,
             )
-            if int(resp.status or 0) != 200:
+            status = int(resp.status or 0)
+            if status != 200:
+                set_download_error(f"HTTP {status}")
                 return False
             body = await resp.body()
             if len(body or b"") < min_bytes:
+                set_download_error(f"too small {len(body or b'')}B (need {min_bytes})")
                 return False
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(body)
-            return path.exists() and path.stat().st_size >= min_bytes
-        except Exception:
+            ok = path.exists() and path.stat().st_size >= min_bytes
+            if not ok:
+                set_download_error("write failed")
+            return ok
+        except Exception as exc:
+            set_download_error(f"{type(exc).__name__}")
             return False
 
 # ═══════════════════════════════════════════════════════════════

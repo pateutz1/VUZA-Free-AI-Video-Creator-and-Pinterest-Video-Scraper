@@ -1,17 +1,17 @@
 import asyncio
-import base64
-from io import BytesIO
+import contextlib
+import hashlib
 import os
 import re
 import json
 import random
 import sys
-from urllib.parse import quote
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+import uuid
+from fastapi import FastAPI, HTTPException, BackgroundTasks, File, Form, UploadFile
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
-from typing import List, Optional, Dict
+from fastapi.responses import FileResponse, JSONResponse, Response
+from pydantic import BaseModel, Field
+from typing import List, Optional
 from pathlib import Path
 import uvicorn
 
@@ -24,9 +24,9 @@ for stream in (sys.stdout, sys.stderr):
 # Built by Ali R. | github.com/AliRash3ed
 # ═══════════════════════════════════════════════════════════════
 
-from aesthetic_scraper import PinterestScraper, PexelsScraper, PixabayScraper, VideoDownloader, LLMProcessor, WebScraper
+from aesthetic_scraper import PinterestScraper, PexelsScraper, PixabayScraper, CoverrScraper, PiAPIScraper, LLMProcessor, WebScraper, LLM_PROVIDER_PRESETS
 
-app = FastAPI(title="VUZA — 中文悬疑短视频自动生成工具")
+app = FastAPI(title="VUZA — Free AI Video Creator")
 
 BASE_DIR = Path(__file__).parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
@@ -37,35 +37,52 @@ static_path.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(static_path)), name="static")
 app.mount("/downloads", StaticFiles(directory=str(DOWNLOAD_DIR)), name="downloads")
 
+UPLOAD_DIR = BASE_DIR / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+
 scraping_status = {
     "is_running": False, "progress": 0,
-    "message": "就绪", "mode": "single", "results": [],
-    "status": "idle", "final_video": None, "error": None
+    "message": "Ready", "mode": "single", "results": [],
+    "status": "idle", "final_video": None, "error": None,
+    "task_id": None, "candidates": [],
 }
 
 # ── Models ──
 class VideoSettings(BaseModel):
     ratio: str = "9:16"
-    voice: str = "zh-CN-YunyangNeural"
+    voice: str = "en-US-ChristopherNeural"
     subtitles: bool = True
-    language: str = "zh-CN"
+    language: str = "en-US"
     subtitle_style: str = "high_retention"
     music: str = "none"
     filter: str = "none"
-    vibe: str = "suspense_cn"
+    vibe: str = "aesthetic"
     emoji_subtitles: bool = False
     watermark: bool = False
     logo_path: str = "static/logo.png"
+    clip_duration: int = Field(default=5, ge=2, le=12)
+    bgm_volume: float = Field(default=0.2, ge=0.0, le=1.0)
+    voice_volume: float = Field(default=1.0, ge=0.0, le=2.0)
+    voice_rate: float = Field(default=1.0, ge=0.5, le=2.0)
+    video_count: int = Field(default=1, ge=1, le=5)
+    subtitle_position: str = "bottom"
+    font_size: int = Field(default=60, ge=24, le=160)
+    text_fore_color: str = "#FFFFFF"
+    stroke_color: str = "#000000"
+    stroke_width: float = Field(default=1.5, ge=0.0, le=12.0)
+    subtitle_background: str = "none"
+    transition: str = "fade"
 
 class ApiKeys(BaseModel):
     llm_key: str = ""
     llm_url: str = "https://openrouter.ai/api/v1/chat/completions"
     llm_model: str = ""
-    seedream_key: str = ""
-    seedream_url: str = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
-    seedream_model: str = "doubao-seedream-4-5-251128"
     pexels_key: str = ""
     pixabay_key: str = ""
+    coverr_key: str = ""
+    piapi_key: str = ""
+    piapi_model: str = "hailuo-2.3-fast"
     yt_client_id: str = ""
     yt_client_secret: str = ""
     eleven_key: str = ""
@@ -74,19 +91,53 @@ class ScrapeRequest(BaseModel):
     query: Optional[str] = None
     script: Optional[str] = None
     scripts: Optional[List[str]] = None
-    source: str = "ai"
+    source: str = "pinterest"
     media_type: str = "photo"
     count: int = 3
     mode: str = "single"
-    vibe: str = "suspense_cn"
+    vibe: str = "aesthetic"
     video_settings: Optional[VideoSettings] = None
     auto_video: bool = True
+    piapi_confirmed: bool = False
     yt_upload: bool = False
+    publish_confirmed: bool = False
+    local_files: Optional[List[str]] = None
     api_keys: Optional[ApiKeys] = None
 
-VALID_SOURCES = {"ai", "pinterest", "pexels", "pixabay"}
+class VoicePreviewRequest(BaseModel):
+    text: str = "This is a VUZA voice preview."
+    voice: str = "en-US-ChristopherNeural"
+    language: str = "en-US"
+    voice_rate: float = 1.0
+    voice_volume: float = 1.0
+    eleven_key: str = ""
+
+class LlmTestRequest(BaseModel):
+    provider: str = ""
+    api_key: str = ""
+    api_url: str = ""
+    model: str = ""
+
+LLM_PROVIDER_MODELS = {
+    "openrouter": [
+        "deepseek/deepseek-v4-pro",
+        "openai/gpt-4o-mini",
+        "qwen/qwen3-coder:free",
+        "openai/gpt-oss-20b:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+    ],
+    "openai": ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"],
+    "deepseek": ["deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"],
+    "groq": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+    "ollama": ["llama3.2", "qwen2.5", "mistral"],
+    "oneapi": ["gpt-4o-mini", "deepseek-chat"],
+}
+
+VALID_SOURCES = {"pinterest", "pexels", "pixabay", "coverr", "piapi", "local"}
 VALID_MEDIA_TYPES = {"photo", "video"}
 VALID_MODES = {"single", "script"}
+VALID_TRANSITIONS = {"none", "fade", "zoom_in", "zoom_out", "slide"}
+ALLOWED_UPLOAD_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".m4v", ".webm"}
 
 # ── Routes ──
 @app.get("/")
@@ -94,41 +145,102 @@ async def read_index():
     return FileResponse(static_path / "index.html")
 
 @app.get("/api/status")
-async def get_status():
+async def get_status(task_id: Optional[str] = None):
+    if task_id and scraping_status.get("task_id") and task_id != scraping_status["task_id"]:
+        return {**scraping_status, "message": "Showing the latest job; requested task_id is no longer active."}
     return scraping_status
+
+@app.get("/api/llm/presets")
+async def llm_presets():
+    presets = []
+    for item in LLM_PROVIDER_PRESETS:
+        models = list(LLM_PROVIDER_MODELS.get(item["id"], [item["model"]]))
+        if item["model"] and item["model"] not in models:
+            models.insert(0, item["model"])
+        presets.append({**item, "models": models})
+    return {"presets": presets}
+
+@app.post("/api/llm/test")
+async def test_llm(request: LlmTestRequest):
+    import requests as req
+    provider = (request.provider or "").strip().lower()
+    preset = next((item for item in LLM_PROVIDER_PRESETS if item["id"] == provider), None)
+    api_url = (request.api_url or "").strip() or ((preset or {}).get("url") or "")
+    model = (request.model or "").strip() or ((preset or {}).get("model") or "")
+    api_key = (request.api_key or "").strip()
+    local_url = "127.0.0.1" in api_url or "localhost" in api_url
+    if not api_url or not model:
+        raise HTTPException(status_code=400, detail="Provider URL and model are required.")
+    if not api_key and not local_url and provider != "ollama":
+        raise HTTPException(status_code=400, detail=f"Enter an API key for {preset['label'] if preset else 'this provider'}.")
+    llm = LLMProcessor(api_key=api_key or "ollama", api_url=api_url, model=model)
+    model_name = llm.models[0]
+    payload = {"model": model_name, "messages": [{"role": "user", "content": "Reply with exactly: ok"}]}
+    if llm._uses_max_completion_tokens(model_name):
+        payload["max_completion_tokens"] = 8
+    else:
+        payload["max_tokens"] = 8
+
+    def ping():
+        return req.post(llm.api_url, headers=llm._headers(), json=payload, timeout=(8, 20))
+
+    try:
+        response = await asyncio.to_thread(ping)
+    except req.RequestException as exc:
+        label = (preset or {}).get("label") or provider or "API"
+        raise HTTPException(status_code=400, detail=f"Could not reach {label}: {exc}") from exc
+
+    if response.status_code != 200:
+        detail = llm._format_api_error(response) or f"HTTP {response.status_code}"
+        raise HTTPException(status_code=400, detail=f"{(preset or {}).get('label') or 'API'} / {model_name}: {detail[:300]}")
+
+    reply = "ok"
+    with contextlib.suppress(Exception):
+        reply = str(response.json()["choices"][0]["message"]["content"]).strip() or "ok"
+    print(f"✅ LLM test ok: {provider or 'custom'} / {model_name}")
+    return {"ok": True, "provider": provider or "custom", "model": model_name, "reply": reply[:80]}
+
+@app.get("/api/music")
+async def list_music():
+    music_dir = BASE_DIR / "static" / "music"
+    files = ["none"]
+    if music_dir.exists():
+        files.extend(sorted(p.name for p in music_dir.iterdir() if p.suffix.lower() in {".mp3", ".wav", ".m4a"} and p.stat().st_size > 0))
+    return {"files": files}
 
 @app.post("/api/analyze")
 async def analyze_script(request: ScrapeRequest):
     if not request.script:
-        raise HTTPException(status_code=400, detail="请先输入脚本")
+        raise HTTPException(status_code=400, detail="Enter a script first.")
 
     api_keys = request.api_keys or ApiKeys()
-    require_llm_key(api_keys, "AI 标题分析")
+    require_llm_key(api_keys, "AI title analysis")
     llm = LLMProcessor(api_key=api_keys.llm_key, api_url=api_keys.llm_url, model=api_keys.llm_model)
     analysis = llm.generate_viral_metadata(request.script)
 
     if not analysis:
-        raise HTTPException(status_code=500, detail=llm.last_error or "分析失败，请检查 AI API Key")
+        raise HTTPException(status_code=500, detail=llm.last_error or "Analysis failed. Check your AI API key.")
 
     return analysis
 
 class GenerateScriptRequest(BaseModel):
     topic: str
-    vibe: str = "general"
+    vibe: str = "aesthetic"
+    language: str = "en-US"
     api_keys: Optional[ApiKeys] = None
 
 @app.post("/api/generate_script")
 async def generate_script(request: GenerateScriptRequest):
     if not request.topic:
-        raise HTTPException(status_code=400, detail="请先输入主题")
+        raise HTTPException(status_code=400, detail="Enter a topic first.")
 
     api_keys = request.api_keys or ApiKeys()
-    require_llm_key(api_keys, "脚本生成")
+    require_llm_key(api_keys, "Script generation")
     llm = LLMProcessor(api_key=api_keys.llm_key, api_url=api_keys.llm_url, model=api_keys.llm_model)
-    script = llm.generate_full_script(request.topic, vibe=request.vibe)
+    script = llm.generate_full_script(request.topic, vibe=request.vibe, language=request.language)
 
     if not script:
-        raise HTTPException(status_code=500, detail=llm.last_error or "脚本生成失败，请检查 AI API Key")
+        raise HTTPException(status_code=500, detail=llm.last_error or "Script generation failed. Check your AI API key.")
 
     return {"script": script}
 
@@ -139,30 +251,97 @@ class ScrapeUrlRequest(BaseModel):
 @app.post("/api/scrape_url")
 async def scrape_url_endpoint(request: ScrapeUrlRequest):
     if not request.url:
-        raise HTTPException(status_code=400, detail="请先粘贴链接")
+        raise HTTPException(status_code=400, detail="Paste a URL first.")
 
     api_keys = request.api_keys or ApiKeys()
-    require_llm_key(api_keys, "链接内容总结")
+    require_llm_key(api_keys, "URL summarization")
 
     scraper = WebScraper()
     content = await scraper.scrape_url(request.url)
     if not content:
-        raise HTTPException(status_code=500, detail="链接内容提取失败")
+        raise HTTPException(status_code=500, detail="Could not extract text from that URL.")
 
     llm = LLMProcessor(api_key=api_keys.llm_key, api_url=api_keys.llm_url, model=api_keys.llm_model)
     script = llm.summarize_url(content)
 
     if not script:
-        raise HTTPException(status_code=500, detail="链接内容总结失败")
+        raise HTTPException(status_code=500, detail="Could not summarize the URL into a script.")
 
     return {"script": script}
 
+@app.post("/api/upload/material")
+async def upload_material(file: UploadFile = File(...)):
+    filename = sanitize_upload_filename(file.filename or "upload.bin")
+    suffix = Path(filename).suffix.lower()
+    if suffix not in ALLOWED_UPLOAD_SUFFIXES:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {suffix or 'unknown'}.")
+    dest = UPLOAD_DIR / f"{uuid.uuid4().hex}_{filename}"
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    dest.write_bytes(content)
+    return {"path": dest.name, "url": "/uploads/" + dest.name}
+
+@app.post("/api/tts/preview")
+async def tts_preview(request: VoicePreviewRequest):
+    text = (request.text or "").strip()[:180]
+    if not text:
+        raise HTTPException(status_code=400, detail="Enter preview text.")
+    engine = load_video_engine()(output_dir=DOWNLOAD_DIR / "_preview")
+    if request.eleven_key:
+        engine.set_eleven_key(request.eleven_key)
+    path = await engine.generate_voiceover(
+        text,
+        0,
+        voice=request.voice,
+        language=request.language,
+        voice_rate=request.voice_rate,
+        voice_volume=request.voice_volume,
+        timeout_seconds=20,
+    )
+    if not path or not Path(path).exists():
+        raise HTTPException(status_code=500, detail="Voice preview failed.")
+    data = Path(path).read_bytes()
+    with contextlib.suppress(OSError):
+        Path(path).unlink()
+    return Response(content=data, media_type="audio/mpeg")
+
 # ── Helpers ──
+def resolve_path_within_directory(base_dir, unsafe_path, require_file=True):
+    if not unsafe_path:
+        raise ValueError("empty path is not allowed")
+    base_dir_real = os.path.realpath(base_dir)
+    candidate_path = unsafe_path
+    if not os.path.isabs(candidate_path):
+        candidate_path = os.path.join(base_dir_real, candidate_path)
+    resolved_path = os.path.realpath(candidate_path)
+    try:
+        common_path = os.path.commonpath([base_dir_real, resolved_path])
+    except ValueError as exc:
+        raise ValueError("path is outside the allowed directory") from exc
+    if common_path != base_dir_real:
+        raise ValueError("path is outside the allowed directory")
+    if require_file and not os.path.isfile(resolved_path):
+        raise ValueError("file does not exist")
+    return resolved_path
+
+def sanitize_upload_filename(filename):
+    name = Path(filename or "upload.bin").name
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    return name[:80] or "upload.bin"
+
 def make_scraper(src, output_dir, api_keys=None):
     keys = api_keys or ApiKeys()
     if src == "pinterest": return PinterestScraper(output_dir=output_dir)
     if src == "pexels": return PexelsScraper(output_dir=output_dir, api_key=keys.pexels_key)
     if src == "pixabay": return PixabayScraper(output_dir=output_dir, api_key=keys.pixabay_key)
+    if src == "coverr": return CoverrScraper(output_dir=output_dir, api_key=keys.coverr_key)
+    if src == "piapi":
+        return PiAPIScraper(
+            output_dir=output_dir,
+            api_key=keys.piapi_key,
+            model=keys.piapi_model or "hailuo-2.3-fast",
+        )
     return None
 
 def load_video_engine():
@@ -170,7 +349,7 @@ def load_video_engine():
         from video_engine import VideoEngine
     except ModuleNotFoundError as exc:
         missing = exc.name or "video dependencies"
-        raise RuntimeError(f"视频合成依赖缺失：{missing}。请运行 pip install -r requirements.txt 后重试。") from exc
+        raise RuntimeError(f"Video assembly dependencies are missing ({missing}). Run pip install -r requirements.txt and retry.") from exc
     return VideoEngine
 
 def load_youtube_uploader():
@@ -178,12 +357,12 @@ def load_youtube_uploader():
         from youtube_utils import YouTubeUploader
     except ModuleNotFoundError as exc:
         missing = exc.name or "YouTube upload dependencies"
-        raise RuntimeError(f"YouTube 上传依赖缺失：{missing}。请运行 pip install -r requirements.txt 后重试。") from exc
+        raise RuntimeError(f"YouTube upload dependencies are missing ({missing}). Run pip install -r requirements.txt and retry.") from exc
     return YouTubeUploader
 
 def require_llm_key(api_keys, action):
     if not (api_keys.llm_key or "").strip():
-        raise HTTPException(status_code=400, detail=f"{action}需要先配置 AI 文本密钥。")
+        raise HTTPException(status_code=400, detail=f"{action} requires an AI text API key.")
 
 def normalized_script_inputs(request):
     scripts = [(script or "").strip() for script in (request.scripts or [])]
@@ -202,50 +381,51 @@ def normalize_scrape_request_options(request):
 def validate_scrape_request_options(request):
     normalize_scrape_request_options(request)
     if request.source not in VALID_SOURCES:
-        raise RuntimeError(f"素材来源无效：{request.source}。请选择 ai、pinterest、pexels 或 pixabay。")
+        raise RuntimeError(f"Invalid media source: {request.source}. Choose pinterest, pexels, pixabay, coverr, piapi, or local.")
     if request.media_type not in VALID_MEDIA_TYPES:
-        raise RuntimeError(f"素材类型无效：{request.media_type}。请选择 photo 或 video。")
-    if request.source == "ai" and request.media_type != "photo":
-        raise RuntimeError("AI 生图模式当前只支持图片素材；如需视频素材，请切换到 Pinterest、Pexels 或 Pixabay。")
+        raise RuntimeError(f"Invalid media type: {request.media_type}. Choose photo or video.")
     if request.mode not in VALID_MODES:
-        raise RuntimeError(f"生成模式无效：{request.mode}。请选择 single 或 script。")
+        raise RuntimeError(f"Invalid mode: {request.mode}. Choose single or script.")
     if request.count < 1 or request.count > 15:
-        raise RuntimeError("每句素材数必须在 1 到 15 之间。")
-    if request.mode != "script" and not (request.query or "").strip():
-        raise RuntimeError("单条生成需要先输入主题 query。")
+        raise RuntimeError("Assets per scene must be between 1 and 15.")
+    if request.source == "local":
+        if not resolved_local_files(request):
+            raise RuntimeError("Local source requires at least one uploaded media file.")
+    elif request.mode != "script" and not (request.query or "").strip():
+        raise RuntimeError("Single search requires a topic query.")
     if request.mode == "script":
         if not normalized_script_inputs(request):
-            raise RuntimeError("脚本模式需要先输入至少一段旁白脚本。")
+            raise RuntimeError("Script mode requires at least one narration script.")
     if request.auto_video:
         settings = request.video_settings or VideoSettings()
         if (settings.voice or "").strip().lower() == "none":
-            raise RuntimeError("自动合成视频需要选择一个 AI 配音；如需不配音，请先关闭自动合成视频。")
+            raise RuntimeError("Auto video requires a TTS voice. Turn off auto video for asset-only mode.")
+        if (settings.transition or "fade") not in VALID_TRANSITIONS:
+            raise RuntimeError("Invalid clip transition. Choose none, fade, zoom_in, zoom_out, or slide.")
         resolve_background_music(settings)
-        if request.mode == "single" and request.source != "ai":
-            raise RuntimeError("单条素材搜索不会自动合成视频；请切换到脚本模式，或关闭自动合成视频。")
-
-def validate_ai_image_keys(request):
-    if request.source != "ai":
-        return
-    api_keys = request.api_keys or ApiKeys()
-    missing = []
-    if not (api_keys.llm_key or "").strip():
-        missing.append("llm_key")
-    if not (api_keys.seedream_key or "").strip():
-        missing.append("seedream_key")
-    if missing:
-        raise RuntimeError(f"AI 生图模式需要同时配置 DeepSeek/兼容 LLM API Key 与 Seedream API Key，缺少：{', '.join(missing)}。当前默认不启用 Pollinations 兜底。")
+        if request.mode == "single" and request.source != "local":
+            raise RuntimeError("Single stock search does not assemble a video. Switch to script mode, or turn off auto video.")
+        if request.yt_upload and not request.publish_confirmed:
+            raise RuntimeError("YouTube publishing requires explicit confirmation.")
 
 def validate_script_keyword_key(request):
-    if request.mode != "script" or request.source == "ai":
+    if request.mode != "script" or request.source == "local":
         return
     api_keys = request.api_keys or ApiKeys()
     if not (api_keys.llm_key or "").strip():
-        raise RuntimeError("脚本模式使用 Pinterest/Pexels/Pixabay 素材源时，需要先配置 AI 文本密钥，用于把旁白拆成搜索关键词。")
+        raise RuntimeError("Script mode with Pinterest/Pexels/Pixabay/Coverr/PiAPI requires an AI text API key to split narration into search keywords.")
 
 def validate_request_api_dependencies(request):
-    validate_ai_image_keys(request)
     validate_script_keyword_key(request)
+    if request.source == "piapi":
+        api_keys = request.api_keys or ApiKeys()
+        key = PiAPIScraper._clean_key(api_keys.piapi_key)
+        if not key:
+            raise RuntimeError("PiAPI source requires an API key. Add it in API settings: https://app.piapi.ai/")
+        if key.lower().startswith("r8_"):
+            raise RuntimeError("PiAPI HTTP 401: this looks like a Replicate token (r8_...). Create a PiAPI key at https://app.piapi.ai/")
+        if not request.piapi_confirmed:
+            raise RuntimeError("PiAPI generation is paid and requires explicit confirmation for this run.")
 
 def local_script_segments(script):
     """Split a Chinese narration script into stable scene rows without calling an LLM."""
@@ -272,9 +452,16 @@ def local_script_segments(script):
         for idx, sentence in enumerate(rows)
     ]
 
-SEEDREAM_IMAGE_SEMAPHORE = asyncio.Semaphore(3)
-POLLINATIONS_IMAGE_SEMAPHORE = asyncio.Semaphore(1)
-ALLOW_POLLINATIONS_FALLBACK = os.environ.get("ALLOW_POLLINATIONS_FALLBACK", "").lower() in {"1", "true", "yes"}
+def resolved_local_files(request):
+    names = [name for name in (request.local_files or []) if (name or "").strip()]
+    resolved = []
+    for name in names:
+        try:
+            resolved.append(resolve_path_within_directory(str(UPLOAD_DIR), Path(name).name))
+        except ValueError:
+            raise RuntimeError(f"Local upload is invalid or outside the uploads folder: {Path(name).name}.")
+    return resolved
+
 _UNSET = object()
 
 def normalize_status_progress(progress):
@@ -308,14 +495,24 @@ def safe_scene_folder(project_path, keyword):
 
 def describe_scene_media_error(error):
     if not error:
-        return "未生成/下载到素材"
+        return "no media was generated or downloaded"
     return str(error) or error.__class__.__name__
 
+def is_fatal_scene_media_error(message):
+    text = (message or "").lower()
+    return (
+        "http 401" in text
+        or "http 402" in text
+        or "failed to verify" in text
+        or "unauthorized" in text
+        or "insufficient credit" in text
+        or "no credit" in text
+        or "replicate token" in text
+    )
+
 def describe_empty_media_result(source, media_type):
-    if source == "ai":
-        return "Seedream 4.5 未返回有效图片"
-    media_label = "视频" if media_type == "video" else "图片"
-    return f"{source} 未找到可用{media_label}素材"
+    media_label = "video" if media_type == "video" else "image"
+    return f"{source} found no usable {media_label} assets"
 
 def validate_scene_images(keyword_data, project_path):
     missing = []
@@ -332,9 +529,9 @@ def validate_scene_images(keyword_data, project_path):
         files = explicit_files or folder_files
         if not files:
             reason = describe_scene_media_error(item.get("_error"))
-            missing.append(f"第 {idx} 个分镜（{item['keyword']}）：{reason}")
+            missing.append(f"scene {idx} ({item['keyword']}): {reason}")
     if missing:
-        raise RuntimeError(f"分镜素材不完整：应有 {len(keyword_data)} 个分镜图/视频，缺少 {len(missing)} 个：{'; '.join(missing[:5])}")
+        raise RuntimeError(f"Scene media is incomplete: expected {len(keyword_data)} scenes, missing {len(missing)}: {'; '.join(missing[:5])}")
 
 def validate_tts_files(engine, scene_count):
     missing = []
@@ -343,15 +540,88 @@ def validate_tts_files(engine, scene_count):
         if not path.exists() or path.stat().st_size <= 0:
             missing.append(idx + 1)
     if missing:
-        raise RuntimeError(f"TTS 文件不完整：应有 {scene_count} 个，缺少/为空 {len(missing)} 个：{missing[:8]}")
+        raise RuntimeError(f"TTS files are incomplete: expected {scene_count}, missing or empty {len(missing)}: {missing[:8]}")
 
 def validate_final_video(video_file):
     if not video_file:
-        raise RuntimeError("视频合成失败：create_video 没有返回 mp4 路径。")
+        raise RuntimeError("Video assembly failed: create_video did not return an mp4 path.")
     video_path = Path(video_file)
     if video_path.suffix.lower() != ".mp4" or not video_path.exists() or video_path.stat().st_size <= 0:
-        raise RuntimeError(f"视频合成失败：create_video 返回的 mp4 不存在或为空：{video_file}")
+        raise RuntimeError(f"Video assembly failed: returned mp4 is missing or empty: {video_file}")
     return video_path
+
+BROAD_STOCK_TERMS = {
+    "exercise", "fitness", "athlete", "sport", "sports", "training", "people",
+    "person", "man", "woman", "action", "power", "motivation", "success",
+    "health", "body", "life", "strong", "strength", "energy", "workout",
+}
+
+def file_fingerprint(path):
+    path = Path(path)
+    digest = hashlib.md5()
+    digest.update(str(path.stat().st_size).encode("ascii"))
+    with path.open("rb") as handle:
+        digest.update(handle.read(65536))
+    return digest.hexdigest()
+
+def stock_keyword_variants(keyword):
+    variants = []
+    raw = (keyword or "").strip()
+    if raw:
+        variants.append(raw)
+    simple = raw.replace(" aesthetic", "").replace(" lofi art", "").replace(" futuristic", "").replace(" black and white", "").strip()
+    if simple and simple not in variants:
+        variants.append(simple)
+    words = [w for w in simple.split() if w]
+    if len(words) >= 2:
+        pair = " ".join(words[:2])
+        if pair not in variants:
+            variants.append(pair)
+        if words[0].lower() not in BROAD_STOCK_TERMS and words[0] not in variants:
+            variants.append(words[0])
+    return variants
+
+def sentence_clip_score(path, sentence, keyword=""):
+    stop = {"the", "and", "for", "you", "your", "are", "this", "that", "with", "from", "have", "will", "just"}
+    words = {w.lower() for w in re.findall(r"[a-zA-Z]{3,}", f"{sentence} {keyword}") if w.lower() not in stop}
+    name = f"{Path(path).stem} {Path(path).parent.name} {keyword}".lower().replace("_", " ")
+    overlap = sum(1 for w in words if w in name)
+    score = overlap * 3
+    try:
+        size = Path(path).stat().st_size
+    except OSError:
+        return -1
+    suffix = Path(path).suffix.lower()
+    min_bytes = 40000 if suffix in {".mp4", ".mov", ".m4v", ".webm"} else 8000
+    if size < min_bytes:
+        return -1
+    score += min(size / 500000, 4)
+    return score
+
+def pick_unique_media(files, seen_hashes, sentence="", keyword="", limit=3):
+    ranked = []
+    for file in files or []:
+        path = Path(file)
+        suffix = path.suffix.lower()
+        min_bytes = 40000 if suffix in {".mp4", ".mov", ".m4v", ".webm"} else 8000
+        try:
+            if not path.is_file() or path.stat().st_size < min_bytes:
+                continue
+            fingerprint = file_fingerprint(path)
+        except OSError:
+            continue
+        if fingerprint in seen_hashes:
+            continue
+        score = sentence_clip_score(path, sentence, keyword)
+        if score < 0:
+            continue
+        ranked.append((score, fingerprint, str(path)))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    chosen = []
+    for score, fingerprint, path in ranked[:limit]:
+        seen_hashes.add(fingerprint)
+        chosen.append(path)
+    return chosen
 
 def existing_media_paths(files):
     valid = []
@@ -369,7 +639,7 @@ def existing_media_paths(files):
 def require_media_files(files, label):
     valid = existing_media_paths(files)
     if not valid:
-        raise RuntimeError(f"没有找到可用素材：{label}。请换关键词或素材来源，或检查素材 API Key/网络。")
+        raise RuntimeError(f"No usable media found for: {label}. Try another keyword or source, or check the stock API key/network.")
     return valid
 
 def resolve_background_music(settings):
@@ -377,223 +647,66 @@ def resolve_background_music(settings):
     if not music or music.lower() == "none":
         return None
     if Path(music).name != music:
-        raise RuntimeError("背景音乐文件名无效，请从页面下拉选项中选择。")
+        raise RuntimeError("Background music filename is invalid. Choose a track from the dropdown.")
 
     music_path = BASE_DIR / "static" / "music" / music
     if not music_path.exists() or music_path.stat().st_size <= 0:
-        raise RuntimeError(f"背景音乐文件不存在或为空：static/music/{music}。请选择“无音乐”或补齐该文件。")
+        raise RuntimeError(f"Background music file is missing or empty: static/music/{music}. Choose “No music” or add the file.")
     return str(music_path)
 
-def normalize_seedream_url(url):
-    url = (url or "").strip().rstrip("/")
-    if not url:
-        url = "https://ark.cn-beijing.volces.com/api/v3"
-    if url.endswith("/images/generations"):
-        return url
-    return f"{url}/images/generations"
-
-def file_to_data_url(path):
-    path = Path(path)
-    suffix = path.suffix.lower()
-    mime = "image/png" if suffix == ".png" else "image/webp" if suffix == ".webp" else "image/jpeg"
-    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:{mime};base64,{encoded}"
-
-def validate_image_bytes(content, label):
-    if not content:
-        raise RuntimeError(f"{label} 返回了空图片内容。")
-    from PIL import Image
-    try:
-        Image.open(BytesIO(content)).verify()
-    except Exception as exc:
-        raise RuntimeError(f"{label} 返回的内容不是有效图片。") from exc
-    return content
-
-async def generate_seedream_image(prompt_text, file_path, api_keys, reference_image=None):
-    seedream_key = (api_keys.seedream_key or "").strip() if api_keys else ""
-    if not seedream_key:
-        raise RuntimeError("AI 生图模式需要 Seedream API Key，当前未配置 seedream_key。")
-
-    import requests
-    url = normalize_seedream_url(api_keys.seedream_url)
-    model = (api_keys.seedream_model or "doubao-seedream-4-5-251128").strip()
-    headers = {
-        "Authorization": f"Bearer {seedream_key}",
-        "Content-Type": "application/json",
-    }
-    base_payload = {
-        "model": model,
-        "prompt": prompt_text[:1800],
-        "size": "1080x1920",
-        "response_format": "url",
-        "watermark": False,
-        "sequential_image_generation": "disabled",
-    }
-
-    base_payloads = [base_payload, {**base_payload, "size": "2K"}]
-    payloads = []
-    if reference_image and Path(reference_image).exists():
-        ref_data = file_to_data_url(reference_image)
-        for payload in base_payloads:
-            payloads.extend([
-                {**payload, "image": [ref_data]},
-                {**payload, "image": ref_data},
-                payload,
-            ])
-    else:
-        payloads = base_payloads
-
-    def save_response(response):
-        data = response.json()
-        first = (data.get("data") or [{}])[0]
-        image_url = first.get("url")
-        b64 = first.get("b64_json")
-        if image_url:
-            image_response = requests.get(image_url, timeout=180)
-            image_response.raise_for_status()
-            file_path.write_bytes(validate_image_bytes(image_response.content, "Seedream 图片下载"))
-            return str(file_path)
-        if b64:
-            file_path.write_bytes(validate_image_bytes(base64.b64decode(b64), "Seedream b64_json"))
-            return str(file_path)
-        raise RuntimeError(f"Seedream returned no image data: {json.dumps(data, ensure_ascii=False)[:240]}")
-
-    def post_once(payload):
-        response = requests.post(url, headers=headers, json=payload, timeout=180)
-        if response.status_code != 200:
-            try:
-                detail = response.json()
-            except Exception:
-                detail = response.text[:240]
-            raise RuntimeError(f"Seedream HTTP {response.status_code}: {detail}")
-        return save_response(response)
-
-    last_error = ""
-    for idx, payload in enumerate(payloads, start=1):
-        for attempt in range(1, 3):
-            try:
-                return await asyncio.to_thread(post_once, payload)
-            except Exception as e:
-                last_error = f"payload {idx}/{len(payloads)}, try {attempt}/2: {e}"
-                print(f"  ❌ Seedream image failed ({last_error})")
-                if "429" in str(e):
-                    await asyncio.sleep(8 * attempt)
-                else:
-                    break
-    detail = f"最后错误：{last_error}" if last_error else "未收到可用错误详情"
-    raise RuntimeError(f"Seedream 生图失败：所有请求 payload 与重试均未返回图片。{detail}")
-
-async def generate_ai_image(sentence, project_path, llm=None, vibe="suspense_cn", character_profile="", label="scene", seed=None, api_keys=None, reference_image=None, image_prompt=None):
-    """Generate one vertical AI image for a sentence and save it locally."""
-    safe_label = re.sub(r'[^\w\-]', '_', label)[:40] or "scene"
-    out_folder = project_path / safe_label
-    out_folder.mkdir(parents=True, exist_ok=True)
-
-    description = image_prompt or (await asyncio.to_thread(llm.generate_image_description, sentence) if llm else sentence)
-    if safe_label == "main_character_reference":
-        style = (
-            "vertical 9:16 protagonist reference portrait, realistic Chinese web drama character, "
-            "clear face, upper body, simple dark background, consistent clothing, no text, no watermark, high detail"
-        )
-        prompt_text = f"{description}. {style}"
-    else:
-        style = (
-            "vertical 9:16 cinematic suspense frame, realistic Chinese web drama still, "
-            "dark moody lighting, coherent composition, no text, no watermark, high detail"
-        )
-        prompt_text = f"{description}. {style}"
-
-    if character_profile and safe_label != "main_character_reference":
-        prompt_text = f"Same protagonist: {character_profile}. Scene: {description}. {style}"
-
-    image_seed = seed if seed is not None else random.randint(1, 999999)
-
-    import requests
-    file_path = out_folder / f"ai_{safe_label}_{image_seed}.jpg"
-
-    if api_keys and api_keys.seedream_key:
-        async with SEEDREAM_IMAGE_SEMAPHORE:
-            return await generate_seedream_image(
-                prompt_text,
-                file_path,
-                api_keys,
-                reference_image=reference_image if safe_label != "main_character_reference" else None
-            )
-
-    if not ALLOW_POLLINATIONS_FALLBACK:
-        raise RuntimeError("AI 生图模式需要 seedream_key；当前默认不启用 Pollinations 兜底。")
-
-    def fetch_image(url):
-        response = requests.get(url, timeout=120)
-        response.raise_for_status()
-        content_type = response.headers.get("content-type", "")
-        if "image" not in content_type.lower() and len(response.content) < 5000:
-            raise RuntimeError(f"AI image API returned non-image response: {response.text[:160]}")
-        file_path.write_bytes(response.content)
-        return str(file_path)
-
-    prompts = [prompt_text[:1200]]
-    if character_profile and safe_label != "main_character_reference":
-        prompts.append(f"{description}. {style}"[:1200])
-    prompts.append(f"{sentence}. vertical 9:16 cinematic suspense frame, realistic, no text, no watermark"[:1200])
-
-    async with POLLINATIONS_IMAGE_SEMAPHORE:
-        for attempt, prompt_variant in enumerate(prompts, start=1):
-            prompt = quote(prompt_variant)
-            attempt_seed = image_seed if attempt == 1 else image_seed + attempt
-            url = f"https://image.pollinations.ai/prompt/{prompt}?width=720&height=1280&nologo=true&model=flux&seed={attempt_seed}"
-            try:
-                return await asyncio.to_thread(fetch_image, url)
-            except Exception as e:
-                print(f"  ❌ AI image generation failed ({safe_label}, try {attempt}/{len(prompts)}): {e}")
-                wait_seconds = 12 * attempt if "429" in str(e) else 1.5 * attempt
-                await asyncio.sleep(wait_seconds)
-        return None
-
-async def try_search(scraper, keyword, media_type, count):
+async def try_search(scraper, keyword, media_type, count, aspect="9:16"):
     if not scraper:
         return []
     try:
         if media_type == "video":
-            return await scraper.search_videos(keyword, num_videos=count)
-        else:
+            if hasattr(scraper, "search_videos"):
+                return await scraper.search_videos(keyword, num_videos=count, aspect=aspect)
+            return []
+        if hasattr(scraper, "search_images"):
             return await scraper.search_images(keyword, num_images=count)
-    except: return []
+        return []
+    except Exception:
+        return []
 
-async def universal_search(keyword, media_type, count, primary_source, project_path, api_keys=None, vibe="aesthetic", sentence="", llm=None, character_profile="", character_seed=None, character_reference=None, image_prompt=None):
-    if primary_source == "ai":
-        print(f"  🎨 AI image source for: '{sentence[:40]}...'")
-        image_path = await generate_ai_image(
-            sentence or keyword, project_path, llm=llm, vibe=vibe,
-            character_profile=character_profile, label=keyword, seed=character_seed,
-            api_keys=api_keys, reference_image=character_reference, image_prompt=image_prompt
-        )
-        return [image_path] if image_path else []
+async def universal_search(keyword, media_type, count, primary_source, project_path, api_keys=None, vibe="aesthetic", sentence="", llm=None, aspect="9:16", local_files=None, seen_hashes=None):
+    if primary_source == "local":
+        return [str(path) for path in (local_files or [])]
 
-    keywords = [keyword]
-    simple = keyword.replace(" aesthetic", "").replace(" lofi art", "").replace(" futuristic", "").replace(" black and white", "")
-    if simple != keyword: keywords.append(simple)
-    words = simple.split()
-    if len(words) > 1: keywords.append(words[0])
+    if primary_source == "piapi":
+        scraper = make_scraper("piapi", project_path, api_keys)
+        prompt = (sentence or keyword or "").strip()
+        kind = "photo" if media_type == "photo" else "video"
+        if kind == "video":
+            res = await scraper.search_videos(prompt, num_videos=1, aspect=aspect)
+        else:
+            res = await scraper.search_images(prompt, num_images=1)
+        picked = pick_unique_media(res, seen_hashes, sentence=sentence, keyword=keyword, limit=1)
+        if picked:
+            print(f"  ✅ [piapi] kept {len(picked)} generated clip(s)")
+        return picked
 
-    all_sources = ["pexels", "pixabay", "pinterest"]
+    keywords = stock_keyword_variants(keyword)
+    seen_hashes = seen_hashes if seen_hashes is not None else set()
+
+    all_sources = ["pexels", "pixabay", "coverr", "pinterest"]
+    if primary_source == "coverr" and media_type != "video":
+        primary_source = "pexels"
     ordered = [primary_source] + [s for s in all_sources if s != primary_source]
+    if media_type != "video":
+        ordered = [s for s in ordered if s != "coverr"]
 
-    # PHASE 1: Parallel search
-    tasks, labels = [], []
+    collected = []
     for src in ordered:
         scraper = make_scraper(src, project_path, api_keys)
         for k in keywords:
-            tasks.append(try_search(scraper, k, media_type, count))
-            labels.append(f"{src}:{k}")
+            res = await try_search(scraper, k, media_type, max(count, 8), aspect=aspect)
+            picked = pick_unique_media(res, seen_hashes, sentence=sentence, keyword=k, limit=max(1, count))
+            if picked:
+                print(f"  ✅ [{src}:{k}] kept {len(picked)} unique clips")
+                collected.extend(picked)
+                if len(collected) >= count:
+                    return collected[:count]
 
-    results = await asyncio.gather(*tasks)
-    for idx, res in enumerate(results):
-        if res:
-            if idx > 0: print(f"  ✅ [{labels[idx]}] found {len(res)} files")
-            return res
-
-    # PHASE 2: AI Re-Ask (Keyword Optimization)
     if llm and sentence and llm.api_key:
         print(f"  🧠 AI Re-Ask for '{keyword}'...")
         try:
@@ -603,47 +716,41 @@ async def universal_search(keyword, media_type, count, primary_source, project_p
                 data=json.dumps({
                     "model": llm.models[0],
                     "messages": [
-                        {"role": "system", "content": "These keywords found NO stock footage. Give ONE ultra-simple 1-2 word keyword that will DEFINITELY have results. Reply ONLY the keyword."},
+                        {"role": "system", "content": "Give ONE 2-3 word stock-footage search query that matches the sentence visually. Concrete objects/actions only. Never reply with: exercise, fitness, athlete, people, motivation, success."},
                         {"role": "user", "content": f"Sentence: {sentence}\nFailed: {', '.join(keywords)}\nNew keyword:"}
                     ]
                 }), timeout=15)
             if r.status_code == 200:
                 new_kw = r.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'").lower()
                 print(f"  🆕 AI suggested: '{new_kw}'")
-                for src in ["pexels", "pixabay"]:
-                    scraper = make_scraper(src, project_path, api_keys)
-                    res = await try_search(scraper, new_kw, media_type, count)
-                    if res: return res
-        except Exception as e: print(f"  ⚠️ AI Re-Ask failed: {e}")
-
-    # Optional legacy fallback. Disabled by default; enable explicitly with ALLOW_POLLINATIONS_FALLBACK=1.
-    if ALLOW_POLLINATIONS_FALLBACK and llm and sentence:
-        print(f"  🎨 No stock found. Generating AI Image for: '{sentence[:50]}...'")
-        try:
-            image_path = await generate_ai_image(
-                sentence, project_path, llm=llm, vibe=vibe,
-                character_profile=character_profile, label=keyword, seed=character_seed,
-                api_keys=api_keys, reference_image=character_reference, image_prompt=image_prompt
-            )
-            if image_path:
-                print(f"  ✨ AI Image generated: {Path(image_path).name}")
-                return [image_path]
+                if new_kw.split()[0] not in BROAD_STOCK_TERMS:
+                    for src in ["pexels", "pixabay", "coverr"]:
+                        if src == "coverr" and media_type != "video":
+                            continue
+                        scraper = make_scraper(src, project_path, api_keys)
+                        res = await try_search(scraper, new_kw, media_type, max(count, 8), aspect=aspect)
+                        picked = pick_unique_media(res, seen_hashes, sentence=sentence, keyword=new_kw, limit=max(1, count))
+                        if picked:
+                            return picked
         except Exception as e:
-            print(f"  ❌ AI Image Fallback failed: {e}")
+            print(f"  ⚠️ AI Re-Ask failed: {e}")
 
-    return []
+    return collected
 
 # ── Main Scraping ──
 async def run_scrape(request: ScrapeRequest):
     global scraping_status
+    task_id = scraping_status.get("task_id") or uuid.uuid4().hex[:12]
     set_status(
         "running",
-        message="开始处理...",
+        message="Starting...",
         progress=0,
         error=None,
         final_video=None,
         results=[],
-        mode=request.mode
+        candidates=[],
+        mode=request.mode,
+        task_id=task_id,
     )
 
     try:
@@ -651,234 +758,165 @@ async def run_scrape(request: ScrapeRequest):
         validate_request_api_dependencies(request)
         source, media_type, count = request.source, request.media_type, request.count
         api_keys = request.api_keys or ApiKeys()
-
-        if request.mode == "single" and source == "ai" and request.auto_video:
-            topic = (request.query or "").strip()
-            if not topic:
-                raise RuntimeError("主题到视频需要先输入主题 query。")
-            set_status(message="🧠 DeepSeek 正在根据主题生成完整脚本...", progress=3, mode="script")
-            llm = LLMProcessor(api_key=api_keys.llm_key, api_url=api_keys.llm_url, model=api_keys.llm_model)
-            generated_script = await asyncio.to_thread(llm.generate_full_script, topic, request.vibe)
-            if not generated_script:
-                raise RuntimeError(llm.last_error or "DeepSeek 没有生成可用脚本。")
-            request.mode = "script"
-            request.script = generated_script
-            request.scripts = [generated_script]
+        settings = request.video_settings or VideoSettings()
+        local_files = resolved_local_files(request) if source == "local" else []
 
         if request.mode == "script":
             scripts = normalized_script_inputs(request)
             if not scripts:
-                raise RuntimeError("脚本模式需要提供 script 或 scripts。")
+                raise RuntimeError("Script mode requires a script or scripts list.")
             for script_idx, script in enumerate(scripts):
                 words = re.findall(r'\w+', script)
                 project_name = "_".join(words[:5]).lower() or f"unnamed_{script_idx}"
-
                 project_path = DOWNLOAD_DIR / project_name / media_type
                 project_path.mkdir(parents=True, exist_ok=True)
 
-                llm = None
-                if source == "ai":
-                    scraping_status["message"] = f"🧩 正在本地拆分分镜 {script_idx+1}/{len(scripts)}..."
+                scraping_status["message"] = f"Analyzing script {script_idx+1}/{len(scripts)}..."
+                if source == "local":
                     keyword_data = local_script_segments(script)
-                    llm = LLMProcessor(api_key=api_keys.llm_key, api_url=api_keys.llm_url, model=api_keys.llm_model)
+                    llm = None
                 else:
-                    scraping_status["message"] = f"🧠 AI 正在分析脚本 {script_idx+1}/{len(scripts)}..."
                     llm = LLMProcessor(api_key=api_keys.llm_key, api_url=api_keys.llm_url, model=api_keys.llm_model)
-                    keyword_data = llm.extract_keywords(script, vibe=request.vibe)
+                    keyword_data = llm.extract_keywords(
+                        script,
+                        vibe=request.vibe,
+                        language=settings.language,
+                        topic=(request.query or script[:160]).strip(),
+                    )
 
                 if not keyword_data:
-                    raise RuntimeError((llm.last_error if llm else "") or "没有生成可用的分镜，请检查脚本是否为空。")
-
-                character_profile = ""
-                character_seed = None
-                character_reference_path = None
-                if source == "ai":
-                    image_provider = "Seedream 4.5"
-
-                    scraping_status["message"] = f"🧠 DeepSeek 正在生成主角设定 {script_idx+1}/{len(scripts)}..."
-                    character_profile = llm.generate_character_profile(script)
-                    if not character_profile:
-                        raise RuntimeError(llm.last_error or "DeepSeek 没有生成可用主角设定。")
-
-                    scraping_status["message"] = f"🧠 DeepSeek 正在生成画面提示词 {script_idx+1}/{len(scripts)}..."
-                    prompted_data = await asyncio.to_thread(llm.generate_scene_prompts, keyword_data, character_profile, request.vibe)
-                    if not prompted_data:
-                        raise RuntimeError(llm.last_error or "DeepSeek 没有生成可用的画面提示词，未开始生图。")
-                    keyword_data = prompted_data
-
-                    scraping_status["message"] = f"🎨 {image_provider} 正在生成主角参考图 {script_idx+1}/{len(scripts)}..."
-                    character_seed = random.randint(1, 999999)
-                    ref_path = await generate_ai_image(
-                        f"Character reference portrait for the protagonist. {character_profile}",
-                        project_path,
-                        llm=None,
-                        vibe=request.vibe,
-                        character_profile=character_profile,
-                        label="main_character_reference",
-                        seed=character_seed,
-                        api_keys=api_keys
-                    )
-                    if ref_path:
-                        character_reference_path = ref_path
-                        try:
-                            ref_rel = "/" + str(Path(ref_path).relative_to(BASE_DIR)).replace("\\", "/")
-                            scraping_status["results"].append({
-                                "keyword": "主角人物参考",
-                                "sentence": character_profile,
-                                "files": [ref_rel]
-                            })
-                        except Exception:
-                            pass
+                    raise RuntimeError((llm.last_error if llm else "") or "No usable scenes were generated. Check that the script is not empty.")
 
                 total = len(keyword_data)
-                batch_size = 3 if source == "ai" and api_keys.seedream_key else (1 if source == "ai" else 3)
-                for bs in range(0, total, batch_size):
-                    batch = keyword_data[bs:bs + batch_size]
-                    action = "Seedream 4.5 正在并行生成分镜图" if source == "ai" else "正在搜索素材"
-                    scraping_status["message"] = f"🔍 {action} {script_idx+1}/{len(scripts)} | {bs+1}-{min(bs+batch_size, total)}/{total}..."
-
-                    search_tasks = [
-                        universal_search(
-                            keyword=item["keyword"], media_type=media_type, count=count,
+                seen_hashes = set()
+                for idx, item in enumerate(keyword_data):
+                    scraping_status["message"] = f"Searching media {script_idx+1}/{len(scripts)} | {idx+1}/{total}..."
+                    try:
+                        res_files = await universal_search(
+                            keyword=item["keyword"], media_type=media_type, count=max(count, 4),
                             primary_source=source, project_path=project_path, api_keys=api_keys,
                             vibe=request.vibe, sentence=item["sentence"], llm=llm,
-                            character_profile=character_profile, character_seed=character_seed,
-                            character_reference=character_reference_path,
-                            image_prompt=item.get("image_prompt")
-                        ) for item in batch
-                    ]
-                    batch_results = await asyncio.gather(*search_tasks, return_exceptions=True)
-
-                    for idx, res_files in enumerate(batch_results):
-                        item = batch[idx]
-                        if isinstance(res_files, BaseException):
-                            if isinstance(res_files, asyncio.CancelledError):
-                                raise res_files
-                            item["_error"] = describe_scene_media_error(res_files)
-                            print(f"  ❌ Scene media failed ({item['keyword']}): {item['_error']}")
-                            continue
-                        rel_paths = []
-                        valid_paths = existing_media_paths(res_files)
-                        valid_files = [str(path) for path in valid_paths]
-                        for path in valid_paths:
-                            try: rel_paths.append("/" + str(path.relative_to(BASE_DIR)).replace("\\", "/"))
-                            except: rel_paths.append(str(path))
-                        if rel_paths:
-                            item["_files"] = valid_files
-                            scraping_status["results"].append({"keyword": item["keyword"], "sentence": item["sentence"], "files": rel_paths})
-                        else:
-                            item["_error"] = describe_empty_media_result(source, media_type)
-
-                    set_status(progress=((script_idx) / len(scripts)) * 100 + ((bs + len(batch)) / total) * (100 / len(scripts)) * 0.8)
+                            aspect=settings.ratio, local_files=local_files, seen_hashes=seen_hashes,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        item["_error"] = describe_scene_media_error(exc)
+                        print(f"  ❌ Scene media failed ({item['keyword']}): {item['_error']}")
+                        if source == "piapi" or is_fatal_scene_media_error(item["_error"]):
+                            raise RuntimeError(item["_error"])
+                        set_status(progress=((script_idx) / len(scripts)) * 100 + ((idx + 1) / total) * (100 / len(scripts)) * 0.8)
+                        continue
+                    rel_paths = []
+                    valid_paths = existing_media_paths(res_files)
+                    valid_files = [str(path) for path in valid_paths]
+                    for path in valid_paths:
+                        try:
+                            rel_paths.append("/" + str(path.relative_to(BASE_DIR)).replace("\\", "/"))
+                        except Exception:
+                            rel_paths.append(str(path))
+                    if rel_paths:
+                        item["_files"] = valid_files
+                        scraping_status["results"].append({"keyword": item["keyword"], "sentence": item["sentence"], "files": rel_paths})
+                    else:
+                        item["_error"] = describe_empty_media_result(source, media_type)
+                    set_status(progress=((script_idx) / len(scripts)) * 100 + ((idx + 1) / total) * (100 / len(scripts)) * 0.8)
 
                 if request.auto_video:
                     validate_scene_images(keyword_data, project_path)
-
-                    scraping_status["message"] = f"🎙️ 正在生成中文旁白 {script_idx+1}/{len(scripts)}..."
+                    scraping_status["message"] = f"Generating voiceover {script_idx+1}/{len(scripts)}..."
                     engine = load_video_engine()(output_dir=project_path.parent)
                     if api_keys.eleven_key:
                         engine.set_eleven_key(api_keys.eleven_key)
-                    settings = request.video_settings or VideoSettings()
                     voice = settings.voice if settings.voice != "none" else None
                     if not voice:
-                        raise RuntimeError("自动合成视频需要 TTS voice；当前 voice=none，无法生成与分镜数量一致的旁白文件。")
+                        raise RuntimeError("Auto video requires a TTS voice; voice=none cannot produce one narration file per scene.")
 
-                    if voice:
-                        sem = asyncio.Semaphore(3)
-                        async def sem_voiceover(text, i):
-                            async with sem:
-                                return await engine.generate_voiceover(text, i, voice=voice, language=settings.language)
-                        await asyncio.gather(*[sem_voiceover(item["sentence"], idx) for idx, item in enumerate(keyword_data)])
+                    sem = asyncio.Semaphore(3)
+                    async def sem_voiceover(text, i):
+                        async with sem:
+                            return await engine.generate_voiceover(
+                                text, i, voice=voice, language=settings.language,
+                                voice_rate=settings.voice_rate, voice_volume=settings.voice_volume,
+                            )
+                    await asyncio.gather(*[sem_voiceover(item["sentence"], idx) for idx, item in enumerate(keyword_data)])
                     validate_tts_files(engine, len(keyword_data))
 
-                    scraping_status["message"] = f"🎬 正在合成视频 {script_idx+1}/{len(scripts)}..."
-                    bg_music = resolve_background_music(settings)
-
-                    # Ensure vibe is passed in settings
                     settings.vibe = request.vibe
-
-                    video_file = await asyncio.to_thread(engine.create_video, keyword_data, project_path, media_type, bg_music=bg_music, settings=settings)
-                    video_path = validate_final_video(video_file)
-
-                    # Generate Thumbnail
-                    thumb_file = engine.generate_thumbnail(video_file, project_name.replace("_", " ").title())
-                    try:
+                    bg_music = resolve_background_music(settings)
+                    candidate_count = max(1, min(5, int(settings.video_count or 1)))
+                    candidates = []
+                    for candidate_idx in range(candidate_count):
+                        scraping_status["message"] = f"Assembling video {script_idx+1}/{len(scripts)} candidate {candidate_idx+1}/{candidate_count}..."
+                        video_file = await asyncio.to_thread(
+                            engine.create_video, keyword_data, project_path, media_type,
+                            bg_music=bg_music, settings=settings,
+                            output_name=f"final_aesthetic_video_{candidate_idx+1}.mp4" if candidate_count > 1 else "final_aesthetic_video.mp4",
+                        )
+                        video_path = validate_final_video(video_file)
                         video_rel = relative_download_path(video_path)
-                        scraping_status["results"].append({"keyword": "合成视频", "files": [video_rel]})
-                        set_status(final_video=video_rel)
-                    except Exception:
-                        pass
+                        candidates.append(video_rel)
+                        scraping_status["results"].append({"keyword": f"Assembled video {candidate_idx+1}", "files": [video_rel]})
+                        if candidate_idx == 0:
+                            set_status(final_video=video_rel)
+                    set_status(candidates=candidates)
+
+                    thumb_file = engine.generate_thumbnail(str(video_path), project_name.replace("_", " ").title())
                     if thumb_file:
-                        try:
+                        with contextlib.suppress(Exception):
                             thumb_rel = "/" + str(Path(thumb_file).relative_to(BASE_DIR)).replace("\\", "/")
-                            scraping_status["results"].append({"keyword": "封面图", "files": [thumb_rel]})
-                        except: pass
+                            scraping_status["results"].append({"keyword": "Thumbnail", "files": [thumb_rel]})
 
-                    scraping_status["message"] = f"✅ 视频已生成：{project_name}/final_aesthetic_video.mp4"
+                    scraping_status["message"] = f"Video ready: {project_name}/final_aesthetic_video.mp4"
 
-                    if request.yt_upload and video_file and api_keys.yt_client_id and api_keys.yt_client_secret:
-                        scraping_status["message"] = "📤 正在上传到 YouTube..."
+                    if request.yt_upload and request.publish_confirmed and video_file and api_keys.yt_client_id and api_keys.yt_client_secret:
+                        scraping_status["message"] = "Uploading to YouTube..."
                         try:
                             uploader = load_youtube_uploader()(api_keys.yt_client_id, api_keys.yt_client_secret)
-                            # Get metadata from AI if available, otherwise fallback
                             title = project_name.replace("_", " ").title()
-                            description = "Automated video created with VUZA."
-                            tags = []
-
-                            # Try to get metadata from previous AI analysis if it was run
-                            # (Actually we don't have a good way to store it here unless we re-run it or pass it)
-                            # For now, we'll use the project name.
-
-                            await asyncio.to_thread(uploader.upload_video, video_file, title, description, tags)
-                            scraping_status["message"] += "（已上传到 YouTube）"
+                            await asyncio.to_thread(uploader.upload_video, str(video_path), title, "Automated video created with VUZA.", [])
+                            scraping_status["message"] += " (uploaded to YouTube)"
                         except Exception as e:
-                            scraping_status["message"] += f"（上传失败：{e}）"
+                            scraping_status["message"] += f" (upload failed: {e})"
                 else:
                     validate_scene_images(keyword_data, project_path)
-                    scraping_status["message"] = f"✅ 素材已保存到 {project_name}/（视频合成已关闭）"
+                    scraping_status["message"] = f"Assets saved to {project_name}/ (video assembly off)"
         else:
             query = request.query
-            project_name = re.sub(r'[^\w\-]', '_', query).lower()
+            project_name = re.sub(r'[^\w\-]', '_', query or "local").lower()
             project_path = DOWNLOAD_DIR / project_name / media_type
             project_path.mkdir(parents=True, exist_ok=True)
 
-            scraping_status["message"] = f"🔍 正在处理“{query}”..."
-            llm = None
-            character_profile = ""
-            character_seed = None
-            character_reference_path = None
-            image_prompt = None
-            if source == "ai":
-                api_keys = request.api_keys or ApiKeys()
-                llm = LLMProcessor(api_key=api_keys.llm_key, api_url=api_keys.llm_url, model=api_keys.llm_model)
-                character_profile = llm.generate_character_profile(query)
-                if not character_profile:
-                    raise RuntimeError(llm.last_error or "DeepSeek 没有生成可用主角设定。")
-                image_prompt = llm.generate_image_description(query)
-                if not image_prompt:
-                    raise RuntimeError(llm.last_error or "DeepSeek 没有生成可用的画面提示词。")
-                character_seed = random.randint(1, 999999)
-            res_files = await universal_search(keyword=query, media_type=media_type, count=count, primary_source=source, project_path=project_path, api_keys=api_keys, llm=llm, sentence=query, character_profile=character_profile, character_seed=character_seed, character_reference=character_reference_path, image_prompt=image_prompt)
-            valid_paths = require_media_files(res_files, query)
+            scraping_status["message"] = f"Searching “{query or 'local uploads'}”..."
+            res_files = await universal_search(
+                keyword=query or "local", media_type=media_type, count=count,
+                primary_source=source, project_path=project_path, api_keys=api_keys,
+                llm=None, sentence=query or "", aspect=settings.ratio, local_files=local_files,
+                seen_hashes=set(),
+            )
+            valid_paths = require_media_files(res_files, query or "local uploads")
             rel_paths = []
             for path in valid_paths:
-                try: rel_paths.append("/" + str(path.relative_to(BASE_DIR)).replace("\\", "/"))
-                except: rel_paths.append(str(path))
-            scraping_status["results"] = [{"keyword": query, "files": rel_paths}]
-            scraping_status["message"] = "✅ 已完成"
+                try:
+                    rel_paths.append("/" + str(path.relative_to(BASE_DIR)).replace("\\", "/"))
+                except Exception:
+                    rel_paths.append(str(path))
+            scraping_status["results"] = [{"keyword": query or "local", "files": rel_paths}]
+            scraping_status["message"] = "Done"
 
         set_status("success", progress=100)
     except Exception as e:
-        set_status("error", message=f"❌ 出错：{str(e)}", progress=100, error=str(e))
-        import traceback; traceback.print_exc()
+        set_status("error", message=f"Error: {str(e)}", progress=100, error=str(e))
+        import traceback
+        traceback.print_exc()
     finally:
         scraping_status["is_running"] = False
 
 @app.post("/api/scrape")
 async def start_scrape(request: ScrapeRequest, background_tasks: BackgroundTasks):
-    print(f"📥 VUZA Request: Mode={request.mode}, Source={request.source}, Vibe={request.vibe}")
+    print(f"VUZA Request: Mode={request.mode}, Source={request.source}, Vibe={request.vibe}")
     if scraping_status["is_running"]:
-        return JSONResponse(status_code=400, content={"message": "正在处理上一个任务，请稍等"})
+        return JSONResponse(status_code=400, content={"message": "A job is already running. Wait for it to finish."})
     try:
         validate_scrape_request_options(request)
         validate_request_api_dependencies(request)
@@ -886,16 +924,19 @@ async def start_scrape(request: ScrapeRequest, background_tasks: BackgroundTasks
         detail = str(exc)
         set_status(
             "error",
-            message=f"❌ 出错：{detail}",
+            message=f"Error: {detail}",
             progress=100,
             error=detail,
             final_video=None,
             results=[],
+            candidates=[],
             mode=request.mode,
         )
         raise HTTPException(status_code=400, detail=detail) from exc
+    task_id = uuid.uuid4().hex[:12]
+    set_status(task_id=task_id, status="queued", message="Queued", progress=0, error=None, results=[], candidates=[], final_video=None, mode=request.mode)
     background_tasks.add_task(run_scrape, request)
-    return {"message": "已开始"}
+    return {"message": "Started", "task_id": task_id}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

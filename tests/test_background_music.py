@@ -1,40 +1,39 @@
-import base64
 import asyncio
 import contextlib
 import io
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import BackgroundTasks, HTTPException
-from PIL import Image
 
 from app import (
+    ALLOWED_UPLOAD_SUFFIXES,
     ApiKeys,
     ScrapeRequest,
+    UPLOAD_DIR,
+    VALID_SOURCES,
     VideoSettings,
-    generate_seedream_image,
     app as fastapi_app,
+    is_fatal_scene_media_error,
     local_script_segments,
     normalized_script_inputs,
+    resolve_path_within_directory,
     set_status,
     run_scrape,
     scraping_status,
     resolve_background_music,
-    normalize_seedream_url,
+    sanitize_upload_filename,
     start_scrape,
-    validate_ai_image_keys,
     validate_request_api_dependencies,
     validate_scrape_request_options,
     validate_script_keyword_key,
 )
+from aesthetic_scraper import CoverrScraper, PiAPIScraper, LLMProcessor, LLM_PROVIDER_PRESETS, is_hd_resolution, matches_video_aspect
 
-
-def tiny_png_bytes():
-    buffer = io.BytesIO()
-    Image.new("RGB", (1, 1), "black").save(buffer, format="PNG")
-    return buffer.getvalue()
+ROOT = Path(__file__).resolve().parents[1]
 
 
 async def post_json(path, payload):
@@ -70,6 +69,39 @@ async def post_json(path, payload):
         "server": ("testserver", 80),
     }
 
+    await fastapi_app(scope, receive, send)
+    status = next(message["status"] for message in messages if message["type"] == "http.response.start")
+    response_body = b"".join(message.get("body", b"") for message in messages if message["type"] == "http.response.body")
+    text = response_body.decode("utf-8") if response_body else "{}"
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        data = {"raw": text}
+    return status, data
+
+
+async def get_json(path, query_string=b""):
+    messages = []
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        messages.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("ascii"),
+        "query_string": query_string,
+        "headers": [(b"host", b"testserver")],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
     await fastapi_app(scope, receive, send)
     status = next(message["status"] for message in messages if message["type"] == "http.response.start")
     response_body = b"".join(message.get("body", b"") for message in messages if message["type"] == "http.response.body")
@@ -134,181 +166,63 @@ class BackgroundMusicResolutionTests(unittest.TestCase):
     def test_missing_music_file_raises_clear_error(self):
         settings = VideoSettings(music="missing.mp3")
 
-        with self.assertRaisesRegex(RuntimeError, "背景音乐文件不存在或为空"):
+        with self.assertRaisesRegex(RuntimeError, "Background music file is missing or empty"):
             resolve_background_music(settings)
 
     def test_nested_music_path_is_rejected(self):
         settings = VideoSettings(music="../cinematic.mp3")
 
-        with self.assertRaisesRegex(RuntimeError, "背景音乐文件名无效"):
+        with self.assertRaisesRegex(RuntimeError, "Background music filename is invalid"):
             resolve_background_music(settings)
 
 
-class SeedreamGateTests(unittest.TestCase):
-    def test_seedream_url_defaults_to_volcengine_generation_endpoint(self):
-        self.assertEqual(
-            normalize_seedream_url(""),
-            "https://ark.cn-beijing.volces.com/api/v3/images/generations",
-        )
+class SourceContractTests(unittest.TestCase):
+    def test_default_source_is_pinterest(self):
+        self.assertEqual(ScrapeRequest().source, "pinterest")
 
-    def test_seedream_url_accepts_api_v3_base_url(self):
-        self.assertEqual(
-            normalize_seedream_url("https://ark.cn-beijing.volces.com/api/v3"),
-            "https://ark.cn-beijing.volces.com/api/v3/images/generations",
-        )
+    def test_ai_source_is_rejected(self):
+        request = ScrapeRequest(source="ai", query="rain alley")
+        with self.assertRaisesRegex(RuntimeError, "Invalid media source"):
+            validate_scrape_request_options(request)
 
-    def test_seedream_url_keeps_full_generation_endpoint(self):
-        self.assertEqual(
-            normalize_seedream_url("https://ark.cn-beijing.volces.com/api/v3/images/generations/"),
-            "https://ark.cn-beijing.volces.com/api/v3/images/generations",
-        )
+    def test_api_keys_have_no_seedream_fields(self):
+        self.assertNotIn("seedream_key", ApiKeys.model_fields)
+        self.assertNotIn("seedream_url", ApiKeys.model_fields)
+        self.assertNotIn("seedream_model", ApiKeys.model_fields)
+        self.assertIn("coverr_key", ApiKeys.model_fields)
+        self.assertIn("piapi_key", ApiKeys.model_fields)
+        self.assertIn("piapi_model", ApiKeys.model_fields)
 
-    def test_ai_source_requires_llm_and_seedream_keys(self):
-        request = ScrapeRequest(
-            source="ai",
-            mode="single",
-            query="雨夜小巷里的悬疑故事",
-            api_keys=ApiKeys(llm_key="", seedream_key=""),
-        )
+    def test_valid_sources_exclude_ai(self):
+        self.assertEqual(VALID_SOURCES, {"pinterest", "pexels", "pixabay", "coverr", "piapi", "local"})
+        self.assertNotIn("ai", VALID_SOURCES)
 
-        with contextlib.redirect_stderr(io.StringIO()):
-            asyncio.run(run_scrape(request))
+    def test_api_scrape_rejects_ai_source_with_english_detail(self):
+        scraping_status["is_running"] = False
+        status, data = asyncio.run(post_json(
+            "/api/scrape",
+            {"source": "ai", "mode": "single", "query": "rain alley", "auto_video": False},
+        ))
+        self.assertEqual(status, 400)
+        self.assertIn("Invalid media source", data["detail"])
+        self.assertFalse(scraping_status["is_running"])
 
-        self.assertEqual(scraping_status["status"], "error")
-        self.assertIn("llm_key", scraping_status["error"])
-        self.assertIn("seedream_key", scraping_status["error"])
-        self.assertIn("不启用 Pollinations 兜底", scraping_status["error"])
-
-    def test_ai_key_validation_reuses_same_error_message(self):
-        request = ScrapeRequest(
-            source="ai",
-            mode="single",
-            query="雨夜小巷里的悬疑故事",
-            api_keys=ApiKeys(llm_key="", seedream_key=""),
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "llm_key.*seedream_key"):
-            validate_ai_image_keys(request)
-
-    def test_ai_key_validation_treats_blank_strings_as_missing(self):
-        request = ScrapeRequest(
-            source="ai",
-            mode="single",
-            query="雨夜小巷里的悬疑故事",
-            api_keys=ApiKeys(llm_key="   ", seedream_key="\t"),
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "llm_key.*seedream_key"):
-            validate_ai_image_keys(request)
-
-    def test_seedream_generation_rejects_blank_key_before_network(self):
-        with self.assertRaisesRegex(RuntimeError, "seedream_key"):
-            asyncio.run(
-                generate_seedream_image(
-                    "雨夜小巷",
-                    Path("unused_seedream_output.jpg"),
-                    ApiKeys(seedream_key="   "),
-                )
-            )
-
-    def test_seedream_url_image_download_must_be_valid_image(self):
-        post_response = Mock(status_code=200)
-        post_response.json.return_value = {"data": [{"url": "https://example.test/not-image"}]}
-        get_response = Mock(content=b"", headers={})
-        get_response.raise_for_status.return_value = None
-
-        with patch("requests.post", return_value=post_response), patch("requests.get", return_value=get_response):
-            with self.assertRaisesRegex(RuntimeError, "Seedream 生图失败") as raised:
-                asyncio.run(
-                    generate_seedream_image(
-                        "雨夜小巷",
-                        Path("unused_seedream_output.jpg"),
-                        ApiKeys(seedream_key="sk-test"),
-                    )
-                )
-        self.assertIn("最后错误", str(raised.exception))
-        self.assertIn("返回了空图片内容", str(raised.exception))
-
-    def test_seedream_url_image_download_rejects_non_image_body(self):
-        post_response = Mock(status_code=200)
-        post_response.json.return_value = {"data": [{"url": "https://example.test/error-page"}]}
-        get_response = Mock(content=b"<html>not an image</html>", headers={})
-        get_response.raise_for_status.return_value = None
-
-        with patch("requests.post", return_value=post_response), patch("requests.get", return_value=get_response), patch.object(Path, "write_bytes", return_value=None) as write_bytes:
-            with self.assertRaisesRegex(RuntimeError, "Seedream 生图失败") as raised:
-                asyncio.run(
-                    generate_seedream_image(
-                        "雨夜小巷",
-                        Path("unused_seedream_output.jpg"),
-                        ApiKeys(seedream_key="sk-test"),
-                    )
-                )
-
-        message = str(raised.exception)
-        self.assertIn("最后错误", message)
-        self.assertIn("Seedream 图片下载", message)
-        self.assertIn("不是有效图片", message)
-        write_bytes.assert_not_called()
-
-    def test_seedream_http_error_keeps_response_detail(self):
-        post_response = Mock(status_code=500, text="internal error")
-        post_response.json.return_value = {"error": {"message": "quota exhausted"}}
-
-        with patch("requests.post", return_value=post_response):
-            with self.assertRaisesRegex(RuntimeError, "Seedream 生图失败") as raised:
-                asyncio.run(
-                    generate_seedream_image(
-                        "雨夜小巷",
-                        Path("unused_seedream_output.jpg"),
-                        ApiKeys(seedream_key="sk-test"),
-                    )
-                )
-
-        message = str(raised.exception)
-        self.assertIn("Seedream HTTP 500", message)
-        self.assertIn("quota exhausted", message)
-
-    def test_seedream_b64_image_writes_valid_image(self):
-        image_data = tiny_png_bytes()
-        post_response = Mock(status_code=200)
-        post_response.json.return_value = {
-            "data": [{"b64_json": base64.b64encode(image_data).decode("ascii")}]
-        }
-        output_path = Path("codex_tmp_seedream_test_output.png")
-
-        with patch("requests.post", return_value=post_response), patch.object(Path, "write_bytes", return_value=None) as write_bytes:
-            result = asyncio.run(
-                generate_seedream_image(
-                    "雨夜小巷",
-                    output_path,
-                    ApiKeys(seedream_key=" sk-test "),
-                )
-            )
-
-        self.assertEqual(result, str(output_path))
-        write_bytes.assert_called_once_with(image_data)
-
-    def test_seedream_b64_payload_must_be_valid_image(self):
-        post_response = Mock(status_code=200)
-        post_response.json.return_value = {
-            "data": [{"b64_json": base64.b64encode(b"not an image").decode("ascii")}]
-        }
-
-        with patch("requests.post", return_value=post_response), patch.object(Path, "write_bytes", return_value=None) as write_bytes:
-            with self.assertRaisesRegex(RuntimeError, "Seedream 生图失败") as raised:
-                asyncio.run(
-                    generate_seedream_image(
-                        "雨夜小巷",
-                        Path("unused_seedream_output.jpg"),
-                        ApiKeys(seedream_key="sk-test"),
-                    )
-                )
-
-        message = str(raised.exception)
-        self.assertIn("Seedream b64_json", message)
-        self.assertIn("不是有效图片", message)
-        write_bytes.assert_not_called()
+    def test_html_js_contract_has_script_id_and_no_seedream(self):
+        html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        js = (ROOT / "static" / "script.js").read_text(encoding="utf-8")
+        self.assertIn('id="script"', html)
+        self.assertIn('id="src-pinterest"', html)
+        self.assertIn("checked", html.split('id="src-pinterest"', 1)[1][:80])
+        self.assertNotIn("src-ai", html)
+        self.assertNotIn("seedream", html.lower())
+        self.assertIn("getElementById('script')", js)
+        self.assertNotIn("src-ai", js)
+        self.assertIn("src-pinterest", js)
+        self.assertIn('id="src-piapi"', html)
+        self.assertIn("PiAPI is paid", html)
+        self.assertIn("window.confirm", js)
+        self.assertIn("piapi_confirmed: piapiConfirmed", js)
+        self.assertNotIn("volces.com", js)
 
 
 class LlmEndpointValidationTests(unittest.TestCase):
@@ -323,7 +237,7 @@ class LlmEndpointValidationTests(unittest.TestCase):
             ))
 
         self.assertEqual(status, 400)
-        self.assertIn("AI 文本密钥", data["detail"])
+        self.assertIn("requires an AI text API key", data["detail"])
         processor.assert_not_called()
 
     def test_api_generate_script_rejects_missing_llm_key_before_processor(self):
@@ -338,7 +252,7 @@ class LlmEndpointValidationTests(unittest.TestCase):
             ))
 
         self.assertEqual(status, 400)
-        self.assertIn("AI 文本密钥", data["detail"])
+        self.assertIn("requires an AI text API key", data["detail"])
         processor.assert_not_called()
 
     def test_api_scrape_url_rejects_missing_llm_key_before_scraping(self):
@@ -352,62 +266,88 @@ class LlmEndpointValidationTests(unittest.TestCase):
             ))
 
         self.assertEqual(status, 400)
-        self.assertIn("AI 文本密钥", data["detail"])
+        self.assertIn("requires an AI text API key", data["detail"])
         web_scraper.assert_not_called()
         processor.assert_not_called()
+
+    def test_llm_presets_exclude_volcengine(self):
+        ids = {item["id"] for item in LLM_PROVIDER_PRESETS}
+        self.assertTrue({"openrouter", "openai", "deepseek", "groq", "ollama", "oneapi"} <= ids)
+        self.assertNotIn("volcengine", ids)
+        status, data = asyncio.run(get_json("/api/llm/presets"))
+        self.assertEqual(status, 200)
+        self.assertEqual(len(data["presets"]), len(LLM_PROVIDER_PRESETS))
+        openai = next(item for item in data["presets"] if item["id"] == "openai")
+        self.assertIn("gpt-4o-mini", openai["models"])
+
+    def test_llm_test_requires_key_for_openai(self):
+        status, data = asyncio.run(post_json("/api/llm/test", {"provider": "openai", "api_key": "", "model": "gpt-4o-mini"}))
+        self.assertEqual(status, 400)
+        self.assertIn("API key", data["detail"])
+
+    def test_llm_test_success_uses_selected_model(self):
+        class FakeResponse:
+            status_code = 200
+            def json(self):
+                return {"choices": [{"message": {"content": "ok"}}]}
+
+        with patch("requests.post", return_value=FakeResponse()):
+            status, data = asyncio.run(post_json("/api/llm/test", {
+                "provider": "openai",
+                "api_key": "sk-test",
+                "model": "gpt-4o-mini",
+            }))
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["model"], "gpt-4o-mini")
 
 
 class ScrapeRequestValidationTests(unittest.TestCase):
     def test_request_options_are_normalized_before_validation(self):
         request = ScrapeRequest(
-            source=" AI ",
+            source=" PEXELS ",
             media_type=" PHOTO ",
             mode=" SCRIPT ",
             script="凌晨两点，我听见门外有人低声喊我的名字。",
-            api_keys=ApiKeys(llm_key="sk-test", seedream_key="sk-test"),
+            auto_video=False,
+            api_keys=ApiKeys(llm_key="sk-test"),
         )
 
         validate_scrape_request_options(request)
         validate_request_api_dependencies(request)
 
-        self.assertEqual(request.source, "ai")
+        self.assertEqual(request.source, "pexels")
         self.assertEqual(request.media_type, "photo")
         self.assertEqual(request.mode, "script")
 
     def test_invalid_source_is_rejected_before_background_work(self):
         request = ScrapeRequest(source="unknown", query="雨夜小巷")
 
-        with self.assertRaisesRegex(RuntimeError, "素材来源无效"):
+        with self.assertRaisesRegex(RuntimeError, "Invalid media source"):
             validate_scrape_request_options(request)
 
     def test_invalid_media_type_is_rejected(self):
         request = ScrapeRequest(media_type="gif", query="雨夜小巷")
 
-        with self.assertRaisesRegex(RuntimeError, "素材类型无效"):
-            validate_scrape_request_options(request)
-
-    def test_ai_source_rejects_video_media_type(self):
-        request = ScrapeRequest(source="ai", media_type="video", query="雨夜小巷")
-
-        with self.assertRaisesRegex(RuntimeError, "只支持图片素材"):
+        with self.assertRaisesRegex(RuntimeError, "Invalid media type"):
             validate_scrape_request_options(request)
 
     def test_single_mode_requires_query(self):
         request = ScrapeRequest(source="pexels", query="  ")
 
-        with self.assertRaisesRegex(RuntimeError, "需要先输入主题 query"):
+        with self.assertRaisesRegex(RuntimeError, "Single search requires a topic query"):
             validate_scrape_request_options(request)
 
     def test_count_must_stay_inside_ui_range(self):
         request = ScrapeRequest(source="pexels", query="雨夜小巷", count=16)
 
-        with self.assertRaisesRegex(RuntimeError, "1 到 15"):
+        with self.assertRaisesRegex(RuntimeError, "1 and 15"):
             validate_scrape_request_options(request)
 
     def test_single_stock_search_rejects_auto_video(self):
         request = ScrapeRequest(source="pexels", query="雨夜小巷", auto_video=True)
 
-        with self.assertRaisesRegex(RuntimeError, "单条素材搜索不会自动合成视频"):
+        with self.assertRaisesRegex(RuntimeError, "Single stock search does not assemble a video"):
             validate_scrape_request_options(request)
 
     def test_auto_video_rejects_disabled_voice(self):
@@ -418,7 +358,7 @@ class ScrapeRequestValidationTests(unittest.TestCase):
             video_settings=VideoSettings(voice=" NONE "),
         )
 
-        with self.assertRaisesRegex(RuntimeError, "自动合成视频需要选择一个 AI 配音"):
+        with self.assertRaisesRegex(RuntimeError, "Auto video requires a TTS voice"):
             validate_scrape_request_options(request)
 
     def test_asset_only_mode_allows_disabled_voice(self):
@@ -430,6 +370,19 @@ class ScrapeRequestValidationTests(unittest.TestCase):
         )
 
         validate_scrape_request_options(request)
+
+    def test_youtube_upload_requires_confirmation(self):
+        request = ScrapeRequest(
+            source="pexels",
+            mode="script",
+            script="Hello there.",
+            auto_video=True,
+            yt_upload=True,
+            publish_confirmed=False,
+            api_keys=ApiKeys(llm_key="sk-test"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "explicit confirmation"):
+            validate_scrape_request_options(request)
 
     def test_start_scrape_rejects_invalid_request_before_queuing_task(self):
         request = ScrapeRequest(source="pexels", query="  ")
@@ -445,11 +398,11 @@ class ScrapeRequestValidationTests(unittest.TestCase):
             asyncio.run(start_scrape(request, background_tasks))
 
         self.assertEqual(raised.exception.status_code, 400)
-        self.assertIn("需要先输入主题 query", raised.exception.detail)
+        self.assertIn("Single search requires a topic query", raised.exception.detail)
         self.assertEqual(background_tasks.tasks, [])
         self.assertEqual(scraping_status["status"], "error")
         self.assertEqual(scraping_status["error"], raised.exception.detail)
-        self.assertIn("需要先输入主题 query", scraping_status["message"])
+        self.assertIn("Single search requires a topic query", scraping_status["message"])
         self.assertEqual(scraping_status["progress"], 100)
         self.assertIsNone(scraping_status["final_video"])
         self.assertEqual(scraping_status["results"], [])
@@ -463,7 +416,7 @@ class ScrapeRequestValidationTests(unittest.TestCase):
             asyncio.run(start_scrape(request, background_tasks))
 
         self.assertEqual(raised.exception.status_code, 400)
-        self.assertIn("至少一段旁白脚本", raised.exception.detail)
+        self.assertIn("at least one narration script", raised.exception.detail)
         self.assertEqual(background_tasks.tasks, [])
 
     def test_script_mode_ignores_blank_batch_entries(self):
@@ -491,7 +444,7 @@ class ScrapeRequestValidationTests(unittest.TestCase):
             api_keys=ApiKeys(llm_key=" "),
         )
 
-        with self.assertRaisesRegex(RuntimeError, "AI 文本密钥"):
+        with self.assertRaisesRegex(RuntimeError, "AI text API key"):
             validate_script_keyword_key(request)
 
     def test_stock_script_mode_api_dependency_rejects_missing_llm_key(self):
@@ -503,16 +456,16 @@ class ScrapeRequestValidationTests(unittest.TestCase):
             api_keys=ApiKeys(llm_key=""),
         )
 
-        with self.assertRaisesRegex(RuntimeError, "搜索关键词"):
+        with self.assertRaisesRegex(RuntimeError, "search keywords"):
             validate_request_api_dependencies(request)
 
-    def test_stock_script_mode_accepts_llm_key_without_seedream_key(self):
+    def test_stock_script_mode_accepts_llm_key_without_coverr_key(self):
         request = ScrapeRequest(
             source="pexels",
             mode="script",
             script="凌晨两点，我听见门外有人低声喊我的名字。",
             auto_video=False,
-            api_keys=ApiKeys(llm_key="sk-test", seedream_key=""),
+            api_keys=ApiKeys(llm_key="sk-test", coverr_key=""),
         )
 
         validate_request_api_dependencies(request)
@@ -526,26 +479,20 @@ class ScrapeRequestValidationTests(unittest.TestCase):
             asyncio.run(start_scrape(request, background_tasks))
 
         self.assertEqual(raised.exception.status_code, 400)
-        self.assertIn("单条素材搜索不会自动合成视频", raised.exception.detail)
+        self.assertIn("Single stock search does not assemble a video", raised.exception.detail)
         self.assertEqual(background_tasks.tasks, [])
 
-    def test_start_scrape_rejects_missing_seedream_keys_before_queuing_task(self):
-        request = ScrapeRequest(
-            source="ai",
-            mode="single",
-            query="雨夜小巷里的悬疑故事",
-            api_keys=ApiKeys(llm_key="", seedream_key=""),
-        )
+    def test_start_scrape_returns_task_id(self):
+        request = ScrapeRequest(source="pexels", query="rain alley", auto_video=False)
         background_tasks = BackgroundTasks()
         scraping_status["is_running"] = False
 
-        with self.assertRaises(HTTPException) as raised:
-            asyncio.run(start_scrape(request, background_tasks))
+        result = asyncio.run(start_scrape(request, background_tasks))
 
-        self.assertEqual(raised.exception.status_code, 400)
-        self.assertIn("llm_key", raised.exception.detail)
-        self.assertIn("seedream_key", raised.exception.detail)
-        self.assertEqual(background_tasks.tasks, [])
+        self.assertIn("task_id", result)
+        self.assertTrue(result["task_id"])
+        self.assertEqual(scraping_status["task_id"], result["task_id"])
+        self.assertEqual(len(background_tasks.tasks), 1)
 
     def test_start_scrape_rejects_stock_script_without_llm_key_before_queuing_task(self):
         request = ScrapeRequest(
@@ -562,15 +509,17 @@ class ScrapeRequestValidationTests(unittest.TestCase):
             asyncio.run(start_scrape(request, background_tasks))
 
         self.assertEqual(raised.exception.status_code, 400)
-        self.assertIn("AI 文本密钥", raised.exception.detail)
+        self.assertIn("AI text API key", raised.exception.detail)
         self.assertEqual(background_tasks.tasks, [])
 
     def test_start_scrape_rejects_missing_music_before_queuing_task(self):
         request = ScrapeRequest(
             source="pexels",
-            query="雨夜小巷",
+            mode="script",
+            script="Hello there.",
             auto_video=True,
             video_settings=VideoSettings(music="missing.mp3"),
+            api_keys=ApiKeys(llm_key="sk-test"),
         )
         background_tasks = BackgroundTasks()
         scraping_status["is_running"] = False
@@ -579,46 +528,8 @@ class ScrapeRequestValidationTests(unittest.TestCase):
             asyncio.run(start_scrape(request, background_tasks))
 
         self.assertEqual(raised.exception.status_code, 400)
-        self.assertIn("背景音乐文件不存在或为空", raised.exception.detail)
+        self.assertIn("Background music file is missing or empty", raised.exception.detail)
         self.assertEqual(background_tasks.tasks, [])
-
-    def test_api_scrape_rejects_missing_seedream_keys_with_detail(self):
-        scraping_status["is_running"] = False
-
-        status, data = asyncio.run(post_json(
-            "/api/scrape",
-            {
-                "source": "ai",
-                "mode": "single",
-                "query": "雨夜小巷里的悬疑故事",
-                "api_keys": {"llm_key": "", "seedream_key": ""},
-            },
-        ))
-
-        self.assertEqual(status, 400)
-        detail = data["detail"]
-        self.assertIn("llm_key", detail)
-        self.assertIn("seedream_key", detail)
-        self.assertIn("不启用 Pollinations 兜底", detail)
-        self.assertFalse(scraping_status["is_running"])
-
-    def test_api_scrape_rejects_ai_video_media_type_with_detail(self):
-        scraping_status["is_running"] = False
-
-        status, data = asyncio.run(post_json(
-            "/api/scrape",
-            {
-                "source": "ai",
-                "media_type": "video",
-                "mode": "single",
-                "query": "雨夜小巷里的悬疑故事",
-                "api_keys": {"llm_key": "sk-test", "seedream_key": "sk-test"},
-            },
-        ))
-
-        self.assertEqual(status, 400)
-        self.assertIn("只支持图片素材", data["detail"])
-        self.assertFalse(scraping_status["is_running"])
 
     def test_api_scrape_rejects_disabled_voice_auto_video_with_detail(self):
         scraping_status["is_running"] = False
@@ -626,17 +537,17 @@ class ScrapeRequestValidationTests(unittest.TestCase):
         status, data = asyncio.run(post_json(
             "/api/scrape",
             {
-                "source": "ai",
+                "source": "pexels",
                 "mode": "script",
                 "script": "凌晨两点，我听见门外有人低声喊我的名字。",
                 "auto_video": True,
                 "video_settings": {"voice": "none"},
-                "api_keys": {"llm_key": "sk-test", "seedream_key": "sk-test"},
+                "api_keys": {"llm_key": "sk-test"},
             },
         ))
 
         self.assertEqual(status, 400)
-        self.assertIn("自动合成视频需要选择一个 AI 配音", data["detail"])
+        self.assertIn("Auto video requires a TTS voice", data["detail"])
         self.assertFalse(scraping_status["is_running"])
 
     def test_api_scrape_rejects_stock_script_without_llm_key_with_detail(self):
@@ -654,7 +565,7 @@ class ScrapeRequestValidationTests(unittest.TestCase):
         ))
 
         self.assertEqual(status, 400)
-        self.assertIn("AI 文本密钥", data["detail"])
+        self.assertIn("AI text API key", data["detail"])
         self.assertFalse(scraping_status["is_running"])
 
     def test_single_search_reports_error_when_no_media_is_found(self):
@@ -672,7 +583,7 @@ class ScrapeRequestValidationTests(unittest.TestCase):
                 asyncio.run(run_scrape(request))
 
         self.assertEqual(scraping_status["status"], "error")
-        self.assertIn("没有找到可用素材", scraping_status["error"])
+        self.assertIn("No usable media found", scraping_status["error"])
         self.assertFalse(scraping_status["is_running"])
 
     def test_asset_only_script_reports_error_when_a_scene_has_no_media(self):
@@ -702,9 +613,8 @@ class ScrapeRequestValidationTests(unittest.TestCase):
                 asyncio.run(run_scrape(request))
 
         self.assertEqual(scraping_status["status"], "error")
-        self.assertIn("分镜素材不完整", scraping_status["error"])
+        self.assertIn("Scene media is incomplete", scraping_status["error"])
         self.assertIn("scene_002", scraping_status["error"])
-        self.assertIn("pexels 未找到可用图片素材", scraping_status["error"])
         self.assertFalse(scraping_status["is_running"])
 
     def test_script_batch_search_exception_keeps_scene_context(self):
@@ -723,7 +633,7 @@ class ScrapeRequestValidationTests(unittest.TestCase):
 
         async def fake_universal_search(keyword, **kwargs):
             if keyword == "scene_002":
-                raise RuntimeError("Seedream HTTP 500: quota exhausted")
+                raise RuntimeError("Coverr HTTP 500: quota exhausted")
             return [Path("README.md")]
 
         scraping_status["is_running"] = False
@@ -736,9 +646,9 @@ class ScrapeRequestValidationTests(unittest.TestCase):
                 asyncio.run(run_scrape(request))
 
         self.assertEqual(scraping_status["status"], "error")
-        self.assertIn("分镜素材不完整", scraping_status["error"])
+        self.assertIn("Scene media is incomplete", scraping_status["error"])
         self.assertIn("scene_002", scraping_status["error"])
-        self.assertIn("Seedream HTTP 500: quota exhausted", scraping_status["error"])
+        self.assertIn("Coverr HTTP 500: quota exhausted", scraping_status["error"])
         self.assertFalse(scraping_status["is_running"])
 
     def test_asset_only_single_search_does_not_load_video_engine(self):
@@ -759,6 +669,185 @@ class ScrapeRequestValidationTests(unittest.TestCase):
         self.assertEqual(scraping_status["status"], "success")
         self.assertIsNone(scraping_status["error"])
         self.assertFalse(scraping_status["is_running"])
+
+
+class PathSafetyAndMediaTests(unittest.TestCase):
+    def test_path_traversal_is_rejected(self):
+        with self.assertRaises(ValueError):
+            resolve_path_within_directory(str(UPLOAD_DIR), "../app.py")
+
+    def test_sanitize_upload_filename_strips_directories(self):
+        self.assertEqual(sanitize_upload_filename("..\\secret.exe"), "secret.exe")
+        self.assertIn(Path("photo.PNG").suffix.lower(), ALLOWED_UPLOAD_SUFFIXES)
+
+    def test_local_source_requires_files(self):
+        request = ScrapeRequest(source="local", mode="single", auto_video=False, local_files=[])
+        with self.assertRaisesRegex(RuntimeError, "Local source requires at least one uploaded media file"):
+            validate_scrape_request_options(request)
+
+    def test_coverr_search_is_mocked_http(self):
+        payload = {"hits": [{"id": "c1", "duration": 6, "width": 1080, "height": 1920, "urls": {"mp4": "https://example.test/c.mp4"}}]}
+        response = Mock()
+        response.json.return_value = payload
+        with tempfile.TemporaryDirectory() as tmp:
+            scraper = CoverrScraper(output_dir=tmp, api_key="ck-test")
+            with patch("requests.get", return_value=response), \
+                 patch.object(scraper, "download_file", return_value=True) as download:
+                files = asyncio.run(scraper.search_videos("rain", num_videos=1, aspect="9:16"))
+            download.assert_called()
+            self.assertIsInstance(files, list)
+
+    def test_piapi_requires_api_key(self):
+        request = ScrapeRequest(source="piapi", mode="single", query="gym squat", auto_video=False)
+        with self.assertRaisesRegex(RuntimeError, "PiAPI source requires an API key"):
+            validate_request_api_dependencies(request)
+
+    def test_piapi_requires_explicit_paid_confirmation(self):
+        request = ScrapeRequest(
+            source="piapi", mode="single", query="gym squat", auto_video=False,
+            api_keys=ApiKeys(piapi_key="pi_test"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "paid.*explicit confirmation"):
+            validate_request_api_dependencies(request)
+
+        request.piapi_confirmed = True
+        validate_request_api_dependencies(request)
+
+    def test_piapi_search_is_mocked_http(self):
+        created = Mock()
+        created.status_code = 200
+        created.json.return_value = {
+            "code": 200,
+            "data": {"task_id": "t1", "status": "pending"},
+        }
+        done = Mock()
+        done.status_code = 200
+        done.json.return_value = {
+            "code": 200,
+            "data": {
+                "task_id": "t1",
+                "status": "Completed",
+                "output": {"video_url": "https://example.test/gen.mp4"},
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            scraper = PiAPIScraper(output_dir=tmp, api_key="pi_test", model="kling-2.5")
+            with patch("requests.post", return_value=created), \
+                 patch("requests.get", return_value=done), \
+                 patch("time.sleep"):
+                def fake_download(url, dest):
+                    Path(dest).parent.mkdir(parents=True, exist_ok=True)
+                    Path(dest).write_bytes(b"x" * 50000)
+                    return True
+                with patch.object(scraper, "download_file", side_effect=fake_download):
+                    files = asyncio.run(scraper.search_videos("gym squat", num_videos=1, aspect="9:16"))
+            self.assertEqual(len(files), 1)
+            self.assertTrue(files[0].endswith(".mp4"))
+
+    def test_piapi_kling_spec_and_retry(self):
+        scraper = PiAPIScraper(output_dir=".", api_key="pi_test", model="kling-2.1-pro")
+        self.assertEqual(scraper._kling_spec(), ("2.1", "pro"))
+        hailuo = PiAPIScraper(output_dir=".", api_key="pi_test", model="hailuo-2.3-fast")
+        body = hailuo._task_body("gym squat", "9:16", "video")
+        self.assertEqual(body["model"], "hailuo")
+        self.assertEqual(body["input"]["model"], "v2.3-fast")
+        self.assertEqual(body["input"]["duration"], 6)
+        self.assertEqual(body["input"]["resolution"], 768)
+        self.assertTrue(body["input"]["expand_prompt"])
+        self.assertEqual(body["config"], {"service_mode": "public"})
+        self.assertEqual(hailuo._output_urls({"video": "https://example.test/h.mp4"}), ["https://example.test/h.mp4"])
+        limited = Mock()
+        limited.status_code = 429
+        limited.headers = {"Retry-After": "1"}
+        limited.json.return_value = {"message": "throttled"}
+        ok = Mock()
+        ok.status_code = 200
+        ok.json.return_value = {"code": 200, "data": {"task_id": "t1", "status": "pending"}}
+        with patch("requests.post", side_effect=[limited, ok]), patch("time.sleep"):
+            data = scraper._create_task({"model": "kling", "task_type": "video_generation", "input": {}})
+        self.assertEqual(data["task_id"], "t1")
+
+    def test_piapi_failed_task_preserves_upstream_diagnostics(self):
+        scraper = PiAPIScraper(output_dir=".", api_key="pi_test", model="hailuo-2.3-fast")
+        failed = {
+            "task_id": "t-failed",
+            "status": "failed",
+            "error": {"message": "invalid request", "raw_message": "unsupported resolution"},
+            "detail": "upstream rejected input",
+        }
+        with self.assertRaisesRegex(RuntimeError, "unsupported resolution"):
+            scraper._wait(failed)
+
+    def test_generated_script_removes_model_chatter(self):
+        content = "I can’t create videos, but I can help you craft a script for one!\nHere’s a high-retention spoken video script:\nNeon rain covers the city."
+        self.assertEqual(
+            LLMProcessor._clean_script_output(content),
+            "Neon rain covers the city.",
+        )
+
+    def test_piapi_402_is_fatal(self):
+        self.assertTrue(is_fatal_scene_media_error("PiAPI HTTP 402: no credit."))
+        self.assertTrue(is_fatal_scene_media_error("PiAPI HTTP 401: API key rejected."))
+        self.assertFalse(is_fatal_scene_media_error("PiAPI HTTP 429: throttled"))
+        self.assertEqual(PiAPIScraper._clean_key('  Bearer abc  '), "abc")
+        request = ScrapeRequest(
+            source="piapi", mode="single", query="gym squat", auto_video=False,
+            api_keys=ApiKeys(piapi_key="r8_old_replicate"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "Replicate token"):
+            validate_request_api_dependencies(request)
+
+    def test_aspect_and_hd_helpers(self):
+        self.assertTrue(matches_video_aspect(1080, 1920, "9:16"))
+        self.assertFalse(matches_video_aspect(1920, 1080, "9:16"))
+        self.assertTrue(is_hd_resolution(1920, 1080))
+        self.assertFalse(is_hd_resolution(640, 360))
+
+    def test_clip_duration_and_bgm_volume_bounds(self):
+        settings = VideoSettings(clip_duration=8, bgm_volume=0.4, video_count=2, transition="fade")
+        self.assertEqual(settings.clip_duration, 8)
+        self.assertEqual(settings.bgm_volume, 0.4)
+        self.assertEqual(settings.video_count, 2)
+        with self.assertRaises(Exception):
+            VideoSettings(clip_duration=99)
+
+    def test_tts_preview_rejects_blank_text(self):
+        status, data = asyncio.run(post_json("/api/tts/preview", {"text": "  "}))
+        self.assertEqual(status, 400)
+        self.assertIn("Enter preview text", data["detail"])
+
+    def test_music_list_includes_none(self):
+        status, data = asyncio.run(get_json("/api/music"))
+        self.assertEqual(status, 200)
+        self.assertIn("none", data["files"])
+
+
+class CliTests(unittest.TestCase):
+    def test_cli_usage_error_is_exit_2(self):
+        from cli import main
+        self.assertEqual(main(["--mode", "single", "--source", "pexels", "--no-auto-video"]), 2)
+
+    def test_cli_help_exits_zero(self):
+        from cli import main
+        with self.assertRaises(SystemExit) as raised:
+            main(["--help"])
+        self.assertEqual(raised.exception.code, 0)
+
+    def test_cli_piapi_requires_and_forwards_explicit_confirmation(self):
+        from cli import build_request, parse_args
+        args = parse_args([
+            "--source", "piapi",
+            "--media-type", "video",
+            "--script", "A runner crosses a neon city.",
+            "--llm-key", "sk-test",
+            "--piapi-key", "pi-test",
+            "--piapi-model", "hailuo-2.3",
+            "--piapi-confirmed",
+        ])
+        request = build_request(args)
+        self.assertTrue(request.piapi_confirmed)
+        self.assertEqual(request.api_keys.piapi_key, "pi-test")
+        self.assertEqual(request.api_keys.piapi_model, "hailuo-2.3")
 
 
 if __name__ == "__main__":

@@ -66,14 +66,14 @@
 ### ✨ Full Feature List
 
 - 🤖 **AI-Powered Script Analysis** — AI reads each sentence of your script and automatically generates the perfect visual search keyword for it
-- 📹 **Auto Media Scraping** — Automatically downloads matching HD videos and photos from **Pinterest** (world's first!), **Pexels** & **Pixabay**
+- 📹 **Auto Media Scraping** — Downloads matching HD videos and photos from **Pinterest** (default), **Pexels**, **Pixabay**, **Coverr**, and local uploads
 - 🎙️ **Free AI Voiceover** — Uses **Edge TTS** (Microsoft's neural text-to-speech) — completely free, no API costs, multiple premium male/female voices available
 - 📝 **Auto Subtitles** — Renders beautiful word-by-word subtitles directly onto the video using PIL rendering
 - 🎬 **Auto Video Assembly** — Combines all media, voiceover & subtitles into a polished final video — automatically, with one click
 - 📐 **Smart Aspect Ratio Cropping** — Supports **9:16** (TikTok/Reels/Shorts), **16:9** (YouTube), **1:1** (Instagram Feed)
 - ⚡ **Parallel Processing** — Downloads and searches multiple items simultaneously for 3x faster results
 - 🛡️ **Stock Media Fallback** — For Pexels, Pixabay, and Pinterest searches, VUZA tries other sources, simplifies keywords, and can ask AI for a simpler stock-media keyword.
-- 🧠 **Custom AI Brain** — Bring your own API key, URL & model name. Works with **OpenRouter** (has free models!), **OpenAI**, **DeepSeek**, or any OpenAI-compatible API
+- 🧠 **Custom AI Brain** — OpenAI-compatible gateways: OpenRouter, OpenAI, DeepSeek, Groq, Ollama, OneAPI. Volcengine Ark / Seedream is not supported.
 - 🎨 **5 AI Vibe Modes** — Aesthetic, LoFi Art, General, Futuristic, and Black & White.
 - 🪄 **AI YouTube Analyzer** — Expert script analysis to generate viral titles, descriptions, and trending hashtags.
 - 📦 **Batch Video Generation** — Create multiple videos at once by adding multiple scripts.
@@ -83,7 +83,7 @@
 - 🎬 **Video Filters** — Apply cinematic filters (Grayscale, Sepia, Invert) and Vibe-based color grading (Futuristic, B&W).
 - 🖼️ **Auto-Thumbnail Creator & AI Prompt** — Extracts video frames and generates detailed AI Image Prompts for high-CTR thumbnails.
 - 🔍 **Ken Burns Effect** — Automatic slow zoom-in for image-based clips for more dynamic visuals.
-- 📤 **YouTube Direct Upload** — Post your videos directly to YouTube from VUZA (OAuth2 supported).
+- 📤 **YouTube Direct Upload** — Opt-in only (off by default). Requires an explicit confirmation checkbox. Never auto-publishes.
 - 🌍 **Multi-language Support** — Voiceover and subtitles in 10+ languages including Spanish, French, Hindi, Urdu, Chinese, and Japanese.
 - 💻 **Runs on Low-Spec PCs** — No GPU required! Works on any computer with even minimal internet speed
 - 🔑 **Privacy-First API Key Storage** — All your API keys are saved only in your browser's localStorage. They are never sent to any server except the API endpoints you configure.
@@ -106,22 +106,22 @@
 ## 🖥️ How It Works
 
 ```
-📝 Default one-click flow: paste a Chinese suspense topic or narration script
+📝 Paste a topic or narration script (Chinese suspense templates still available)
     ↓
-🤖 AI splits the story into scenes and writes Seedream 4.5 image prompts
+🤖 AI splits the story into scenes and stock-search keywords
     ↓
-🎨 Seedream 4.5 generates one cinematic vertical image per scene
+📌 Default source Pinterest (or Pexels / Pixabay / Coverr / local files)
     ↓
-🎙️ VUZA generates free voiceover for each sentence (Edge TTS — $0 cost)
+🎙️ Voiceover via Edge TTS or ElevenLabs
     ↓
-📝 Renders high-retention subtitles onto the video
+📝 High-retention captions
     ↓
-🎬 Assembles the final 9:16 video with transitions, filters, and optional music
+🎬 Assembles 9:16 / 16:9 / 1:1 with optional BGM, transitions, and filters
     ↓
-✅ Done! Your video is ready to download and post.
+✅ Download locally. Publishing is never automatic.
 ```
 
-Optional stock-media flow: switch the source to Pinterest, Pexels, or Pixabay and VUZA will search/download HD media instead of generating Seedream images. Stock searches use the fallback ladder below when keywords are hard to match.
+There is no AI-image / Seedream / Pollinations mode. If image generation returns later, it will be a new explicit provider — not a restored `source=ai` radio.
 
 ---
 
@@ -183,14 +183,17 @@ python app.py
 
 ### API Keys Setup
 
-VUZA can use free stock-media APIs, plus your own OpenAI-compatible LLM and Seedream 4.5 credentials for AI image generation. Getting the API keys only takes a few minutes:
+VUZA can use free stock-media APIs plus an OpenAI-compatible LLM. Default media source is **Pinterest** (no API key). Getting optional keys only takes a few minutes:
 
 | Service | Get Free Key | What It Does |
 |---------|-------------|-------------|
 | **OpenRouter** | [openrouter.ai/keys](https://openrouter.ai/keys) | AI keyword extraction — has many completely free models! |
-| **Volcengine Ark / Seedream 4.5** | [console.volcengine.com/ark](https://console.volcengine.com/ark) | Required for AI image mode and one-click Seedream video generation |
 | **Pexels** | [pexels.com/api](https://www.pexels.com/api/new/) | Free stock videos & photos API |
 | **Pixabay** | [pixabay.com/api](https://pixabay.com/api/docs/) | Free stock videos & photos API |
+| **Coverr** | [coverr.co](https://coverr.co/) | Extra stock video source |
+| **PiAPI Hailuo** | [app.piapi.ai](https://app.piapi.ai/) | Paid AI video clips; VUZA asks for confirmation before every run |
+
+Volcengine Ark / Seedream / Pollinations are not supported.
 
 After getting your keys:
 1. Open VUZA in your browser
@@ -224,7 +227,7 @@ The T4 GPU makes video rendering **much faster** than most laptops. Plus you get
 
 ## 🛡️ Stock Media Fallback System
 
-VUZA's stock-media fallback system helps Pexels, Pixabay, and Pinterest searches recover from difficult or abstract keywords. AI image mode is separate: it requires a configured Seedream 4.5 API key by default.
+VUZA's stock-media fallback system helps Pexels, Pixabay, Coverr, and Pinterest searches recover from difficult or abstract keywords.
 
 ```
 Step 1 → Try PRIMARY source with original AI-generated keyword
@@ -236,7 +239,7 @@ Step 5 → If STILL nothing → Ask AI: "Give me ONE ultra-simple keyword
 Step 6 → Try that AI-suggested keyword on Pexels + Pixabay
 ```
 
-**Result:** Stock-media mode gets multiple recovery attempts before giving up. Seedream AI image mode requires both the LLM key and Seedream key up front. The legacy AI-image fallback is only available after stock-media searches fail, an LLM is available, and `ALLOW_POLLINATIONS_FALLBACK=1` is explicitly set; it still prefers Seedream when a Seedream key is provided, otherwise it falls back to Pollinations.
+**Result:** Stock-media mode gets multiple recovery attempts before giving up. There is no AI-image fallback.
 
 ---
 
@@ -300,12 +303,13 @@ python app.py
 - [x] ✅ AI YouTube Analyzer (Viral titles, descriptions, hashtags)
 - [x] ✅ **URL to Video** — Scrape any blog post or news article and turn it into a video automatically.
 - [x] ✅ **"Hormozi-Style" Dynamic Captions** — High-energy, colorful, word-by-word subtitles with auto-emoji insertion.
-- [x] ✅ **Seedream 4.5 AI Image Generation** — AI image mode generates cinematic visuals with configured LLM and Seedream keys; stock-media failures can use the legacy AI-image fallback only when an LLM is available and `ALLOW_POLLINATIONS_FALLBACK=1`, preferring Seedream when keyed and Pollinations otherwise.
+- [x] ✅ **Coverr + local uploads** — Extra stock video source and path-safe local files. No Seedream / Pollinations / `source=ai`.
+- [x] ✅ **CLI** — `python cli.py` uses the same pipeline as `/api/scrape`. Exit 0/1/2. See `docs/skill/SKILL.md`.
 - [x] ✅ **Auto-Thumbnail Creator** — Generates a high-CTR YouTube thumbnail using frames from your video and viral titles.
 - [x] ✅ **Watermarking & Branding** — Add your own logo or watermark to all your videos automatically.
 - [x] ✅ **Custom Voice IDs** — Support for voice cloning and specific custom voices from ElevenLabs.
 - [ ] 🔜 AI Image Generation (Free API)
-- [ ] 🔜 AI Video Generation (Free API)
+- [x] ✅ **AI Video Generation** — PiAPI Hailuo v2.3/v2.3-fast, with explicit paid-run confirmation
 - [ ] 🔜 Direct upload to TikTok, Instagram
 
 ---
@@ -328,7 +332,7 @@ python app.py
 ## 🔮 Coming Soon
 
 - 🖼️ **AI Image Generation** — Generate custom images with free AI APIs (no stock needed!)
-- 🎥 **AI Video Generation** — Generate video clips with free AI models
+- 🎥 **More AI video providers** — Add alternatives alongside the existing paid PiAPI Hailuo integration
 - 📤 **Direct Upload to TikTok & Instagram** — Expand your reach beyond YouTube.
 - ☁️ **Cloud Storage Integration** — Auto-save your videos to Google Drive or Dropbox.
 
@@ -394,6 +398,24 @@ MIT License — Use it, modify it, share it, sell it. Just give credit.
 **Keywords:** VUZA, free ai video creator, open source faceless video generator, money printer tool, free video maker, pictory ai alternative, invideo ai alternative, moneyprinter turbo alternative, pinterest video scraper, free pinterest scraper, pinterest video downloader, ai video automation, auto video creator, edge tts video, free voiceover tool, pexels video downloader, pixabay scraper, ai content creation tool, tiktok video maker, youtube shorts creator, instagram reels generator, faceless youtube channel, ai money printer, free video generation, open source video tool, python video creator, script to video ai, auto faceless video, ai short video generator, free ai voiceover, auto subtitle generator, video utility zero cost automation, free alternative pictory, free alternative invideo
 
 </div>
+
+## CLI
+
+Same pipeline as `POST /api/scrape`. Publishing is never automatic.
+
+```powershell
+cd VUZA-Free-AI-Video-Creator-and-Pinterest-Video-Scraper
+python cli.py --mode script --source pinterest --script "Your narration." --llm-key "sk-..."
+python cli.py --mode single --source pexels --query "rain alley" --no-auto-video --pexels-key "..."
+```
+
+Exit codes: `0` success, `1` runtime failure, `2` usage/validation error.
+
+Local agent skill (ask first, never auto-publish): `docs/skill/SKILL.md`.
+
+Tests (no live network): `python -m pytest -q`
+
+Live stock smoke only when `VUZA_LIVE_SMOKE=1`.
 
 ## 📺 YouTube API Setup Tutorial
 

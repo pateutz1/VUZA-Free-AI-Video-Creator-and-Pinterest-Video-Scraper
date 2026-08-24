@@ -1,6 +1,5 @@
 import asyncio
 import os
-import random
 import re
 import sys
 from pathlib import Path
@@ -106,6 +105,40 @@ def apply_glitch(clip, duration):
     """Simulates a glitch effect by random shifting."""
     return clip
 
+def crop_center(clip, w, h):
+    cw, ch = clip.size
+    if cw / ch > w / h:
+        new_w = int(ch * w / h)
+        clip = clip.cropped(x1=int((cw - new_w) / 2), width=new_w)
+    else:
+        new_h = int(cw * h / w)
+        clip = clip.cropped(y1=int((ch - new_h) / 2), height=new_h)
+    return clip.resized((w, h))
+
+def frame_is_unusable(frame):
+    import numpy as np
+    arr = np.asarray(frame)
+    if arr.size == 0:
+        return True
+    return float(arr.mean()) < 16 or float(arr.std()) < 7
+
+def clip_is_unusable(clip):
+    if clip is None or getattr(clip, "duration", 0) < 1.15:
+        return True
+    try:
+        import numpy as np
+        times = [clip.duration * t for t in (0.25, 0.5, 0.75)]
+        frames = [clip.get_frame(min(t, max(clip.duration - 0.02, 0))) for t in times]
+        if any(frame_is_unusable(f) for f in frames):
+            return True
+        diffs = [
+            float(np.mean(np.abs(frames[i].astype("float32") - frames[0].astype("float32"))))
+            for i in range(1, len(frames))
+        ]
+        return bool(diffs) and max(diffs) < 2.5
+    except Exception:
+        return False
+
 class SubtitleHelper:
     @staticmethod
     def insert_emojis(text):
@@ -119,14 +152,23 @@ class SubtitleHelper:
             "food": "🍕", "health": "🥗", "fitness": "💪", "gym": "🏋️", "sport": "⚽",
             "book": "📚", "idea": "💡", "learn": "🧠", "school": "🏫", "work": "💼",
             "travel": "✈️", "plane": "🛫", "car": "🚗", "city": "🏙️", "home": "🏠",
-            "time": "⏰", "fast": "⚡", "slow": "🐌", "stop": "🛑", "go": "🚦"
+            "time": "⏰", "fast": "⚡", "slow": "🐌", "stop": "🛑", "go": "🚦",
+            "strong": "💪", "stronger": "💪", "strength": "💪", "excuses": "🚫",
+            "unlock": "🔓", "ready": "🔥", "push": "🏋️", "motivation": "🔥",
+            "workout": "🏋️", "lift": "🏋️", "warrior": "⚔️", "power": "⚡",
+            "never": "🚫", "now": "🔥", "yes": "✅",
         }
         words = text.split()
+        inserted = False
         for i, word in enumerate(words):
             clean_word = re.sub(r'[^\w]', '', word.lower())
             if clean_word in emoji_map:
                 words[i] = f"{word} {emoji_map[clean_word]}"
-        return " ".join(words)
+                inserted = True
+        joined = " ".join(words)
+        if not inserted and joined.strip():
+            joined = f"{joined} 🔥"
+        return joined
 
 class VideoEngine:
     def __init__(self, output_dir):
@@ -139,12 +181,11 @@ class VideoEngine:
     def set_eleven_key(self, key):
         self.eleven_key = key
 
-    async def generate_voiceover(self, text, idx, voice="en-US-ChristopherNeural", language="en-US"):
+    async def generate_voiceover(self, text, idx, voice="en-US-ChristopherNeural", language="en-US", voice_rate=1.0, voice_volume=1.0, timeout_seconds=60):
         """Generates TTS audio for a single sentence with retries. Supports Edge-TTS and ElevenLabs."""
         if not text or not text.strip():
             return None
 
-        # Language-based voice fallback if voice is not provided or "default"
         if not voice or voice == "default":
             voice_defaults = {
                 "en-US": "en-US-ChristopherNeural",
@@ -163,17 +204,24 @@ class VideoEngine:
         if voice.startswith("eleven_"):
             return await self._generate_elevenlabs(text, idx, voice.replace("eleven_", ""))
 
+        rate_pct = int(round((float(voice_rate or 1.0) - 1.0) * 100))
+        rate = f"{rate_pct:+d}%"
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                communicate = Communicate(text, voice)
+                communicate = Communicate(text, voice, rate=rate)
                 path = self.temp_dir / f"speech_{idx}.mp3"
-                await communicate.save(str(path))
+                await asyncio.wait_for(communicate.save(str(path)), timeout=timeout_seconds)
+                if float(voice_volume or 1.0) != 1.0 and path.exists():
+                    from moviepy import AudioFileClip
+                    clip = AudioFileClip(str(path)).with_volume_scaled(float(voice_volume))
+                    clip.write_audiofile(str(path), logger=None)
+                    clip.close()
                 return str(path)
             except Exception as e:
                 print(f"⚠️ TTS Attempt {attempt+1} failed: {e}")
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt) # Exponential backoff
+                    await asyncio.sleep(2 ** attempt)
                 else:
                     print(f"❌ TTS Error after {max_retries} attempts: {e}")
                     return None
@@ -249,7 +297,7 @@ class VideoEngine:
             print(f"⚠️ Thumbnail generation failed: {e}")
             return None
 
-    def create_video(self, script_data, project_path, media_type="video", bg_music=None, settings=None):
+    def create_video(self, script_data, project_path, media_type="video", bg_music=None, settings=None, output_name="final_aesthetic_video.mp4"):
         """Assembles the final video from script chunks and downloaded media."""
         print("🎬 Starting Video Assembly...")
 
@@ -278,16 +326,14 @@ class VideoEngine:
 
             # Create Audio Clip
             audio_clip = AudioFileClip(audio_path)
-            duration = audio_clip.duration + 0.5 # Add padding
+            duration = max(float(audio_clip.duration), 0.8)
 
-            # Use the exact scene assets collected by the pipeline; no cross-scene fallback.
-            media_folder = None
             explicit_files = [
                 str(Path(f)) for f in item.get("_files", [])
-                if Path(f).exists() and Path(f).stat().st_size > 0
+                if Path(f).exists() and Path(f).stat().st_size > 40000
             ]
 
-            # 1. Exact try
+            media_folder = None
             if (project_path / keyword).exists():
                 media_folder = project_path / keyword
             else:
@@ -295,82 +341,96 @@ class VideoEngine:
                 if safe_keyword and (project_path / safe_keyword).exists():
                     media_folder = project_path / safe_keyword
 
-            if not media_folder:
-                if explicit_files:
-                    files = explicit_files
-                else:
-                    print(f"❌ No exact media folder found for scene {i + 1}: {keyword}")
-                    return None
-            else:
-                files = sorted([str(f) for f in media_folder.glob("*") if f.suffix.lower() in ['.mp4', '.jpg', '.jpeg', '.png', '.webp']])
-
-            files = [f for f in files if os.path.getsize(f) > 0]
+            folder_files = []
+            if media_folder:
+                folder_files = sorted([
+                    str(f) for f in media_folder.glob("*")
+                    if f.suffix.lower() in ['.mp4', '.jpg', '.jpeg', '.png', '.webp'] and f.stat().st_size > 40000
+                ])
+            files = explicit_files or folder_files
             if not files:
                 print(f"❌ Empty media folder for scene {i + 1}: {keyword}")
                 return None
-
-            # Select Visuals (Smart Logic)
-            # If duration is long (> 5s), use multiple visuals if available
-            visual_clip = None
 
             image_exts = {'.jpg', '.jpeg', '.png', '.webp'}
             video_exts = {'.mp4', '.mov', '.m4v', '.webm'}
             video_files = [f for f in files if Path(f).suffix.lower() in video_exts]
             image_files = [f for f in files if Path(f).suffix.lower() in image_exts]
             preferred_files = video_files if media_type == "video" and video_files else (image_files or files)
-            segment_seconds = 4 if preferred_files == video_files else 3
+            segment_seconds = getattr(settings, "clip_duration", None) or (4 if preferred_files == video_files else 3)
+            segment_seconds = max(2, min(12, float(segment_seconds)))
+
+            ratio = settings.ratio if settings else "9:16"
+            w, h = 1080, 1920
+            if ratio == "16:9":
+                w, h = 1920, 1080
+            elif ratio == "1:1":
+                w, h = 1080, 1080
 
             def build_visual_clip(file_path, clip_duration):
                 suffix = Path(file_path).suffix.lower()
-                if suffix in video_exts:
-                    clip = VideoFileClip(file_path)
-                    if clip.duration < clip_duration:
-                        clip = clip.with_effects([vfx.Loop(duration=clip_duration)])
-                    else:
-                        clip = clip.subclipped(0, clip_duration)
-                    return clip.resized(height=1080)
+                try:
+                    if suffix in video_exts:
+                        clip = VideoFileClip(file_path)
+                        if clip_is_unusable(clip):
+                            print(f"  🚫 Rejected dark/frozen clip: {Path(file_path).name}")
+                            clip.close()
+                            return None
+                        if clip.duration >= clip_duration:
+                            clip = clip.subclipped(0, clip_duration)
+                        elif clip.duration >= 1.5:
+                            clip = clip.with_effects([vfx.Loop(duration=clip_duration)])
+                        else:
+                            clip.close()
+                            return None
+                        return crop_center(clip.resized(height=h), w, h)
 
-                clip = ImageClip(file_path).with_duration(clip_duration).resized(height=1080)
-                return apply_ken_burns(clip, clip_duration)
+                    clip = ImageClip(file_path).with_duration(clip_duration).resized(height=h)
+                    if frame_is_unusable(clip.get_frame(0)):
+                        clip.close()
+                        return None
+                    return crop_center(apply_ken_burns(clip, clip_duration), w, h)
+                except Exception as exc:
+                    print(f"⚠️ Skip clip {file_path}: {exc}")
+                    return None
 
+            num_segments = 1
             if duration > 5 and len(preferred_files) > 1:
-                num_segments = int(duration / segment_seconds) + 1
-                segment_duration = duration / num_segments
-                visual_clip = concatenate_videoclips([
-                    build_visual_clip(preferred_files[k % len(preferred_files)], segment_duration)
-                    for k in range(num_segments)
-                ])
+                num_segments = max(1, int(duration / segment_seconds))
+                if duration / num_segments < 1.6:
+                    num_segments = max(1, int(duration / 1.6))
+            segment_duration = duration / num_segments
+            parts = []
+            used = []
+            for file_path in preferred_files:
+                needed = duration if num_segments == 1 else segment_duration
+                part = build_visual_clip(file_path, needed)
+                if part is None:
+                    continue
+                parts.append(part)
+                used.append(file_path)
+                if len(parts) >= num_segments:
+                    break
+            if not parts:
+                print(f"❌ No usable (non-black) clip for scene {i + 1}: {keyword}")
+                return None
+            if len(parts) == 1 and num_segments > 1:
+                rebuilt = build_visual_clip(used[0], duration)
+                visual_clip = rebuilt or parts[0]
+            elif len(parts) == 1:
+                visual_clip = parts[0]
             else:
-                visual_clip = build_visual_clip(random.choice(preferred_files), duration)
+                visual_clip = concatenate_videoclips(parts, method="chain")
 
-            # Crop/Resize Logic based on Ratio
             try:
-                ratio = settings.ratio if settings else "9:16"
-                w, h = 1080, 1920
-                if ratio == "16:9": w, h = 1920, 1080
-                elif ratio == "1:1": w, h = 1080, 1080
-
-                # Resize keeping aspect ratio then crop
-                def crop_center(clip, w, h):
-                    cw, ch = clip.size
-                    if cw / ch > w / h:
-                        # Too wide, crop width
-                        new_w = int(ch * w / h)
-                        clip = clip.cropped(x1=int((cw - new_w)/2), width=new_w)
-                    else:
-                        # Too tall/narrow, crop height
-                        new_h = int(cw * h / w)
-                        clip = clip.cropped(y1=int((ch - new_h)/2), height=new_h)
-                    return clip.resized((w, h))
-
                 visual_clip = crop_center(visual_clip, w, h)
-
-            except Exception as e: print(f"Resize Error: {e}")
+            except Exception as e:
+                print(f"Resize Error: {e}")
 
             # Apply Vibe-based filters (from VideoSettings or vibe field)
             vibe = getattr(settings, 'vibe', 'general')
             if vibe == "futuristic":
-                visual_clip = visual_clip.multiply_color([0.7, 1.2, 1.4]) # Cyan/Blue tint
+                visual_clip = visual_clip.image_transform(lambda im: (im * [0.7, 1.2, 1.4]).clip(0, 255).astype('uint8')) # Cyan/Blue tint
             elif vibe == "black_and_white":
                 visual_clip = visual_clip.with_effects([vfx.BlackAndWhite()])
 
@@ -387,10 +447,16 @@ class VideoEngine:
                 elif settings.filter == "invert":
                     visual_clip = visual_clip.with_effects([vfx.InvertColors()])
 
-            # Keep suspense videos visually stable: no random shake/glitch/zoom.
-            trans_type = random.choice(["fade", "none"])
-            if trans_type == "fade":
-                visual_clip = visual_clip.with_effects([vfx.FadeIn(0.5), vfx.FadeOut(0.5)])
+            trans_type = getattr(settings, "transition", None) or "fade"
+            if trans_type == "zoom_in":
+                visual_clip = apply_zoom_in(visual_clip, duration)
+            elif trans_type == "zoom_out":
+                visual_clip = apply_zoom_out(visual_clip, duration)
+            elif trans_type == "slide":
+                visual_clip = apply_slide_left(visual_clip, duration)
+            elif trans_type == "fade" and duration >= 1.2:
+                fade = min(0.12, duration / 8)
+                visual_clip = visual_clip.with_effects([vfx.FadeIn(fade), vfx.FadeOut(fade)])
 
             try:
                 visual_clip = crop_center(visual_clip, w, h)
@@ -414,7 +480,11 @@ class VideoEngine:
                         img = Image.new('RGBA', (w, h), (0,0,0,0))
                         draw = ImageDraw.Draw(img)
 
-                        font_size = 70 if current_style == "bold_outline" else 100 if current_style == "high_retention" else 60
+                        requested_size = int(getattr(settings, "font_size", 0) or 0)
+                        if requested_size <= 60:
+                            font_size = 96 if current_style == "high_retention" else 80
+                        else:
+                            font_size = requested_size
                         try:
                             font_path = resolve_font_path()
                             font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
@@ -429,32 +499,29 @@ class VideoEngine:
                         tw, th = right - left, bottom - top
 
                         x = (w - tw) / 2
-                        y = (h - th) / 2 if current_style == "high_retention" else h - th - 200 # Center or Bottom
+                        position = (getattr(settings, "subtitle_position", "bottom") or "bottom").strip().lower()
+                        if position == "top":
+                            y = 80
+                        elif position == "center":
+                            y = (h - th) / 2
+                        else:
+                            y = h - th - 200
+                        fill = getattr(settings, "text_fore_color", None) or "white"
+                        stroke_fill = getattr(settings, "stroke_color", None) or "black"
+                        stroke_w = max(int(getattr(settings, "stroke_width", 0) or 0), 6)
+                        bg_mode = getattr(settings, "subtitle_background", "none")
 
-                        if current_style == "yellow_box":
+                        if current_style == "high_retention" or current_style == "bold_outline" or current_style == "default":
+                            draw.text((x, y), full_text, font=font, fill="white", stroke_width=stroke_w, stroke_fill="black", align="center")
+                        elif bg_mode == "box" or current_style == "yellow_box":
                             padding = 20
-                            draw.rectangle([x - padding, y - padding, x + tw + padding, y + th + padding], fill="yellow")
-                            draw.text((x, y), full_text, font=font, fill="black", align="center")
-                        elif current_style == "bold_outline":
-                            stroke_width = 5
-                            draw.text((x, y), full_text, font=font, fill="white", stroke_width=stroke_width, stroke_fill="black", align="center")
+                            box_color = "yellow" if current_style == "yellow_box" else (0, 0, 0, 160)
+                            draw.rectangle([x - padding, y - padding, x + tw + padding, y + th + padding], fill=box_color)
+                            draw.text((x, y), full_text, font=font, fill="black" if current_style == "yellow_box" else fill, align="center")
                         elif current_style == "minimal":
-                            draw.text((x, y), full_text, font=font, fill="white", align="center")
-                        elif current_style == "high_retention":
-                            # Big bold text with shadow and random colors (Yellow, Green, White)
-                            shadow_color = "black"
-                            for adj in range(-4, 5):
-                                for adj2 in range(-4, 5):
-                                    draw.text((x+adj, y+adj2), full_text, font=font, fill=shadow_color, align="center")
-
-                            color = random.choice(["#ffdd00", "#00ff00", "#ffffff"]) # Yellow, Green, White
-                            draw.text((x, y), full_text, font=font, fill=color, align="center")
-                        else: # Default
-                            shadow_color = "black"
-                            for adj in range(-2, 3):
-                                for adj2 in range(-2, 3):
-                                    draw.text((x+adj, y+adj2), full_text, font=font, fill=shadow_color, align="center")
-                            draw.text((x, y), full_text, font=font, fill="white", align="center")
+                            draw.text((x, y), full_text, font=font, fill=fill, align="center")
+                        else:
+                            draw.text((x, y), full_text, font=font, fill=fill, stroke_width=stroke_w, stroke_fill=stroke_fill, align="center")
 
                         return np.array(img)
 
@@ -495,7 +562,7 @@ class VideoEngine:
         if not final_clips: return None
 
         # Concatenate
-        final_video = concatenate_videoclips(final_clips, method="compose")
+        final_video = concatenate_videoclips(final_clips, method="chain")
 
         # Overlay Watermark
         if watermark_clip:
@@ -507,7 +574,7 @@ class VideoEngine:
         # Add BG Music
         if bg_music and os.path.exists(bg_music):
             from moviepy import CompositeAudioClip
-            bg = AudioFileClip(bg_music).with_volume_scaled(0.1) # 10% volume
+            bg = AudioFileClip(bg_music).with_volume_scaled(float(getattr(settings, "bgm_volume", 0.2) or 0.2))
             if bg.duration < final_video.duration:
                 from moviepy.audio import fx as afx
                 bg = bg.with_effects([afx.AudioLoop(duration=final_video.duration)])
@@ -518,7 +585,7 @@ class VideoEngine:
             final_video = final_video.with_audio(final_audio)
 
         # Export
-        output_filename = self.output_dir / "final_aesthetic_video.mp4"
+        output_filename = self.output_dir / (output_name or "final_aesthetic_video.mp4")
         final_video.write_videofile(str(output_filename), fps=24, codec='libx264', audio_codec='aac', threads=4)
         if not output_filename.exists() or output_filename.stat().st_size <= 0:
             print(f"❌ Video export failed or empty: {output_filename}")

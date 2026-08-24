@@ -569,6 +569,28 @@ body {
     margin-bottom: 20px;
 }
 
+.settings-grid.source-type-grid {
+    grid-template-columns: 1fr 1fr;
+    align-items: start;
+}
+
+.setting-card .settings-note {
+    margin-top: 14px;
+    margin-bottom: 0;
+}
+
+#provider-fallback-wrap {
+    margin-top: 8px;
+}
+
+#provider-fallback-wrap .setting-label {
+    margin-top: 14px;
+}
+
+.setting-label.nested-label {
+    margin-top: 16px;
+}
+
 .setting-card {
     background: var(--bg-clay);
     border: 1px solid var(--border);
@@ -616,6 +638,10 @@ body {
 
 .pill-group.quad {
     grid-template-columns: repeat(4, 1fr);
+}
+
+.pill-group.vibe-pills {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .pill-group input[type="radio"] {
@@ -1529,6 +1555,7 @@ body {
 @media (max-width: 700px) {
 
     .settings-grid,
+    .settings-grid.source-type-grid,
     .studio-grid,
     .hero-features,
     .upcoming-grid,

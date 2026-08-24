@@ -757,7 +757,13 @@ class PixabayScraper:
         try:
             candidates = []
             for variant in short_query_fallbacks(original) or [original]:
-                params = {"q": variant, "video_type": "all", "per_page": 50, "key": self.api_key}
+                params = {
+                    "q": variant,
+                    "video_type": "all",
+                    "per_page": 50,
+                    "key": self.api_key,
+                    "orientation": pixabay_orientation(aspect),
+                }
                 url = f"https://pixabay.com/api/videos/?{urlencode(params)}"
                 data = requests.get(url, timeout=(30, 60), verify=True).json()
                 before = len(candidates)
@@ -932,6 +938,27 @@ def pexels_orientation(aspect="9:16"):
     return "portrait"
 
 
+def pixabay_orientation(aspect="9:16"):
+    if aspect == "16:9":
+        return "horizontal"
+    if aspect == "1:1":
+        return "all"
+    return "vertical"
+
+
+def clip_matches_panel_aspect(width, height, aspect="9:16", is_vertical=None):
+    if aspect == "1:1":
+        return True
+    if width and height:
+        return matches_orientation(width, height, aspect)
+    if isinstance(is_vertical, bool):
+        if aspect == "9:16":
+            return is_vertical
+        if aspect == "16:9":
+            return not is_vertical
+    return True
+
+
 def short_query_fallbacks(query):
     text = (query or "").strip()
     words = text.split()
@@ -1051,6 +1078,8 @@ class CoverrScraper:
                     continue
                 width = item.get("max_width") or item.get("width") or 0
                 height = item.get("max_height") or item.get("height") or 0
+                if not clip_matches_panel_aspect(width, height, aspect, item.get("is_vertical")):
+                    continue
                 self.seen_ids.add(vid_id)
                 creator = item.get("creator") or item.get("author") or {}
                 creator_name = creator.get("name") if isinstance(creator, dict) else (creator or "")
@@ -1102,6 +1131,17 @@ _MIXKIT_LD_JSON_RE = re.compile(r'<script[^>]*type=["\']application/ld\+json["\'
 _MIXKIT_ISO8601_DURATION_RE = re.compile(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?')
 _MIXKIT_VIDEO_ID_RE = re.compile(r'/videos/(\d+)/')
 _MIXKIT_DETAIL_HREF_RE = re.compile(r'href="(/free-stock-video/[a-z0-9\-]+-\d+/)"')
+
+
+def schema_px(value):
+    if value is None:
+        return 0
+    if isinstance(value, dict):
+        return schema_px(value.get("value") or value.get("width") or value.get("height"))
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
 
 
 def mixkit_iso8601_duration_seconds(value):
@@ -1174,6 +1214,9 @@ class MixkitScraper:
                 duration = mixkit_iso8601_duration_seconds(item.get("duration"))
                 if duration and duration < min_seconds:
                     continue
+                width, height = schema_px(item.get("width")), schema_px(item.get("height"))
+                if not clip_matches_panel_aspect(width, height, aspect):
+                    continue
                 self.seen_ids.add(vid_id)
                 candidates.append({
                     "provider": "mixkit",
@@ -1183,8 +1226,8 @@ class MixkitScraper:
                     "creator": "Mixkit",
                     "title": item.get("name") or "",
                     "duration": duration,
-                    "width": 0,
-                    "height": 0,
+                    "width": width,
+                    "height": height,
                     "query": original or query,
                     "rendition": {"id": "720p"},
                 })
@@ -1271,295 +1314,6 @@ def mixkit_music_tracks(mood, limit=6):
             break
     return tracks
 
-
-class PiAPIScraper:
-    """Generate clips via PiAPI Unified API. Docs: https://piapi.ai/docs/unified-api-schema"""
-
-    BASE_URL = "https://api.piapi.ai/api/v1/task"
-    DEFAULT_VIDEO_MODEL = "hailuo-2.3-fast"
-    DEFAULT_IMAGE_MODEL = "Qubico/flux1-schnell"
-
-    def __init__(self, output_dir="downloads/piapi", api_key=None, model=None):
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.api_key = self._clean_key(api_key or os.environ.get("PIAPI_API_KEY", "") or os.environ.get("PIAPI_KEY", ""))
-        self.model = (model or "").strip() or self.DEFAULT_VIDEO_MODEL
-
-    @staticmethod
-    def _clean_key(api_key):
-        key = (api_key or "").strip().strip('"').strip("'")
-        if key.lower().startswith("bearer "):
-            key = key[7:].strip()
-        return key
-
-    def _get_folder(self, query):
-        folder = self.output_dir / re.sub(r"[^\w\-]", "_", query)[:25]
-        folder.mkdir(parents=True, exist_ok=True)
-        return folder
-
-    def _headers(self):
-        return {"x-api-key": self.api_key, "Content-Type": "application/json"}
-
-    def _kling_spec(self):
-        raw = (self.model or "").lower()
-        version = "2.5"
-        mode = "pro" if "pro" in raw or "master" in raw else "std"
-        if "master" in raw:
-            version = "2.1-master"
-        else:
-            match = re.search(r"(1\.5|1\.6|2\.1|2\.5|2\.6)", raw)
-            if match:
-                version = match.group(1)
-        return version, mode
-
-    def _is_hailuo(self):
-        raw = (self.model or "").lower()
-        return "hailuo" in raw or "v2.3" in raw or "2.3-fast" in raw
-
-    def _hailuo_variant(self):
-        raw = (self.model or "").lower()
-        return "v2.3-fast" if "fast" in raw else "v2.3"
-
-    def _task_body(self, prompt, aspect, kind):
-        limit = 2000 if self._is_hailuo() and kind != "image" else 2500
-        prompt = (prompt or "")[:limit]
-        if kind == "image" or "flux" in (self.model or "").lower():
-            model = self.model if "flux" in (self.model or "").lower() else self.DEFAULT_IMAGE_MODEL
-            if "/" not in model:
-                model = f"Qubico/{model}"
-            size = {"9:16": (768, 1344), "16:9": (1344, 768)}.get(aspect or "9:16", (1024, 1024))
-            return {
-                "model": model,
-                "task_type": "txt2img",
-                "input": {"prompt": prompt, "width": size[0], "height": size[1]},
-            }
-        if self._is_hailuo():
-            return {
-                "model": "hailuo",
-                "task_type": "video_generation",
-                "input": {
-                    "prompt": prompt,
-                    "model": self._hailuo_variant(),
-                    "expand_prompt": True,
-                    "duration": 6,
-                    "resolution": 768,
-                },
-                "config": {"service_mode": "public"},
-            }
-        version, mode = self._kling_spec()
-        ratio = aspect if aspect in {"16:9", "9:16", "1:1"} else "9:16"
-        return {
-            "model": "kling",
-            "task_type": "video_generation",
-            "input": {
-                "prompt": prompt,
-                "negative_prompt": "subtitles, captions, text overlay, watermark, logo",
-                "cfg_scale": "0.5",
-                "duration": 5,
-                "aspect_ratio": ratio,
-                "mode": mode,
-                "version": version,
-            },
-        }
-
-    def _retry_after_seconds(self, response):
-        header = response.headers.get("Retry-After") or response.headers.get("retry-after")
-        if header:
-            try:
-                return max(1, min(int(float(header)), 60))
-            except ValueError:
-                pass
-        return 12
-
-    def _payload_message(self, payload):
-        if not isinstance(payload, dict):
-            return str(payload)[:300]
-        err = payload.get("error")
-        if isinstance(err, dict):
-            return str(err.get("message") or err.get("raw_message") or err)[:300]
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-        nested = data.get("error") if isinstance(data, dict) else None
-        if isinstance(nested, dict):
-            return str(nested.get("message") or nested.get("raw_message") or nested)[:300]
-        return str(payload.get("message") or payload.get("detail") or payload.get("title") or "")[:300]
-
-    def _format_error(self, response):
-        try:
-            payload = response.json()
-        except Exception:
-            payload = {}
-        detail = self._payload_message(payload) or (response.text or "")[:300]
-        text = f"PiAPI HTTP {response.status_code}: {detail}".strip(": ")
-        lowered = text.lower()
-        if response.status_code == 401 or "failed to verify api key" in lowered or "unauthorized" in lowered:
-            return (
-                "PiAPI HTTP 401: API key rejected. Create a PiAPI key at https://app.piapi.ai/ "
-                "and paste it in API settings. Do not use a Replicate r8_ token."
-            )
-        if response.status_code == 402 or "credit" in lowered or "balance" in lowered:
-            return (
-                "PiAPI HTTP 402: no credit. Top up at https://app.piapi.ai/ "
-                "or switch Source to Pexels."
-            )
-        return text if detail else f"PiAPI HTTP {response.status_code}"
-
-    def _create_task(self, body):
-        last_error = None
-        for attempt in range(5):
-            response = requests.post(self.BASE_URL, headers=self._headers(), json=body, timeout=60)
-            if response.status_code == 429:
-                wait = self._retry_after_seconds(response)
-                last_error = self._format_error(response)
-                print(f"⏳ PiAPI rate limit, waiting {wait}s (attempt {attempt + 1}/5)")
-                time.sleep(wait)
-                continue
-            if response.status_code in (500, 502, 503, 504) and attempt < 4:
-                last_error = self._format_error(response)
-                wait = 5 * (attempt + 1)
-                print(f"⏳ PiAPI upstream {response.status_code}, retrying in {wait}s (attempt {attempt + 1}/5)")
-                time.sleep(wait)
-                continue
-            if response.status_code >= 400:
-                raise RuntimeError(self._format_error(response))
-            payload = response.json() if response.content else {}
-            code = payload.get("code")
-            if code not in (None, 200, 0):
-                raise RuntimeError(f"PiAPI error {code}: {self._payload_message(payload) or 'create task failed'}")
-            data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-            if not (data or {}).get("task_id"):
-                raise RuntimeError(self._payload_message(payload) or "PiAPI did not return a task_id.")
-            return data
-        raise RuntimeError(last_error or "PiAPI HTTP 429: rate limited")
-
-    def _wait(self, data):
-        task_id = data.get("task_id")
-        if not task_id:
-            raise RuntimeError("PiAPI did not return a task_id.")
-        url = f"{self.BASE_URL}/{task_id}"
-        last_status = None
-        for _ in range(72):
-            status = str(data.get("status") or "").lower()
-            if status != last_status:
-                print(f"⏳ PiAPI task {task_id}: {status or 'pending'}")
-                last_status = status
-            if status == "completed":
-                return data
-            if status in {"failed", "error", "cancelled", "canceled"}:
-                msg = self._task_failure_message(data)
-                raise RuntimeError(f"PiAPI failed: {msg}")
-            time.sleep(5)
-            response = requests.get(url, headers=self._headers(), timeout=30)
-            if response.status_code == 429:
-                time.sleep(self._retry_after_seconds(response))
-                continue
-            if response.status_code >= 400:
-                raise RuntimeError(self._format_error(response))
-            payload = response.json() if response.content else {}
-            code = payload.get("code") if isinstance(payload, dict) else None
-            if code not in (None, 200, 0):
-                raise RuntimeError(f"PiAPI error {code}: {self._payload_message(payload) or 'task polling failed'}")
-            data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-        raise RuntimeError("PiAPI task timed out after 6 minutes.")
-
-    def _task_failure_message(self, data):
-        error = data.get("error") if isinstance(data, dict) else None
-        parts = []
-        if isinstance(error, dict):
-            for key in ("message", "raw_message", "detail", "code"):
-                value = error.get(key)
-                if value not in (None, "", 0) and str(value) not in parts:
-                    parts.append(str(value))
-        elif error:
-            parts.append(str(error))
-        detail = data.get("detail") if isinstance(data, dict) else None
-        if detail and str(detail) not in parts:
-            parts.append(str(detail))
-        logs = data.get("logs") if isinstance(data, dict) else None
-        if logs:
-            log_text = logs[-1] if isinstance(logs, list) else logs
-            if str(log_text) not in parts:
-                parts.append(str(log_text))
-        return " | ".join(parts)[:1000] or "task failed without an upstream error message"
-
-    def _output_urls(self, output):
-        if not output:
-            return []
-        if isinstance(output, str) and output.startswith("http"):
-            return [output]
-        if isinstance(output, list):
-            urls = []
-            for item in output:
-                urls.extend(self._output_urls(item))
-            return urls
-        if isinstance(output, dict):
-            for key in ("video_url", "image_url", "url", "href", "video", "image", "resource"):
-                if output.get(key):
-                    found = self._output_urls(output[key])
-                    if found:
-                        return found
-            for key in ("works", "images", "videos"):
-                if output.get(key):
-                    found = self._output_urls(output[key])
-                    if found:
-                        return found
-        return []
-
-    def download_file(self, url, path):
-        min_bytes = MIN_VIDEO_BYTES if str(path).lower().endswith(".mp4") else MIN_IMAGE_BYTES
-        try:
-            response = requests.get(url, timeout=120)
-            if response.status_code == 200 and response.content and len(response.content) >= min_bytes:
-                path.write_bytes(response.content)
-                return True
-        except Exception:
-            pass
-        return False
-
-    async def _generate(self, prompt, kind, aspect, limit=1):
-        if not self.api_key:
-            print("⚠️ PiAPI key not set")
-            return []
-        if self.api_key.lower().startswith("r8_"):
-            raise RuntimeError(
-                "PiAPI HTTP 401: this looks like a Replicate token (r8_...). "
-                "Create a PiAPI key at https://app.piapi.ai/"
-            )
-        prompt = (prompt or "").strip()
-        if not prompt:
-            return []
-        folder = self._get_folder(prompt)
-        original_model = self.model
-        if kind == "image" and "flux" not in original_model.lower():
-            self.model = self.DEFAULT_IMAGE_MODEL
-        paths = []
-        try:
-            for idx in range(max(1, min(limit, 1))):
-                print(f"🎬 PiAPI {kind}: {self.model} | {prompt[:80]}")
-                visual = prompt if "vertical" in prompt.lower() or "9:16" in prompt else f"{prompt}, vertical 9:16, cinematic, no subtitles"
-                data = await asyncio.to_thread(self._create_task, self._task_body(visual, aspect, kind))
-                data = await asyncio.to_thread(self._wait, data)
-                urls = self._output_urls(data.get("output"))
-                if not urls:
-                    print("⚠️ PiAPI returned no file URL")
-                    continue
-                ext = "jpg" if kind == "image" else "mp4"
-                task_id = data.get("task_id") or f"{idx}_{int(time.time())}"
-                path = folder / f"p_{re.sub(r'[^\w\-]', '_', str(task_id))[:40]}.{ext}"
-                ok = await asyncio.to_thread(self.download_file, urls[0], path)
-                if ok and path.exists() and path.stat().st_size >= (MIN_IMAGE_BYTES if kind == "image" else MIN_VIDEO_BYTES):
-                    paths.append(str(path))
-        except Exception as exc:
-            print(f"⚠️ PiAPI generate failed: {exc}")
-            raise
-        finally:
-            self.model = original_model
-        return paths
-
-    async def search_images(self, query, num_images=1):
-        return await self._generate(query, "image", "9:16", limit=min(num_images, 1))
-
-    async def search_videos(self, query, num_videos=1, aspect="9:16"):
-        return await self._generate(query, "video", aspect or "9:16", limit=min(num_videos, 1))
 
 class VideoDownloader:
     def __init__(self, output_dir):

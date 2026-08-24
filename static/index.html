@@ -9,7 +9,7 @@
         content="VUZA free AI video creator: turn a topic or script into stock footage, voiceover, subtitles, and a 9:16 short.">
     <meta name="keywords"
         content="VUZA, free ai video creator, faceless video generator, money printer tool, pinterest video scraper, pinterest scraper, free pictory ai alternative, free invideo alternative, moneyprinter turbo, pexels video downloader, pixabay scraper, edge tts, ai voiceover, auto subtitles, open source video tool, python video creator, script to video, tiktok video maker, youtube shorts creator, instagram reels, ai automation, free video generation, content creation tool">
-    <link rel="stylesheet" href="/static/style.css?v=5.1">
+    <link rel="stylesheet" href="/static/style.css?v=5.3">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap"
         rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
@@ -194,25 +194,6 @@
                                     <p class="settings-note prov-status" id="coverr-test-status"></p>
                                 </div>
                             </div>
-                            <div class="key-field">
-                                <label>PiAPI key <a href="https://app.piapi.ai/" target="_blank"
-                                        class="get-key">Get key →</a></label>
-                                <input type="password" id="piapi-key" placeholder="PiAPI workspace key"
-                                    autocomplete="off">
-                            </div>
-                            <div class="key-field">
-                                <label>PiAPI video model</label>
-                                <input type="text" id="piapi-model" list="piapi-model-presets"
-                                    placeholder="hailuo-2.3-fast" value="hailuo-2.3-fast">
-                                <datalist id="piapi-model-presets">
-                                    <option value="hailuo-2.3-fast">
-                                    <option value="hailuo-2.3">
-                                    <option value="kling-2.5">
-                                    <option value="kling-2.6">
-                                    <option value="kling-2.1">
-                                </datalist>
-                                <p class="settings-note">Default: Hailuo 2.3 Fast (6s, 768p) via the <a href="https://piapi.ai/docs/hailuo-api/generate-video" target="_blank" class="get-key">PiAPI Hailuo API</a>. Photos use Flux.</p>
-                            </div>
                         </div>
                     </div>
 
@@ -298,30 +279,21 @@
                     <button type="button" id="add-script-btn" class="secondary-btn"><i class="fas fa-plus"></i> Add another script (batch)</button>
                 </div>
 
-                <div class="settings-grid">
-                    <div class="setting-card">
+                <div class="settings-grid source-type-grid">
+                    <div class="setting-card source-card">
                         <div class="setting-label"><i class="fas fa-globe"></i> Media source</div>
-                        <div class="pill-group quad">
-                            <input type="radio" id="src-mixkit" name="source" value="mixkit" checked>
-                            <label for="src-mixkit"><i class="fas fa-play-circle"></i> Mixkit</label>
-                            <input type="radio" id="src-pexels" name="source" value="pexels">
-                            <label for="src-pexels"><i class="fas fa-camera"></i> Pexels</label>
-                            <input type="radio" id="src-pixabay" name="source" value="pixabay">
-                            <label for="src-pixabay"><i class="fas fa-star"></i> Pixabay</label>
-                            <input type="radio" id="src-coverr" name="source" value="coverr">
-                            <label for="src-coverr"><i class="fas fa-film"></i> Coverr</label>
-                            <input type="radio" id="src-local" name="source" value="local">
-                            <label for="src-local"><i class="fas fa-folder"></i> Local</label>
-                             <input type="radio" id="src-piapi" name="source" value="piapi">
-                             <label for="src-piapi"><i class="fas fa-bolt"></i> PiAPI</label>
-                             <input type="radio" id="src-round-robin" name="source" value="round_robin">
-                             <label for="src-round-robin"><i class="fas fa-sync-alt"></i> Round-Robin</label>
-                         </div>
-                         <p class="settings-note">PiAPI is paid. Hailuo creates one 6-second AI clip per detected script scene and asks for confirmation before every run.</p>
-                         <p class="settings-note" id="round-robin-note">Round-Robin searches Mixkit, Pexels, Pixabay, and Coverr together per scene and blends the best matches. Requires narration script mode + video type; add API keys for any providers you have.</p>
-                         <p class="settings-note" id="mixkit-note">Mixkit is free stock video (no API key). It has no photo library — Photos switches to Videos automatically.</p>
-                         <div id="provider-fallback-wrap">
-                            <div class="setting-label" style="margin-top:0.75rem">Provider fallback</div>
+                        <select id="source-select" class="custom-select" name="source">
+                            <option value="mixkit" selected>Mixkit</option>
+                            <option value="pexels">Pexels</option>
+                            <option value="pixabay">Pixabay</option>
+                            <option value="coverr">Coverr</option>
+                            <option value="local">Local</option>
+                            <option value="round_robin">Round-Robin</option>
+                        </select>
+                        <p class="settings-note" id="round-robin-note">Round-Robin searches Mixkit, Pexels, Pixabay, and Coverr together per scene and blends the best matches. Requires narration script mode + video type; add API keys for any providers you have.</p>
+                        <p class="settings-note" id="mixkit-note">Mixkit is free stock video (no API key). It has no photo library — Photos switches to Videos automatically.</p>
+                        <div id="provider-fallback-wrap">
+                            <div class="setting-label">Provider fallback</div>
                             <div class="pill-group">
                                 <input type="radio" id="fallback-on" name="provider_fallback" value="true" checked>
                                 <label for="fallback-on"><i class="fas fa-random"></i> On</label>
@@ -329,9 +301,9 @@
                                 <label for="fallback-off"><i class="fas fa-ban"></i> Off</label>
                             </div>
                             <p class="settings-note">Off = only the source you picked. On = if that source cannot cover narration, try the next stock provider in order.</p>
-                         </div>
-                     </div>
-                    <div class="setting-card">
+                        </div>
+                    </div>
+                    <div class="setting-card type-card">
                         <div class="setting-label"><i class="fas fa-photo-video"></i> Media type</div>
                         <div class="pill-group">
                             <input type="radio" id="type-photo" name="media_type" value="photo">
@@ -339,16 +311,18 @@
                             <input type="radio" id="type-video" name="media_type" value="video" checked>
                             <label for="type-video"><i class="fas fa-video"></i> Videos</label>
                         </div>
-                    </div>
-                    <div class="setting-card">
-                        <div class="setting-label"><i class="fas fa-palette"></i> AI vibe</div>
-                        <div class="pill-group penta">
-                            <input type="radio" id="vibe-aesthetic" name="vibe" value="aesthetic" checked>
+                        <div class="setting-label nested-label"><i class="fas fa-layer-group"></i> Assets per scene: <span id="count-val"
+                                class="highlight">3</span></div>
+                        <input type="range" id="count" min="1" max="15" value="3" class="custom-range"
+                            oninput="document.getElementById('count-val').innerText = this.value">
+                        <div class="setting-label nested-label"><i class="fas fa-palette"></i> AI vibe</div>
+                        <div class="pill-group vibe-pills">
+                            <input type="radio" id="vibe-general" name="vibe" value="general" checked>
+                            <label for="vibe-general">🌍 General</label>
+                            <input type="radio" id="vibe-aesthetic" name="vibe" value="aesthetic">
                             <label for="vibe-aesthetic">✨ Aesthetic</label>
                             <input type="radio" id="vibe-lofi" name="vibe" value="lofi">
                             <label for="vibe-lofi">🌙 Night</label>
-                            <input type="radio" id="vibe-general" name="vibe" value="general">
-                            <label for="vibe-general">🌍 General</label>
                             <input type="radio" id="vibe-futuristic" name="vibe" value="futuristic">
                             <label for="vibe-futuristic">🚀 Futuristic</label>
                             <input type="radio" id="vibe-bw" name="vibe" value="black_and_white">
@@ -356,12 +330,6 @@
                             <input type="radio" id="vibe-suspense" name="vibe" value="suspense_cn">
                             <label for="vibe-suspense">Suspense</label>
                         </div>
-                    </div>
-                    <div class="setting-card">
-                        <div class="setting-label"><i class="fas fa-layer-group"></i> Assets per scene: <span id="count-val"
-                                class="highlight">3</span></div>
-                        <input type="range" id="count" min="1" max="15" value="3" class="custom-range"
-                            oninput="document.getElementById('count-val').innerText = this.value">
                     </div>
                 </div>
 
@@ -466,11 +434,25 @@
                         <div class="setting-card">
                             <div class="setting-label">Caption style</div>
                             <select id="subtitle-style" class="custom-select">
-                                <option value="default">White text + shadow</option>
-                                <option value="yellow_box">Yellow box</option>
+                                <option value="high_retention" selected>High-retention (word chunks)</option>
+                                <option value="default">Clean outline</option>
                                 <option value="bold_outline">Bold outline</option>
+                                <option value="yellow_box">Yellow box</option>
                                 <option value="minimal">Minimal</option>
-                                <option value="high_retention" selected>🔥 High-retention</option>
+                            </select>
+                        </div>
+                        <div class="setting-card">
+                            <div class="setting-label">Font</div>
+                            <select id="caption-font" class="custom-select">
+                                <option value="BeVietnamPro-Bold.ttf" selected>Be Vietnam Pro Bold</option>
+                                <option value="BeVietnamPro-Medium.ttf">Be Vietnam Pro Medium</option>
+                                <option value="Charm-Bold.ttf">Charm Bold</option>
+                                <option value="Charm-Regular.ttf">Charm</option>
+                                <option value="UTM Kabel KT.ttf">Kabel</option>
+                                <option value="MicrosoftYaHeiBold.ttc">YaHei Bold</option>
+                                <option value="MicrosoftYaHeiNormal.ttc">YaHei</option>
+                                <option value="STHeitiMedium.ttc">Heiti Medium</option>
+                                <option value="STHeitiLight.ttc">Heiti Light</option>
                             </select>
                         </div>
                         <div class="setting-card">
@@ -479,11 +461,16 @@
                                 <option value="bottom" selected>Bottom</option>
                                 <option value="center">Center</option>
                                 <option value="top">Top</option>
+                                <option value="custom">Custom</option>
                             </select>
                         </div>
+                        <div class="setting-card hidden" id="custom-caption-position-wrap">
+                            <div class="setting-label">Custom position (% from top)</div>
+                            <input type="number" id="subtitle-custom-position" class="custom-select" min="0" max="100" step="0.5" value="70.0">
+                        </div>
                         <div class="setting-card">
-                            <div class="setting-label">Font size: <span id="font-size-val" class="highlight">24</span></div>
-                            <input type="range" id="font-size" min="24" max="160" value="24" class="custom-range"
+                            <div class="setting-label">Font size: <span id="font-size-val" class="highlight">52</span></div>
+                            <input type="range" id="font-size" min="24" max="160" value="52" class="custom-range"
                                 oninput="document.getElementById('font-size-val').innerText = this.value">
                         </div>
                         <div class="setting-card">
@@ -495,8 +482,8 @@
                             <input type="color" id="stroke-color" value="#000000">
                         </div>
                         <div class="setting-card">
-                            <div class="setting-label">Stroke width: <span id="stroke-width-val" class="highlight">1.5</span></div>
-                            <input type="range" id="stroke-width" min="0" max="12" step="0.5" value="1.5" class="custom-range"
+                            <div class="setting-label">Stroke width: <span id="stroke-width-val" class="highlight">3</span></div>
+                            <input type="range" id="stroke-width" min="0" max="12" step="0.5" value="3" class="custom-range"
                                 oninput="document.getElementById('stroke-width-val').innerText = this.value">
                         </div>
                         <div class="setting-card">
@@ -680,7 +667,7 @@
     </div>
 
     <div id="toast" class="toast hidden"></div>
-    <script src="/static/script.js?v=7.1"></script>
+    <script src="/static/script.js?v=7.4"></script>
 </body>
 
 </html>

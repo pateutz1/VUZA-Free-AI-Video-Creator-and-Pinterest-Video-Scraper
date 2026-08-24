@@ -32,7 +32,7 @@ def parse_args(argv=None):
     parser.add_argument("--mode", choices=["single", "script"], default="script")
     parser.add_argument(
         "--source",
-        choices=["pinterest", "pexels", "pixabay", "coverr", "piapi", "local"],
+        choices=["pinterest", "pexels", "pixabay", "coverr", "mixkit", "local"],
         default="pinterest",
     )
     parser.add_argument("--media-type", choices=["photo", "video"], default="photo")
@@ -59,13 +59,6 @@ def parse_args(argv=None):
     parser.add_argument("--pexels-key", default="")
     parser.add_argument("--pixabay-key", default="")
     parser.add_argument("--coverr-key", default="")
-    parser.add_argument("--piapi-key", default="")
-    parser.add_argument("--piapi-model", default="hailuo-2.3-fast")
-    parser.add_argument(
-        "--piapi-confirmed",
-        action="store_true",
-        help="Required for paid PiAPI generation. Never implied.",
-    )
     parser.add_argument("--eleven-key", default="")
     parser.add_argument("--yt-client-id", default="")
     parser.add_argument("--yt-client-secret", default="")
@@ -84,7 +77,6 @@ def build_request(args) -> ScrapeRequest:
         auto_video=not args.no_auto_video,
         yt_upload=args.yt_upload,
         publish_confirmed=args.publish_confirmed,
-        piapi_confirmed=args.piapi_confirmed,
         local_files=args.local_files or None,
         video_settings=VideoSettings(
             ratio=args.ratio,
@@ -102,8 +94,6 @@ def build_request(args) -> ScrapeRequest:
             pexels_key=args.pexels_key,
             pixabay_key=args.pixabay_key,
             coverr_key=args.coverr_key,
-            piapi_key=args.piapi_key,
-            piapi_model=args.piapi_model,
             eleven_key=args.eleven_key,
             yt_client_id=args.yt_client_id,
             yt_client_secret=args.yt_client_secret,

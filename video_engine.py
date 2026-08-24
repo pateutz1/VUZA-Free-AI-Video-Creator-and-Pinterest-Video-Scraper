@@ -16,9 +16,18 @@ for stream in (sys.stdout, sys.stderr):
 # ANTIGRAVITY VIDEO ENGINE (MOVIEPY + EDGE-TTS)
 # ═══════════════════════════════════════════════════════════════
 
+ENGINE_DIR = Path(__file__).resolve().parent
+FONT_DIR = ENGINE_DIR / "static" / "fonts"
+LATIN_CAPTION_FONTS = {
+    "BeVietnamPro-Bold.ttf",
+    "BeVietnamPro-Medium.ttf",
+    "Charm-Bold.ttf",
+    "Charm-Regular.ttf",
+    "UTM Kabel KT.ttf",
+}
 FONT_CANDIDATES = [
-    r"C:\Windows\Fonts\msyh.ttc",
     r"C:\Windows\Fonts\msyhbd.ttc",
+    r"C:\Windows\Fonts\msyh.ttc",
     r"C:\Windows\Fonts\simhei.ttf",
     "static/fonts/NotoSansSC-Bold.ttf",
     "static/fonts/NotoSansSC-Regular.ttf",
@@ -30,11 +39,48 @@ FONT_CANDIDATES = [
     "arial.ttf",
 ]
 
-def resolve_font_path():
+
+def _font_in_dirs(name):
+    name = Path(name or "").name
+    if not name:
+        return None
+    path = FONT_DIR / name
+    if path.is_file():
+        return str(path)
+    return None
+
+
+def resolve_font_path(font_name=""):
+    chosen = _font_in_dirs(font_name)
+    if chosen:
+        return chosen
+    for preferred in ("BeVietnamPro-Bold.ttf", "BeVietnamPro-Medium.ttf", "MicrosoftYaHeiBold.ttc"):
+        found = _font_in_dirs(preferred)
+        if found:
+            return found
     for font_path in FONT_CANDIDATES:
         if os.path.exists(font_path):
             return font_path
     return None
+
+
+def subtitle_top(frame_h, text_h, position="bottom", custom_pct=70.0):
+    pos = (position or "bottom").strip().lower()
+    if pos == "top":
+        pct = 12.0
+    elif pos == "center":
+        pct = 50.0
+    elif pos == "custom":
+        try:
+            pct = float(custom_pct)
+        except (TypeError, ValueError):
+            pct = 70.0
+    else:
+        pct = 78.0
+    pct = max(0.0, min(100.0, pct))
+    y = frame_h * (pct / 100.0) - text_h / 2.0
+    margin = 24
+    return max(margin, min(max(margin, frame_h - text_h - margin), y))
 
 def contains_cjk(text):
     return bool(re.search(r'[\u3400-\u9fff]', text or ""))
@@ -617,51 +663,75 @@ class VideoEngine:
                     style = settings.subtitle_style if settings else "default"
 
                     def make_text_image(txt, w, h, current_style="default"):
-                        img = Image.new('RGBA', (w, h), (0,0,0,0))
+                        img = Image.new('RGBA', (w, h), (0, 0, 0, 0))
                         draw = ImageDraw.Draw(img)
 
-                        requested_size = int(getattr(settings, "font_size", 0) or 0)
-                        if requested_size <= 60:
-                            font_size = 96 if current_style == "high_retention" else 80
-                        else:
-                            font_size = requested_size
+                        requested_size = int(getattr(settings, "font_size", 0) or 52)
+                        font_size = max(24, min(160, requested_size))
+                        font_name = getattr(settings, "font_name", "") or ""
+                        if contains_cjk(txt) and Path(font_name).name in LATIN_CAPTION_FONTS:
+                            font_name = "MicrosoftYaHeiBold.ttc"
                         try:
-                            font_path = resolve_font_path()
+                            font_path = resolve_font_path(font_name)
                             font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
-                        except:
+                        except Exception:
                             font = ImageFont.load_default()
 
-                        # Manual multiline
-                        lines = wrap_text_lines(txt, draw, font, w * 0.8)
-
-                        full_text = "\n".join(lines)
-                        left, top, right, bottom = draw.textbbox((0, 0), full_text, font=font)
-                        tw, th = right - left, bottom - top
-
-                        x = (w - tw) / 2
-                        position = (getattr(settings, "subtitle_position", "bottom") or "bottom").strip().lower()
-                        if position == "top":
-                            y = 80
-                        elif position == "center":
-                            y = (h - th) / 2
-                        else:
-                            y = h - th - 200
-                        fill = getattr(settings, "text_fore_color", None) or "white"
-                        stroke_fill = getattr(settings, "stroke_color", None) or "black"
-                        stroke_w = max(int(getattr(settings, "stroke_width", 0) or 0), 6)
+                        lines = wrap_text_lines(txt, draw, font, w * 0.82)
+                        fill = getattr(settings, "text_fore_color", None) or "#FFFFFF"
+                        stroke_fill = getattr(settings, "stroke_color", None) or "#000000"
+                        stroke_w = int(round(float(getattr(settings, "stroke_width", 3) or 0)))
+                        stroke_w = max(0, min(12, stroke_w))
+                        if current_style == "minimal":
+                            stroke_w = 0
+                        elif current_style == "bold_outline":
+                            stroke_w = max(stroke_w, max(3, font_size // 16))
                         bg_mode = getattr(settings, "subtitle_background", "none")
 
-                        if current_style == "high_retention" or current_style == "bold_outline" or current_style == "default":
-                            draw.text((x, y), full_text, font=font, fill="white", stroke_width=stroke_w, stroke_fill="black", align="center")
-                        elif bg_mode == "box" or current_style == "yellow_box":
-                            padding = 20
-                            box_color = "yellow" if current_style == "yellow_box" else (0, 0, 0, 160)
-                            draw.rectangle([x - padding, y - padding, x + tw + padding, y + th + padding], fill=box_color)
-                            draw.text((x, y), full_text, font=font, fill="black" if current_style == "yellow_box" else fill, align="center")
-                        elif current_style == "minimal":
-                            draw.text((x, y), full_text, font=font, fill=fill, align="center")
-                        else:
-                            draw.text((x, y), full_text, font=font, fill=fill, stroke_width=stroke_w, stroke_fill=stroke_fill, align="center")
+                        line_sizes = []
+                        for line in lines:
+                            try:
+                                box = draw.textbbox((0, 0), line, font=font, stroke_width=stroke_w)
+                            except TypeError:
+                                box = draw.textbbox((0, 0), line, font=font)
+                            line_sizes.append((box[2] - box[0], box[3] - box[1], -box[1]))
+                        line_gap = max(8, font_size // 6)
+                        th = sum(size[1] for size in line_sizes) + line_gap * (len(lines) - 1)
+                        tw = max((size[0] for size in line_sizes), default=0)
+                        y = subtitle_top(
+                            h, th,
+                            getattr(settings, "subtitle_position", "bottom"),
+                            getattr(settings, "subtitle_custom_position", 70.0),
+                        )
+
+                        if bg_mode == "box" or current_style == "yellow_box":
+                            padding = max(16, font_size // 4)
+                            x0 = (w - tw) / 2 - padding
+                            box_color = (255, 214, 0, 230) if current_style == "yellow_box" else (0, 0, 0, 160)
+                            draw.rectangle(
+                                [x0, y - padding, x0 + tw + padding * 2, y + th + padding],
+                                fill=box_color,
+                            )
+                            fill = "#111111" if current_style == "yellow_box" else fill
+                            stroke_w = 0
+
+                        cursor_y = y
+                        for line, (lw, lh, baseline) in zip(lines, line_sizes):
+                            lx = (w - lw) / 2
+                            ly = cursor_y - baseline
+                            if current_style != "minimal" and current_style != "yellow_box" and bg_mode != "box":
+                                shadow = max(2, font_size // 24)
+                                draw.text((lx + shadow, ly + shadow), line, font=font, fill=(0, 0, 0, 110), align="left")
+                            draw.text(
+                                (lx, ly),
+                                line,
+                                font=font,
+                                fill=fill,
+                                stroke_width=stroke_w,
+                                stroke_fill=stroke_fill,
+                                align="left",
+                            )
+                            cursor_y += lh + line_gap
 
                         return np.array(img)
 

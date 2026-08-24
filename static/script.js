@@ -129,8 +129,6 @@ document.addEventListener('DOMContentLoaded', () => {
         if (keys.pexels_key) document.getElementById('pexels-key').value = keys.pexels_key;
         if (keys.pixabay_key) document.getElementById('pixabay-key').value = keys.pixabay_key;
         if (keys.coverr_key) document.getElementById('coverr-key').value = keys.coverr_key;
-        if (keys.piapi_key && !keys.piapi_key.startsWith('r8_')) document.getElementById('piapi-key').value = keys.piapi_key;
-        if (keys.piapi_model && keys.piapi_model !== 'kling-2.5') document.getElementById('piapi-model').value = keys.piapi_model;
         if (keys.yt_client_id) document.getElementById('yt-client-id').value = keys.yt_client_id;
         if (keys.yt_client_secret) document.getElementById('yt-client-secret').value = keys.yt_client_secret;
         if (keys.eleven_key) document.getElementById('eleven-key').value = keys.eleven_key;
@@ -276,14 +274,12 @@ document.addEventListener('DOMContentLoaded', () => {
             pexels_key: valueOf('pexels-key'),
             pixabay_key: valueOf('pixabay-key'),
             coverr_key: valueOf('coverr-key'),
-            piapi_key: valueOf('piapi-key'),
-            piapi_model: valueOf('piapi-model') || 'hailuo-2.3-fast',
             yt_client_id: valueOf('yt-client-id'),
             yt_client_secret: valueOf('yt-client-secret'),
             eleven_key: valueOf('eleven-key')
         };
         const merged = { ...saved };
-        const stale = ["seedream_key", "seedream_url", "seedream_model", "replicate_key", "replicate_model"];
+        const stale = ["seedream_key", "seedream_url", "seedream_model", "replicate_key", "replicate_model", "piapi_key", "piapi_model"];
         stale.forEach((key) => { delete merged[key]; });
         Object.entries(current).forEach(([key, value]) => {
             if (key === 'llm_providers' || key === 'llm_preset' || value) merged[key] = value;
@@ -293,7 +289,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function persistKeys(keys) {
         const clean = { ...keys };
-        const stale = ["seedream_key", "seedream_url", "seedream_model", "replicate_key", "replicate_model"];
+        const stale = ["seedream_key", "seedream_url", "seedream_model", "replicate_key", "replicate_model", "piapi_key", "piapi_model"];
         stale.forEach((key) => { delete clean[key]; });
         localStorage.setItem('vuza_api_keys', JSON.stringify(clean));
     }
@@ -495,7 +491,8 @@ document.addEventListener('DOMContentLoaded', () => {
             if (el) el.checked = true;
         };
 
-        setChecked('src-mixkit');
+        const sourceSelect = document.getElementById('source-select');
+        if (sourceSelect) sourceSelect.value = 'mixkit';
         setChecked('type-video');
         setChecked('ratio-9-16');
         setChecked('emoji-subs-off');
@@ -511,7 +508,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const subtitleStyle = document.getElementById('subtitle-style');
         if (subtitleStyle) subtitleStyle.value = 'high_retention';
+        const captionFont = document.getElementById('caption-font');
+        if (captionFont) captionFont.value = 'MicrosoftYaHeiBold.ttc';
     }
+
+    function updateCaptionPositionUi() {
+        const pos = document.getElementById('subtitle-position')?.value;
+        const wrap = document.getElementById('custom-caption-position-wrap');
+        if (wrap) wrap.classList.toggle('hidden', pos !== 'custom');
+    }
+
+    document.getElementById('subtitle-position')?.addEventListener('change', updateCaptionPositionUi);
+    updateCaptionPositionUi();
 
     if (languageSelect) {
         languageSelect.addEventListener('change', updateVoices);
@@ -522,26 +530,33 @@ document.addEventListener('DOMContentLoaded', () => {
     refreshMusicOptions();
     resumeCurrentJob();
 
-    document.querySelectorAll('input[name="source"], input[name="auto_video"]').forEach(input => {
-        input.addEventListener('change', () => {
-            const source = document.querySelector('input[name="source"]:checked')?.value;
-            if (source === 'piapi' || source === 'round_robin' || source === 'mixkit') {
-                const videoType = document.getElementById('type-video');
-                if (videoType) videoType.checked = true;
-            }
-            if (source === 'round_robin') {
-                if (typeof switchMode === 'function') switchMode('script');
-            }
-            updateProviderFallbackVisibility();
-            updatePrimaryButtonText();
-        });
+    function getSelectedSource() {
+        return document.getElementById('source-select')?.value;
+    }
+
+    function onSourceOrAutoVideoChange() {
+        const source = getSelectedSource();
+        if (source === 'round_robin' || source === 'mixkit') {
+            const videoType = document.getElementById('type-video');
+            if (videoType) videoType.checked = true;
+        }
+        if (source === 'round_robin') {
+            if (typeof switchMode === 'function') switchMode('script');
+        }
+        updateProviderFallbackVisibility();
+        updatePrimaryButtonText();
+    }
+
+    document.getElementById('source-select')?.addEventListener('change', onSourceOrAutoVideoChange);
+    document.querySelectorAll('input[name="auto_video"]').forEach(input => {
+        input.addEventListener('change', onSourceOrAutoVideoChange);
     });
 
     function updateProviderFallbackVisibility() {
         const wrap = document.getElementById('provider-fallback-wrap');
         const roundRobinNote = document.getElementById('round-robin-note');
         const mixkitNote = document.getElementById('mixkit-note');
-        const source = document.querySelector('input[name="source"]:checked')?.value;
+        const source = getSelectedSource();
         const stock = source === 'mixkit' || source === 'pexels' || source === 'pixabay' || source === 'coverr';
         if (wrap) wrap.style.display = stock ? '' : 'none';
         if (roundRobinNote) roundRobinNote.style.display = source === 'round_robin' ? '' : 'none';
@@ -830,7 +845,7 @@ document.addEventListener('DOMContentLoaded', () => {
                             .map(s => s.value.trim())
                             .filter(s => s !== "");
 
-        const source = document.querySelector('input[name="source"]:checked').value;
+        const source = getSelectedSource();
         const mediaType = document.querySelector('input[name="media_type"]:checked').value;
         const vibe = document.querySelector('input[name="vibe"]:checked').value;
         const count = parseInt(countInput.value);
@@ -872,26 +887,6 @@ document.addEventListener('DOMContentLoaded', () => {
         if (ytUpload && !publishConfirmed) {
             showToast('YouTube publishing requires the confirmation checkbox.', 'error');
             return;
-        }
-
-        if (source === 'piapi') {
-            const piapiKey = (keys.piapi_key || '').trim();
-            if (!piapiKey || piapiKey.startsWith('r8_')) {
-                showApiSettings();
-                showToast('Add a PiAPI key from https://app.piapi.ai/ (not a Replicate r8_ token)', 'error');
-                return;
-            }
-        }
-
-        let piapiConfirmed = false;
-        if (source === 'piapi') {
-            piapiConfirmed = window.confirm(
-                'PiAPI is a paid service. VUZA will create one Hailuo task for every detected script scene. Continue with this paid generation?'
-            );
-            if (!piapiConfirmed) {
-                showToast('PiAPI generation cancelled before any paid task was created', 'error');
-                return;
-            }
         }
 
         if (currentMode === 'script' && source !== 'local' && !keys.llm_key) {
@@ -943,15 +938,16 @@ document.addEventListener('DOMContentLoaded', () => {
                         voice_rate: numVal('voice-rate', 100) / 100,
                         video_count: numVal('video-count', 1),
                         subtitle_position: document.getElementById('subtitle-position')?.value || 'bottom',
-                        font_size: numVal('font-size', 60),
+                        subtitle_custom_position: Number(document.getElementById('subtitle-custom-position')?.value || 70),
+                        font_name: document.getElementById('caption-font')?.value || 'BeVietnamPro-Bold.ttf',
+                        font_size: numVal('font-size', 52),
                         text_fore_color: document.getElementById('text-fore-color')?.value || '#FFFFFF',
                         stroke_color: document.getElementById('stroke-color')?.value || '#000000',
-                        stroke_width: numVal('stroke-width', 1.5),
+                        stroke_width: numVal('stroke-width', 3),
                         subtitle_background: document.getElementById('subtitle-background')?.value || 'none',
                         transition: document.getElementById('transition-select')?.value || 'fade'
                     },
                     auto_video: autoVideo,
-                    piapi_confirmed: piapiConfirmed,
                     yt_upload: ytUpload,
                     publish_confirmed: publishConfirmed,
                     api_keys: {
@@ -961,8 +957,6 @@ document.addEventListener('DOMContentLoaded', () => {
                         pexels_key: keys.pexels_key || '',
                         pixabay_key: keys.pixabay_key || '',
                         coverr_key: keys.coverr_key || '',
-                        piapi_key: keys.piapi_key || '',
-                        piapi_model: keys.piapi_model || 'hailuo-2.3-fast',
                         yt_client_id: keys.yt_client_id || '',
                         yt_client_secret: keys.yt_client_secret || '',
                         eleven_key: keys.eleven_key || ''
@@ -1136,13 +1130,11 @@ document.addEventListener('DOMContentLoaded', () => {
         const btnText = scrapeBtn.querySelector('.btn-text');
         if (!btnText) return;
 
-        const source = document.querySelector('input[name="source"]:checked')?.value;
+        const source = getSelectedSource();
         const autoVideo = document.querySelector('input[name="auto_video"]:checked')?.value === 'true';
 
         if (currentMode === 'script') {
             btnText.textContent = autoVideo ? 'Script to video' : 'Generate assets from script';
-        } else if (source === 'piapi') {
-            btnText.textContent = autoVideo ? 'Generate AI video' : 'Generate AI clips';
         } else if (source === 'local') {
             btnText.textContent = autoVideo ? 'Local files to video' : 'Use local files';
         } else {

@@ -19,7 +19,7 @@ from app import (
     scraping_status,
 )
 from semantic_media import MediaCandidate
-from video_engine import best_crop_box, scene_visual_plan
+from video_engine import best_crop_box, scene_visual_plan, subtitle_top, resolve_font_path
 
 
 def _candidate(provider, asset_id, path):
@@ -218,6 +218,23 @@ class CropFrameTests(unittest.TestCase):
     def test_matching_aspect_keeps_full_frame(self):
         x, y, w, h = best_crop_box([], 1080, 1920, 1080, 1920)
         self.assertEqual((x, y, w, h), (0, 0, 1080, 1920))
+
+
+class CaptionLayoutTests(unittest.TestCase):
+    def test_custom_position_is_percent_from_top(self):
+        y = subtitle_top(1000, 100, "custom", 70)
+        self.assertAlmostEqual(y, 650, delta=1)
+
+    def test_bottom_sits_in_lower_third(self):
+        y = subtitle_top(1920, 120, "bottom", 70)
+        self.assertGreater(y, 1920 * 0.6)
+        self.assertLess(y, 1920 - 120)
+
+    def test_default_caption_font_resolves_from_project_static_fonts(self):
+        path = resolve_font_path("BeVietnamPro-Bold.ttf")
+        self.assertTrue(path)
+        self.assertIn("static", path.replace("\\", "/").lower())
+        self.assertTrue(path.endswith("BeVietnamPro-Bold.ttf"))
 
 
 class StatusReviewStateTests(unittest.TestCase):

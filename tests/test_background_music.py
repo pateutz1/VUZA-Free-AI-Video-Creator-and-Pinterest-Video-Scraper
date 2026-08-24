@@ -37,7 +37,7 @@ from app import (
     validate_script_keyword_key,
 )
 import app as app_module
-from aesthetic_scraper import CoverrScraper, PiAPIScraper, LLMProcessor, LLM_PROVIDER_PRESETS, is_hd_resolution, matches_video_aspect
+from aesthetic_scraper import CoverrScraper, LLMProcessor, LLM_PROVIDER_PRESETS, is_hd_resolution, matches_video_aspect
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -291,11 +291,11 @@ class SourceContractTests(unittest.TestCase):
         self.assertNotIn("seedream_url", ApiKeys.model_fields)
         self.assertNotIn("seedream_model", ApiKeys.model_fields)
         self.assertIn("coverr_key", ApiKeys.model_fields)
-        self.assertIn("piapi_key", ApiKeys.model_fields)
-        self.assertIn("piapi_model", ApiKeys.model_fields)
+        self.assertNotIn("piapi_key", ApiKeys.model_fields)
+        self.assertNotIn("piapi_model", ApiKeys.model_fields)
 
     def test_valid_sources_exclude_ai(self):
-        self.assertEqual(VALID_SOURCES, {"pinterest", "pexels", "pixabay", "coverr", "mixkit", "piapi", "local", "round_robin"})
+        self.assertEqual(VALID_SOURCES, {"pinterest", "pexels", "pixabay", "coverr", "mixkit", "local", "round_robin"})
         self.assertNotIn("ai", VALID_SOURCES)
 
     def test_api_scrape_rejects_ai_source_with_english_detail(self):
@@ -312,19 +312,19 @@ class SourceContractTests(unittest.TestCase):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         js = (ROOT / "static" / "script.js").read_text(encoding="utf-8")
         self.assertIn('id="script"', html)
-        self.assertIn('id="src-mixkit"', html)
-        self.assertIn("checked", html.split('id="src-mixkit"', 1)[1][:80])
+        self.assertIn('id="source-select"', html)
+        self.assertIn('value="mixkit" selected', html)
         self.assertNotIn('id="src-pinterest"', html)
         self.assertNotIn("src-ai", html)
         self.assertNotIn("seedream", html.lower())
         self.assertIn("getElementById('script')", js)
         self.assertNotIn("src-ai", js)
-        self.assertIn("src-mixkit", js)
+        self.assertIn("getSelectedSource", js)
         self.assertNotIn("src-pinterest", js)
-        self.assertIn('id="src-piapi"', html)
-        self.assertIn("PiAPI is paid", html)
-        self.assertIn("window.confirm", js)
-        self.assertIn("piapi_confirmed: piapiConfirmed", js)
+        self.assertNotIn('id="src-piapi"', html)
+        self.assertNotIn("PiAPI", html)
+        self.assertNotIn("src-piapi", js)
+        self.assertNotIn("piapi_confirmed", js)
         self.assertIn('id="keywords-input"', html)
         self.assertIn('id="regenerate-keywords-btn"', html)
         self.assertIn("/api/generate_keywords", js)
@@ -888,87 +888,6 @@ class PathSafetyAndMediaTests(unittest.TestCase):
             download.assert_called()
             self.assertIsInstance(files, list)
 
-    def test_piapi_requires_api_key(self):
-        request = ScrapeRequest(source="piapi", mode="single", query="gym squat", auto_video=False)
-        with self.assertRaisesRegex(RuntimeError, "PiAPI source requires an API key"):
-            validate_request_api_dependencies(request)
-
-    def test_piapi_requires_explicit_paid_confirmation(self):
-        request = ScrapeRequest(
-            source="piapi", mode="single", query="gym squat", auto_video=False,
-            api_keys=ApiKeys(piapi_key="pi_test"),
-        )
-        with self.assertRaisesRegex(RuntimeError, "paid.*explicit confirmation"):
-            validate_request_api_dependencies(request)
-
-        request.piapi_confirmed = True
-        validate_request_api_dependencies(request)
-
-    def test_piapi_search_is_mocked_http(self):
-        created = Mock()
-        created.status_code = 200
-        created.json.return_value = {
-            "code": 200,
-            "data": {"task_id": "t1", "status": "pending"},
-        }
-        done = Mock()
-        done.status_code = 200
-        done.json.return_value = {
-            "code": 200,
-            "data": {
-                "task_id": "t1",
-                "status": "Completed",
-                "output": {"video_url": "https://example.test/gen.mp4"},
-            },
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            scraper = PiAPIScraper(output_dir=tmp, api_key="pi_test", model="kling-2.5")
-            with patch("requests.post", return_value=created), \
-                 patch("requests.get", return_value=done), \
-                 patch("time.sleep"):
-                def fake_download(url, dest):
-                    Path(dest).parent.mkdir(parents=True, exist_ok=True)
-                    Path(dest).write_bytes(b"x" * 50000)
-                    return True
-                with patch.object(scraper, "download_file", side_effect=fake_download):
-                    files = asyncio.run(scraper.search_videos("gym squat", num_videos=1, aspect="9:16"))
-            self.assertEqual(len(files), 1)
-            self.assertTrue(files[0].endswith(".mp4"))
-
-    def test_piapi_kling_spec_and_retry(self):
-        scraper = PiAPIScraper(output_dir=".", api_key="pi_test", model="kling-2.1-pro")
-        self.assertEqual(scraper._kling_spec(), ("2.1", "pro"))
-        hailuo = PiAPIScraper(output_dir=".", api_key="pi_test", model="hailuo-2.3-fast")
-        body = hailuo._task_body("gym squat", "9:16", "video")
-        self.assertEqual(body["model"], "hailuo")
-        self.assertEqual(body["input"]["model"], "v2.3-fast")
-        self.assertEqual(body["input"]["duration"], 6)
-        self.assertEqual(body["input"]["resolution"], 768)
-        self.assertTrue(body["input"]["expand_prompt"])
-        self.assertEqual(body["config"], {"service_mode": "public"})
-        self.assertEqual(hailuo._output_urls({"video": "https://example.test/h.mp4"}), ["https://example.test/h.mp4"])
-        limited = Mock()
-        limited.status_code = 429
-        limited.headers = {"Retry-After": "1"}
-        limited.json.return_value = {"message": "throttled"}
-        ok = Mock()
-        ok.status_code = 200
-        ok.json.return_value = {"code": 200, "data": {"task_id": "t1", "status": "pending"}}
-        with patch("requests.post", side_effect=[limited, ok]), patch("time.sleep"):
-            data = scraper._create_task({"model": "kling", "task_type": "video_generation", "input": {}})
-        self.assertEqual(data["task_id"], "t1")
-
-    def test_piapi_failed_task_preserves_upstream_diagnostics(self):
-        scraper = PiAPIScraper(output_dir=".", api_key="pi_test", model="hailuo-2.3-fast")
-        failed = {
-            "task_id": "t-failed",
-            "status": "failed",
-            "error": {"message": "invalid request", "raw_message": "unsupported resolution"},
-            "detail": "upstream rejected input",
-        }
-        with self.assertRaisesRegex(RuntimeError, "unsupported resolution"):
-            scraper._wait(failed)
-
     def test_generated_script_removes_model_chatter(self):
         content = "I can’t create videos, but I can help you craft a script for one!\nHere’s a high-retention spoken video script:\nNeon rain covers the city."
         self.assertEqual(
@@ -976,17 +895,10 @@ class PathSafetyAndMediaTests(unittest.TestCase):
             "Neon rain covers the city.",
         )
 
-    def test_piapi_402_is_fatal(self):
-        self.assertTrue(is_fatal_scene_media_error("PiAPI HTTP 402: no credit."))
-        self.assertTrue(is_fatal_scene_media_error("PiAPI HTTP 401: API key rejected."))
-        self.assertFalse(is_fatal_scene_media_error("PiAPI HTTP 429: throttled"))
-        self.assertEqual(PiAPIScraper._clean_key('  Bearer abc  '), "abc")
-        request = ScrapeRequest(
-            source="piapi", mode="single", query="gym squat", auto_video=False,
-            api_keys=ApiKeys(piapi_key="r8_old_replicate"),
-        )
-        with self.assertRaisesRegex(RuntimeError, "Replicate token"):
-            validate_request_api_dependencies(request)
+    def test_http_401_402_is_fatal(self):
+        self.assertTrue(is_fatal_scene_media_error("HTTP 402: no credit."))
+        self.assertTrue(is_fatal_scene_media_error("HTTP 401: API key rejected."))
+        self.assertFalse(is_fatal_scene_media_error("HTTP 429: throttled"))
 
     def test_aspect_and_hd_helpers(self):
         self.assertTrue(matches_video_aspect(1080, 1920, "9:16"))
@@ -1023,22 +935,6 @@ class CliTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as raised:
             main(["--help"])
         self.assertEqual(raised.exception.code, 0)
-
-    def test_cli_piapi_requires_and_forwards_explicit_confirmation(self):
-        from cli import build_request, parse_args
-        args = parse_args([
-            "--source", "piapi",
-            "--media-type", "video",
-            "--script", "A runner crosses a neon city.",
-            "--llm-key", "sk-test",
-            "--piapi-key", "pi-test",
-            "--piapi-model", "hailuo-2.3",
-            "--piapi-confirmed",
-        ])
-        request = build_request(args)
-        self.assertTrue(request.piapi_confirmed)
-        self.assertEqual(request.api_keys.piapi_key, "pi-test")
-        self.assertEqual(request.api_keys.piapi_model, "hailuo-2.3")
 
 
 if __name__ == "__main__":

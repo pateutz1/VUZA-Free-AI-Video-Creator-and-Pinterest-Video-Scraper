@@ -125,6 +125,7 @@ class ProviderFilterTests(unittest.TestCase):
             items = scraper.find_videos("red planet rover", aspect="9:16", min_duration=2)
         self.assertIn("video_type=all", captured["url"])
         self.assertIn("per_page=50", captured["url"])
+        self.assertIn("orientation=vertical", captured["url"])
         self.assertEqual([item["asset_id"] for item in items], ["10"])
         self.assertEqual(items[0]["rendition"]["id"], "large")
 
@@ -154,7 +155,34 @@ class ProviderFilterTests(unittest.TestCase):
         self.assertEqual(items[0]["query"], "gym transformation")
         self.assertEqual(items[0]["asset_id"], "123")
 
-    def test_coverr_uses_popular_sort_and_keeps_landscape(self):
+    def test_mixkit_skips_landscape_when_portrait_requested(self):
+        scraper = MixkitScraper(output_dir=tempfile.mkdtemp())
+        hit = '<script type="application/ld+json">' + json.dumps({
+            "@graph": [
+                {
+                    "@type": "VideoObject",
+                    "contentUrl": "https://assets.mixkit.co/videos/111/111-720.mp4",
+                    "duration": "PT8S",
+                    "name": "Wide lift",
+                    "width": 1920,
+                    "height": 1080,
+                },
+                {
+                    "@type": "VideoObject",
+                    "contentUrl": "https://assets.mixkit.co/videos/222/222-720.mp4",
+                    "duration": "PT8S",
+                    "name": "Portrait lift",
+                    "width": 1080,
+                    "height": 1920,
+                },
+            ]
+        }) + "</script>"
+
+        with patch.object(scraper, "_fetch", return_value=hit):
+            items = scraper.find_videos("gym lifting weights", aspect="9:16", min_duration=2)
+        self.assertEqual([item["asset_id"] for item in items], ["222"])
+
+    def test_coverr_uses_popular_sort_and_keeps_matching_aspect(self):
         scraper = CoverrScraper(output_dir=tempfile.mkdtemp(), api_key="cv-test")
         captured = {}
 
@@ -180,7 +208,7 @@ class ProviderFilterTests(unittest.TestCase):
         self.assertIn("sort=popular", captured["url"])
         self.assertIn("urls=true", captured["url"])
         self.assertNotIn("is_vertical", captured["url"])
-        self.assertEqual([item["asset_id"] for item in items], ["ok", "wide"])
+        self.assertEqual([item["asset_id"] for item in items], ["ok"])
         self.assertTrue(items[0]["url"])
 
     def test_coverr_retries_shorter_query_when_empty(self):

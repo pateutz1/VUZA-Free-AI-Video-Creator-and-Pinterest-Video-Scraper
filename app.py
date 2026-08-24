@@ -25,7 +25,7 @@ for stream in (sys.stdout, sys.stderr):
 # Built by Ali R. | github.com/AliRash3ed
 # ═══════════════════════════════════════════════════════════════
 
-from aesthetic_scraper import PinterestScraper, PexelsScraper, PixabayScraper, CoverrScraper, MixkitScraper, PiAPIScraper, LLMProcessor, WebScraper, LLM_PROVIDER_PRESETS, pinterest_mp4_urls, pinterest_pin_page, download_pinterest_with_ytdlp, mixkit_music_tracks, MIXKIT_MUSIC_MOODS
+from aesthetic_scraper import PinterestScraper, PexelsScraper, PixabayScraper, CoverrScraper, MixkitScraper, LLMProcessor, WebScraper, LLM_PROVIDER_PRESETS, pinterest_mp4_urls, pinterest_pin_page, download_pinterest_with_ytdlp, mixkit_music_tracks, MIXKIT_MUSIC_MOODS
 from media_quality import content_fingerprint, delete_rejected_file, download_http, last_download_error, redact_secret, reset_download_fail_logs, validate_downloaded_video, MIN_VIDEO_BYTES
 from semantic_media import (
     CoverageError,
@@ -47,6 +47,7 @@ from semantic_media import (
     rank_scene_candidates,
     interleave_candidates_by_query,
     interleave_candidates_by_provider,
+    matches_orientation,
     search_with_cache,
     selected_record,
     unique_usable_duration,
@@ -99,11 +100,13 @@ class VideoSettings(BaseModel):
     voice_rate: float = Field(default=1.0, ge=0.5, le=2.0)
     video_count: int = Field(default=1, ge=1, le=5)
     subtitle_position: str = "bottom"
-    font_size: int = Field(default=60, ge=24, le=160)
+    font_size: int = Field(default=52, ge=24, le=160)
+    font_name: str = "BeVietnamPro-Bold.ttf"
     text_fore_color: str = "#FFFFFF"
     stroke_color: str = "#000000"
-    stroke_width: float = Field(default=1.5, ge=0.0, le=12.0)
+    stroke_width: float = Field(default=3.0, ge=0.0, le=12.0)
     subtitle_background: str = "none"
+    subtitle_custom_position: float = Field(default=70.0, ge=0.0, le=100.0)
     transition: str = "fade"
 
 class ApiKeys(BaseModel):
@@ -113,8 +116,6 @@ class ApiKeys(BaseModel):
     pexels_key: str = ""
     pixabay_key: str = ""
     coverr_key: str = ""
-    piapi_key: str = ""
-    piapi_model: str = "hailuo-2.3-fast"
     yt_client_id: str = ""
     yt_client_secret: str = ""
     eleven_key: str = ""
@@ -130,7 +131,6 @@ class ScrapeRequest(BaseModel):
     vibe: str = "aesthetic"
     video_settings: Optional[VideoSettings] = None
     auto_video: bool = True
-    piapi_confirmed: bool = False
     yt_upload: bool = False
     publish_confirmed: bool = False
     local_files: Optional[List[str]] = None
@@ -176,7 +176,7 @@ LLM_PROVIDER_MODELS = {
     "oneapi": ["gpt-4o-mini", "deepseek-chat"],
 }
 
-VALID_SOURCES = {"pinterest", "pexels", "pixabay", "coverr", "mixkit", "piapi", "local", "round_robin"}
+VALID_SOURCES = {"pinterest", "pexels", "pixabay", "coverr", "mixkit", "local", "round_robin"}
 VALID_MEDIA_TYPES = {"photo", "video"}
 VALID_MODES = {"single", "script"}
 VALID_TRANSITIONS = {"none", "fade", "zoom_in", "zoom_out", "slide"}
@@ -565,12 +565,6 @@ def make_scraper(src, output_dir, api_keys=None):
     if src == "pexels": return PexelsScraper(output_dir=output_dir, api_key=keys.pexels_key)
     if src == "pixabay": return PixabayScraper(output_dir=output_dir, api_key=keys.pixabay_key)
     if src == "coverr": return CoverrScraper(output_dir=output_dir, api_key=keys.coverr_key)
-    if src == "piapi":
-        return PiAPIScraper(
-            output_dir=output_dir,
-            api_key=keys.piapi_key,
-            model=keys.piapi_model or "hailuo-2.3-fast",
-        )
     return None
 
 def load_video_engine():
@@ -610,7 +604,7 @@ def normalize_scrape_request_options(request):
 def validate_scrape_request_options(request):
     normalize_scrape_request_options(request)
     if request.source not in VALID_SOURCES:
-        raise RuntimeError(f"Invalid media source: {request.source}. Choose mixkit, pexels, pixabay, coverr, pinterest, piapi, local, or round_robin.")
+        raise RuntimeError(f"Invalid media source: {request.source}. Choose mixkit, pexels, pixabay, coverr, pinterest, local, or round_robin.")
     if request.source == "round_robin" and not (request.mode == "script" and request.media_type == "video"):
         raise RuntimeError("Round-Robin requires script mode and video media type (it searches Mixkit, Pexels, Pixabay, and Coverr together per scene).")
     if request.media_type not in VALID_MEDIA_TYPES:
@@ -644,19 +638,10 @@ def validate_script_keyword_key(request):
         return
     api_keys = request.api_keys or ApiKeys()
     if not (api_keys.llm_key or "").strip():
-        raise RuntimeError("Script mode with Pinterest/Pexels/Pixabay/Coverr/PiAPI requires an AI text API key to split narration into search keywords.")
+        raise RuntimeError("Script mode with Pinterest/Pexels/Pixabay/Coverr requires an AI text API key to split narration into search keywords.")
 
 def validate_request_api_dependencies(request):
     validate_script_keyword_key(request)
-    if request.source == "piapi":
-        api_keys = request.api_keys or ApiKeys()
-        key = PiAPIScraper._clean_key(api_keys.piapi_key)
-        if not key:
-            raise RuntimeError("PiAPI source requires an API key. Add it in API settings: https://app.piapi.ai/")
-        if key.lower().startswith("r8_"):
-            raise RuntimeError("PiAPI HTTP 401: this looks like a Replicate token (r8_...). Create a PiAPI key at https://app.piapi.ai/")
-        if not request.piapi_confirmed:
-            raise RuntimeError("PiAPI generation is paid and requires explicit confirmation for this run.")
 
 def local_script_segments(script):
     """Split a Chinese narration script into stable scene rows without calling an LLM."""
@@ -1024,19 +1009,6 @@ async def universal_search(keyword, media_type, count, primary_source, project_p
     if primary_source == "local":
         return [str(path) for path in (local_files or [])]
 
-    if primary_source == "piapi":
-        scraper = make_scraper("piapi", project_path, api_keys)
-        prompt = (sentence or keyword or "").strip()
-        kind = "photo" if media_type == "photo" else "video"
-        if kind == "video":
-            res = await scraper.search_videos(prompt, num_videos=1, aspect=aspect)
-        else:
-            res = await scraper.search_images(prompt, num_images=1)
-        picked = pick_unique_media(res, seen_hashes, sentence=sentence, keyword=keyword, limit=1)
-        if picked:
-            print(f"  ✅ [piapi] kept {len(picked)} generated clip(s)")
-        return picked
-
     keywords = stock_keyword_variants(keyword)
     seen_hashes = seen_hashes if seen_hashes is not None else set()
     providers = stock_fallback_providers(primary_source, enable_fallback)
@@ -1251,7 +1223,7 @@ def candidate_from_dict(item, scene_index, query):
     )
 
 
-async def download_stock_candidate(candidate, project_path, source, probe=None, fetcher=None):
+async def download_stock_candidate(candidate, project_path, source, probe=None, fetcher=None, aspect="9:16"):
     folder = Path(project_path) / source / re.sub(r"[^\w\-]", "_", candidate.query or "scene")[:25]
     folder.mkdir(parents=True, exist_ok=True)
     prefix = {"pexels": "vid", "pixabay": "v", "coverr": "c", "mixkit": "mk"}.get(source, "vid")
@@ -1301,6 +1273,9 @@ async def download_stock_candidate(candidate, project_path, source, probe=None, 
             candidate.width = candidate.width or int(info.get("width") or 0)
             candidate.height = candidate.height or int(info.get("height") or 0)
             candidate.quality = f"ok fps={info.get('fps')}"
+        if aspect != "1:1" and candidate.width and candidate.height and not matches_orientation(candidate.width, candidate.height, aspect):
+            delete_rejected_file(path, newly_downloaded=not existed)
+            return None, "wrong aspect"
         try:
             candidate.fingerprint = content_fingerprint(path)
         except OSError:
@@ -1427,6 +1402,14 @@ async def collect_stock_videos(
         if candidate.provider != "pinterest" and candidate.duration and candidate.duration < clip_duration:
             rejection_log[scene_index].append({"asset_id": candidate.asset_id, "reason": "too short"})
             return False
+        if (
+            aspect != "1:1"
+            and candidate.width
+            and candidate.height
+            and not matches_orientation(candidate.width, candidate.height, aspect)
+        ):
+            rejection_log[scene_index].append({"asset_id": candidate.asset_id, "reason": "wrong aspect"})
+            return False
         return True
 
     groups = []
@@ -1494,7 +1477,7 @@ async def collect_stock_videos(
                 path, reason = await downloader(candidate, project_path, effective_provider, probe)
             else:
                 path, reason = await download_stock_candidate(
-                    candidate, project_path, effective_provider, probe, fetcher=fetchers.get(effective_provider)
+                    candidate, project_path, effective_provider, probe, fetcher=fetchers.get(effective_provider), aspect=aspect
                 )
             if path:
                 print(f"  ✅ kept {Path(path).name}")
@@ -1982,7 +1965,7 @@ async def run_scrape(request: ScrapeRequest):
                         except Exception as exc:
                             item["_error"] = describe_scene_media_error(exc)
                             print(f"  ❌ Scene media failed ({item['keyword']}): {item['_error']}")
-                            if source == "piapi" or is_fatal_scene_media_error(item["_error"]):
+                            if is_fatal_scene_media_error(item["_error"]):
                                 raise RuntimeError(item["_error"])
                             set_status(progress=((script_idx) / len(scripts)) * 100 + ((idx + 1) / total) * (100 / len(scripts)) * 0.8)
                             continue

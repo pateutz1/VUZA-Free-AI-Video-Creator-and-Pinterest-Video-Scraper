@@ -375,15 +375,26 @@ def apply_user_keywords(grouped, keywords, topic=""):
         cleaned.append(keyword)
     if not cleaned or not grouped:
         return None
-    primary, alts = cleaned[0], cleaned[1:]
-    return [
-        {
-            "sentence": item.get("sentence") or "",
+
+    def overlap(keyword, sentence):
+        words = set(re.findall(r"[a-zA-Z]{3,}", (sentence or "").lower()))
+        keys = set(re.findall(r"[a-zA-Z]{3,}", (keyword or "").lower()))
+        return len(words & keys)
+
+    used = set()
+    mapped = []
+    for item in grouped:
+        sentence = item.get("sentence") or ""
+        unused = [keyword for keyword in cleaned if keyword.lower() not in used]
+        pool = unused or cleaned
+        primary = max(pool, key=lambda keyword: (overlap(keyword, sentence), -cleaned.index(keyword)))
+        used.add(primary.lower())
+        mapped.append({
+            "sentence": sentence,
             "keyword": primary,
-            "_alts": alts,
-        }
-        for item in grouped
-    ]
+            "_alts": [keyword for keyword in cleaned if keyword.lower() != primary.lower()],
+        })
+    return mapped
 
 
 def keywords_from_topic_and_script(llm, topic, script, vibe, language, count, clip_duration):

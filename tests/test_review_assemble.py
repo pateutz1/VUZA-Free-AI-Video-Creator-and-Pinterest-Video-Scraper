@@ -19,7 +19,7 @@ from app import (
     scraping_status,
 )
 from semantic_media import MediaCandidate
-from video_engine import scene_visual_plan
+from video_engine import best_crop_box, scene_visual_plan
 
 
 def _candidate(provider, asset_id, path):
@@ -203,6 +203,21 @@ class ShortLastSceneMergeTests(unittest.TestCase):
         grouped = group_scenes_to_clip_budget(rows, count=3, clip_duration=5)
         self.assertEqual(len(grouped), 1)
         self.assertIn("Smash that like button", grouped[0]["sentence"])
+
+
+class CropFrameTests(unittest.TestCase):
+    def test_landscape_to_portrait_follows_subject_on_the_right(self):
+        import numpy as np
+        frame = np.full((108, 192, 3), 40, dtype="uint8")
+        frame[:, 140:190] = (200, 160, 120)
+        frame[:, 150:180:2] = (240, 220, 200)
+        x, y, w, h = best_crop_box([frame], 192, 108, 9, 16)
+        self.assertEqual(y, 0)
+        self.assertGreater(x, 70)
+
+    def test_matching_aspect_keeps_full_frame(self):
+        x, y, w, h = best_crop_box([], 1080, 1920, 1080, 1920)
+        self.assertEqual((x, y, w, h), (0, 0, 1080, 1920))
 
 
 class StatusReviewStateTests(unittest.TestCase):

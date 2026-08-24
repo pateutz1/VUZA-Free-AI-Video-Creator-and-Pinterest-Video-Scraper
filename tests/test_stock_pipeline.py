@@ -855,15 +855,32 @@ class KeywordParseHookTests(unittest.TestCase):
             "gym, fitness, motivation",
         )
         self.assertEqual(mapped[0]["keyword"], "gym motivation workout")
-        self.assertEqual(mapped[1]["keyword"], "gym motivation workout")
+        self.assertEqual(mapped[1]["keyword"], "gym dedication challenge")
         self.assertEqual(
             mapped[0]["_alts"],
             ["gym dedication challenge", "gym fitness", "gym"],
         )
         self.assertEqual(
+            mapped[1]["_alts"],
+            ["gym motivation workout", "gym fitness", "gym"],
+        )
+        self.assertEqual(
             stock_query_plan(mapped),
             ["gym motivation workout", "gym dedication challenge", "gym fitness", "gym"],
         )
+
+    def test_apply_user_keywords_matches_scene_words_not_first_keyword(self):
+        grouped = [
+            {"sentence": "Every time you step into the gym, you're not just lifting weights."},
+            {"sentence": "Every drop of sweat is a step closer to the best version of you."},
+        ]
+        mapped = apply_user_keywords(
+            grouped,
+            ["gym weights lifting", "gym fitness", "gym sweat dropping", "gym"],
+            "gym",
+        )
+        self.assertEqual(mapped[0]["keyword"], "gym weights lifting")
+        self.assertEqual(mapped[1]["keyword"], "gym sweat dropping")
 
     def test_keywords_from_topic_always_four_longest_first(self):
         class FakeLLM:

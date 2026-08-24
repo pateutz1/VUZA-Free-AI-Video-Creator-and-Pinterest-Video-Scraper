@@ -136,15 +136,81 @@ def apply_glitch(clip, duration):
     """Simulates a glitch effect by random shifting."""
     return clip
 
-def crop_center(clip, w, h):
+def crop_window_score(frames, x1, y1, x2, y2):
+    import numpy as np
+    total = 0.0
+    prev = None
+    for frame in frames or []:
+        if frame is None:
+            continue
+        region = frame[y1:y2, x1:x2]
+        if region.size == 0:
+            continue
+        small = region[::4, ::4]
+        gray = small.mean(axis=2) if small.ndim == 3 else small.astype("float32")
+        gx = float(np.abs(np.diff(gray, axis=1)).mean()) if gray.shape[1] > 1 else 0.0
+        gy = float(np.abs(np.diff(gray, axis=0)).mean()) if gray.shape[0] > 1 else 0.0
+        score = float(gray.std()) + gx * 2 + gy
+        if prev is not None and prev.shape == small.shape:
+            score += float(np.abs(small.astype("int16") - prev.astype("int16")).mean()) * 3
+        prev = small
+        total += score
+    return total
+
+
+def best_crop_box(frames, src_w, src_h, target_w, target_h, steps=7):
+    src_w, src_h = int(src_w), int(src_h)
+    target_w, target_h = max(1, int(target_w)), max(1, int(target_h))
+    if src_w < 2 or src_h < 2:
+        return 0, 0, max(1, src_w), max(1, src_h)
+    src_aspect = src_w / src_h
+    target_aspect = target_w / target_h
+    if abs(src_aspect - target_aspect) < 0.03:
+        return 0, 0, src_w, src_h
+    usable = [frame for frame in (frames or []) if frame is not None]
+    if src_aspect > target_aspect:
+        win_w = max(1, min(src_w, int(round(src_h * target_aspect))))
+        max_x = max(0, src_w - win_w)
+        if not usable:
+            return max_x // 2, 0, win_w, src_h
+        best_x, best_s = max_x // 2, -1.0
+        for i in range(max(2, steps)):
+            x = 0 if max_x == 0 else int(round(max_x * i / (steps - 1)))
+            score = crop_window_score(usable, x, 0, x + win_w, src_h)
+            if score > best_s:
+                best_s, best_x = score, x
+        return best_x, 0, win_w, src_h
+    win_h = max(1, min(src_h, int(round(src_w / target_aspect))))
+    max_y = max(0, src_h - win_h)
+    if not usable:
+        return 0, max_y // 2, src_w, win_h
+    best_y, best_s = max_y // 2, -1.0
+    for i in range(max(2, steps)):
+        y = 0 if max_y == 0 else int(round(max_y * i / (steps - 1)))
+        score = crop_window_score(usable, 0, y, src_w, y + win_h)
+        if score > best_s:
+            best_s, best_y = score, y
+    return 0, best_y, src_w, win_h
+
+
+def crop_to_frame(clip, w, h):
     cw, ch = clip.size
-    if cw / ch > w / h:
-        new_w = int(ch * w / h)
-        clip = clip.cropped(x1=int((cw - new_w) / 2), width=new_w)
-    else:
-        new_h = int(cw * h / w)
-        clip = clip.cropped(y1=int((ch - new_h) / 2), height=new_h)
-    return clip.resized((w, h))
+    if abs((cw / max(ch, 1)) - (w / max(h, 1))) < 0.03:
+        return clip.resized((w, h))
+    frames = []
+    duration = float(getattr(clip, "duration", 0) or 0)
+    times = [0.0] if duration <= 0.05 else [duration * t for t in (0.2, 0.5, 0.8)]
+    for t in times:
+        try:
+            frames.append(clip.get_frame(min(max(t, 0.0), max(duration - 0.02, 0.0))))
+        except Exception:
+            continue
+    x, y, nw, nh = best_crop_box(frames, cw, ch, w, h)
+    return clip.cropped(x1=x, y1=y, width=nw, height=nh).resized((w, h))
+
+
+def crop_center(clip, w, h):
+    return crop_to_frame(clip, w, h)
 
 def clip_is_unusable(clip):
     if clip is None or getattr(clip, "duration", 0) < 1.15:
@@ -414,13 +480,13 @@ class VideoEngine:
                         else:
                             clip.close()
                             return None
-                        return crop_center(clip.resized(height=h), w, h)
+                        return crop_to_frame(clip, w, h)
 
-                    clip = ImageClip(file_path).with_duration(clip_duration).resized(height=h)
+                    clip = ImageClip(file_path).with_duration(clip_duration)
                     if frame_is_unusable(clip.get_frame(0)):
                         clip.close()
                         return None
-                    return crop_center(apply_ken_burns(clip, clip_duration), w, h)
+                    return crop_to_frame(apply_ken_burns(clip, clip_duration), w, h)
                 except Exception as exc:
                     print(f"⚠️ Skip clip {file_path}: {exc}")
                     return None

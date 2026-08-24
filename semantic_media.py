@@ -36,6 +36,7 @@ class MediaCandidate:
     url: str = ""
     source_page: str = ""
     creator: str = ""
+    title: str = ""
     query: str = ""
     scene_index: int = 0
     duration: float = 0.0
@@ -130,6 +131,14 @@ ABSTRACT_TOPIC_WORDS = {
     "success", "confidence", "hustle", "dopamine", "regret", "legend",
 }
 
+UNREALISTIC_PIN_RE = re.compile(
+    r"\b(anatomy|anatomical|3d|cgi|animation|animated|infographic|tutorial|"
+    r"how to|form check|diagram|kinesiology|split screen|comparison|"
+    r"explained|muscle map|muscle highlight|correct form|incorrect|"
+    r"mannequin|wireframe)\b",
+    re.I,
+)
+
 
 def topic_anchor_words(topic):
     words = [
@@ -194,6 +203,22 @@ def stock_query_plan(keyword_data):
     return queries
 
 
+def is_visual_stock_query(query, topic=""):
+    words = [word.lower() for word in normalize_stock_query(query).split() if word]
+    if not words:
+        return False
+    anchors = set(topic_anchor_words(topic))
+    abstract_hit = any(word in ABSTRACT_TOPIC_WORDS for word in words)
+    visual = [word for word in words if word not in ABSTRACT_TOPIC_WORDS]
+    if abstract_hit and visual and all(word in anchors for word in visual):
+        return False
+    return bool(visual)
+
+
+def visual_query_plan(keyword_data, topic=""):
+    return stock_query_plan(keyword_data)
+
+
 def fit_keyword_length(keyword, word_count, topic=""):
     n = max(1, min(4, int(word_count or 1)))
     kw = ensure_topic_anchor(keyword, topic)
@@ -238,20 +263,24 @@ def query_relevance(candidate, sentence="", keyword=""):
     stop = {"the", "and", "for", "you", "your", "are", "this", "that", "with", "from", "have", "will", "just"}
     words = {
         word.lower()
-        for word in re.findall(r"[a-zA-Z]{3,}", f"{sentence} {keyword} {candidate.query}")
+        for word in re.findall(r"[a-zA-Z]{3,}", f"{sentence} {keyword}")
         if word.lower() not in stop
     }
+    title = str(getattr(candidate, "title", "") or "")
     haystack = " ".join(
         [
-            str(candidate.asset_id),
-            candidate.query,
-            candidate.source_page,
+            title,
             candidate.creator,
-            str(candidate.rendition.get("id") or ""),
+            candidate.source_page,
         ]
     ).lower().replace("_", " ")
     overlap = sum(1 for word in words if word in haystack)
-    score = overlap * 3.0
+    if not title:
+        overlap += 0.25 * sum(1 for word in words if word in (candidate.query or "").lower())
+    score = overlap * 4.0
+    blob = f"{title} {candidate.query}".lower()
+    if UNREALISTIC_PIN_RE.search(blob):
+        score -= 16.0
     duration = float(candidate.duration or 0)
     if duration > 0:
         score += min(duration / 8.0, 2.0)
@@ -419,6 +448,7 @@ def candidate_to_cache_item(candidate: MediaCandidate):
         "asset_id": candidate.asset_id,
         "source_page": public_url(candidate.source_page) or "",
         "creator": candidate.creator,
+        "title": candidate.title,
         "duration": candidate.duration,
         "width": candidate.width,
         "height": candidate.height,
@@ -441,6 +471,7 @@ def candidate_from_cache_item(item, query="", scene_index=0):
         url=str(item.get("url") or ""),
         source_page=str(item.get("source_page") or ""),
         creator=str(item.get("creator") or ""),
+        title=str(item.get("title") or ""),
         query=query,
         scene_index=scene_index,
         duration=float(item.get("duration") or 0),

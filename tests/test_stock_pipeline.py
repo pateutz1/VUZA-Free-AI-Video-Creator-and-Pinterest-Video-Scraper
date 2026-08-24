@@ -424,6 +424,12 @@ class PinterestParseTests(unittest.TestCase):
         self.assertTrue(is_text_heavy_pin({"title": 'Follow for more "never quit"'}))
         self.assertTrue(is_text_heavy_pin({"title": "Shop now gym program"}))
         self.assertFalse(is_text_heavy_pin({"title": "barbell squat gym"}))
+        self.assertTrue(is_text_heavy_pin({"title": "3D anatomical deadlift muscles"}))
+        self.assertTrue(is_text_heavy_pin({"title": "Deadlift tutorial correct form"}))
+        self.assertTrue(is_text_heavy_pin({"title": "30 MINUTE BARBELL BURNER WORKOUT"}))
+        self.assertTrue(is_text_heavy_pin({"title": "full body kettlebell workout"}))
+        self.assertTrue(is_text_heavy_pin({"title": "Reverse lunge 3 x 10"}))
+        self.assertTrue(is_text_heavy_pin({"title": "gym session \U0001F525"}))
 
     def test_hls_only_converts_to_mp4(self):
         from aesthetic_scraper import pinterest_mp4_urls, pinterest_video_rendition

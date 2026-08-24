@@ -77,3 +77,6 @@ class MediaQualityTests(unittest.TestCase):
             for x in range(15, 75):
                 caption[y, x] = 220.0 if (x + y) % 2 == 0 else 8.0
         self.assertGreaterEqual(overlay_text_score(caption), 0.38)
+        boxed = np.full((90, 90), 40.0)
+        boxed[18:48, 4:34] = 220.0
+        self.assertGreaterEqual(overlay_text_score(boxed), 0.28)

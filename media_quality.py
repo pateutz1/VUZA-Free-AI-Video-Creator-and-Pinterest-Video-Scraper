@@ -137,15 +137,36 @@ def overlay_text_score(gray):
     width_e = min(dx.shape[1], dy.shape[1])
     edge = (dx[:height_e, :width_e] > 28) & (dy[:height_e, :width_e] > 18)
 
-    def band_frac(start, end):
-        region = edge[start:end]
+    def _parts(region):
         if region.size == 0:
-            return 0.0
-        return float((region.mean(axis=1) > 0.07).mean())
+            return []
+        width_r = region.shape[1]
+        return [
+            region,
+            region[:, : max(1, width_r // 3)],
+            region[:, width_r // 3 : 2 * width_r // 3],
+            region[:, 2 * width_r // 3 :],
+        ]
 
-    top = band_frac(0, max(1, int(height * 0.18)))
-    mid = band_frac(int(height * 0.32), int(height * 0.68))
-    bottom = band_frac(int(height * 0.70), height)
+    def band_score(y0, y1):
+        scores = []
+        edge_band = edge[y0:min(y1, edge.shape[0])]
+        for part in _parts(edge_band):
+            if part.size == 0:
+                continue
+            scores.append(float((part.mean(axis=1) > 0.06).mean()))
+        gray_band = gray[y0:min(y1, height), :width]
+        for part in _parts(gray_band):
+            if part.size == 0:
+                continue
+            bright = float((part > 200).mean())
+            if 0.08 <= bright <= 0.55:
+                scores.append(min(bright * 1.4, 1.0))
+        return max(scores) if scores else 0.0
+
+    top = band_score(0, max(1, int(height * 0.30)))
+    mid = band_score(int(height * 0.28), int(height * 0.72))
+    bottom = band_score(int(height * 0.68), height)
     return max(top, mid, bottom)
 
 
@@ -161,15 +182,18 @@ def video_has_overlay_text(path):
         duration = float(clip.duration or 0)
         if duration <= 0:
             return False
-        times = [min(max(duration * 0.35, 0), max(duration - 0.05, 0))]
+        stamps = [
+            min(max(duration * 0.05, 0), max(duration - 0.05, 0)),
+            min(max(duration * 0.35, 0), max(duration - 0.05, 0)),
+        ]
         if duration > 2:
-            times.append(min(max(duration * 0.7, 0), max(duration - 0.05, 0)))
-        for stamp in times:
+            stamps.append(min(max(duration * 0.7, 0), max(duration - 0.05, 0)))
+        for stamp in stamps:
             frame = clip.get_frame(stamp)
             if frame is None:
                 continue
             gray = np.mean(frame, axis=2)
-            if overlay_text_score(gray) >= 0.38:
+            if overlay_text_score(gray) >= 0.28:
                 return True
         return False
     except Exception:

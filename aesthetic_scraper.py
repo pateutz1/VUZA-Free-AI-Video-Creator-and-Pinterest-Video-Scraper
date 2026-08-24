@@ -42,13 +42,38 @@ PROMO_PIN_RE = re.compile(
     r"\b(follow|subscribe|shop now|link in bio|promo code|discount code|#ad|click here|tiktok|instagram)\b",
     re.I,
 )
+CAPTION_PIN_RE = re.compile(
+    r"("
+    r"\d+\s*(min(?:ute)?s?|sec(?:ond)?s?)"
+    r"|\d+\s*x\s*\d+"
+    r"|full body"
+    r"|fat burner"
+    r"|tone\s*\+"
+    r"|save this"
+    r"|try this"
+    r"|workout plan"
+    r"|workout routine"
+    r")",
+    re.I,
+)
+EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0000FE0F"
+    "]+"
+)
 
 
 def is_text_heavy_pin(item):
+    from semantic_media import UNREALISTIC_PIN_RE
     title = str((item or {}).get("title") or "")
-    if not title:
+    blob = f"{title} {str((item or {}).get('description') or '')}"
+    if not blob.strip():
         return False
-    if PROMO_PIN_RE.search(title):
+    if PROMO_PIN_RE.search(blob) or UNREALISTIC_PIN_RE.search(blob) or CAPTION_PIN_RE.search(blob):
+        return True
+    if EMOJI_RE.search(blob):
         return True
     return any(mark in title for mark in ('"', "“", "”"))
 
@@ -1432,7 +1457,8 @@ Rules:
 - Follow the exact word count written in [N words] for each line.
 - Mix 1-word, 2-word, 3-word, and 4-word queries. The 1-word query must be the topic's main visible subject (gym, not motivation).
 - Every query must be footage of the VIDEO TOPIC setting plus a visible action from the narration.
-- No slogans, emotions, body-only closeups, on-screen text, hashtags, or vibe suffixes.
+- Never use motivation, inspiration, regret, or slogans as search words.
+- No body-only closeups, on-screen text, hashtags, or vibe suffixes.
 Return format strictly: Sentence → keyword"""
         if scenes:
             stock_rules = """You will receive numbered narration scenes.
@@ -1441,6 +1467,7 @@ Rules:
 - Follow the exact word count in [N words] for that scene.
 - Mix 1-word, 2-word, 3-word, and 4-word queries. The 1-word query must be the topic's main visible subject.
 - Every query must show the VIDEO TOPIC setting (gym/workout if the topic is gym/fitness) plus a visible action from that scene.
+- Never use motivation, inspiration, regret, or slogans as search words.
 - No slogans, "person feeling", on-screen text, hashtags, or vibe suffixes.
 Return format strictly: <scene text> → keyword"""
         prompts = {

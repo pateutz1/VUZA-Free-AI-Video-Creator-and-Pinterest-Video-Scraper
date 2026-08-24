@@ -40,6 +40,7 @@ from semantic_media import (
     fallback_stock_query,
     query_broaden_chain,
     stock_query_plan,
+    visual_query_plan,
     normalize_stock_query,
     rank_scene_candidates,
     search_with_cache,
@@ -913,6 +914,7 @@ def candidate_from_dict(item, scene_index, query):
         url=str(item.get("url") or ""),
         source_page=str(item.get("source_page") or ""),
         creator=str(item.get("creator") or ""),
+        title=str(item.get("title") or ""),
         query=query,
         scene_index=scene_index,
         duration=float(item.get("duration") or 0),
@@ -991,18 +993,19 @@ async def collect_stock_videos(
     """Search selected provider, round-robin download, then enforce unique duration coverage."""
     clip_duration = max(2, min(12, float(clip_duration or 5)))
     needed = max(1, int(count or 1))
-    search_limit = max(8, min(20, needed * 4))
+    search_limit = max(12, min(24, needed * 6))
     cache = cache if cache is not None else get_search_cache()
     scraper = make_scraper(source, project_path, api_keys)
     rejection_log = {idx: [] for idx in range(len(keyword_data))}
     alt_queries = {idx: [] for idx in range(len(keyword_data))}
     seen_keys = set()
 
+    plan = visual_query_plan(keyword_data, topic)
     print("🧭 Query plan:")
-    for idx, query in enumerate(stock_query_plan(keyword_data)):
+    for idx, query in enumerate(plan or stock_query_plan(keyword_data)):
         print(f"  {idx + 1}. {query} ({len(query.split())} words)")
 
-    async def search_query(query, scene_index):
+    async def search_query(query, scene_index, broaden=True):
         if search_fn:
             raw_items = await search_fn(query, scene_index)
             items = [
@@ -1014,7 +1017,10 @@ async def collect_stock_videos(
         merged = []
         origin = "live"
         finder = getattr(scraper, "find_videos", None)
-        for variant in query_broaden_chain(query, topic):
+        chain = query_broaden_chain(query, topic) if broaden else [normalize_stock_query(query)]
+        for variant in chain:
+            if not variant:
+                continue
             if finder and inspect.iscoroutinefunction(finder):
                 try:
                     raw = await finder(variant, aspect=aspect, min_duration=clip_duration, limit=search_limit)
@@ -1049,53 +1055,61 @@ async def collect_stock_videos(
                     item.scene_index = scene_index
                     item.query = variant
                 merged.extend(items)
-            if len(merged) >= 8:
-                break
         return merged, origin
 
+    def keep_candidate(candidate, scene_index):
+        if not candidate.url or not candidate.asset_id:
+            rejection_log[scene_index].append({"asset_id": candidate.asset_id, "reason": "missing url or id"})
+            return False
+        if candidate.provider != "pinterest" and candidate.duration and candidate.duration < clip_duration:
+            rejection_log[scene_index].append({"asset_id": candidate.asset_id, "reason": "too short"})
+            return False
+        return True
+
     groups = []
-    for idx, item in enumerate(keyword_data):
-        query = item.get("keyword") or ""
-        found, origin = await search_query(query, idx)
-        ranked = rank_scene_candidates(found, sentence=item.get("sentence") or "", keyword=query)
-        unique = []
-        for candidate in ranked:
-            if not candidate.url or not candidate.asset_id:
-                rejection_log[idx].append({"asset_id": candidate.asset_id, "reason": "missing url or id"})
-                continue
-            if candidate.provider != "pinterest" and candidate.duration and candidate.duration < clip_duration:
-                rejection_log[idx].append({"asset_id": candidate.asset_id, "reason": "too short"})
-                continue
-            unique.append(candidate)
-        unique = dedupe_candidates(unique, seen_keys)
-        if len(unique) < 8 and not search_fn:
-            for alt in item.get("_alts") or []:
-                extra, extra_origin = await search_query(alt, idx)
-                extra_kept = []
-                for candidate in extra:
-                    if not candidate.url or not candidate.asset_id:
-                        continue
-                    if candidate.provider != "pinterest" and candidate.duration and candidate.duration < clip_duration:
-                        continue
-                    extra_kept.append(candidate)
-                unique = dedupe_candidates(unique + extra_kept, seen_keys)
-                origin = extra_origin or origin
-                if len(unique) >= 8:
-                    break
-        print(f"  provider={source} query={query!r} origin={origin} candidates={len(unique)}")
-        groups.append(unique)
+    if search_fn:
+        for idx, item in enumerate(keyword_data):
+            query = item.get("keyword") or ""
+            found, origin = await search_query(query, idx)
+            ranked = rank_scene_candidates(found, sentence=item.get("sentence") or "", keyword=query)
+            unique = [candidate for candidate in ranked if keep_candidate(candidate, idx)]
+            unique = dedupe_candidates(unique, seen_keys)
+            print(f"  provider={source} query={query!r} origin={origin} candidates={len(unique)}")
+            groups.append(unique)
+    else:
+        pool = []
+        origin = "live"
+        for query in (plan or stock_query_plan(keyword_data)):
+            found, origin = await search_query(query, 0, broaden=False)
+            pool.extend(found)
+        pool = [candidate for candidate in pool if keep_candidate(candidate, 0)]
+        pool = dedupe_candidates(pool)
+        print(f"  provider={source} origin={origin} pool={len(pool)} queries={len(plan or [])}")
+        for idx, item in enumerate(keyword_data):
+            ranked = rank_scene_candidates(
+                pool,
+                sentence=item.get("sentence") or "",
+                keyword=f"{item.get('keyword') or ''} {topic}",
+            )
+            groups.append(ranked)
 
     selected = [[] for _ in keyword_data]
     pointers = [0] * len(keyword_data)
+    taken_keys = set()
 
     async def take_next(scene_index):
         group = groups[scene_index]
         while pointers[scene_index] < len(group):
             candidate = group[pointers[scene_index]]
             pointers[scene_index] += 1
+            keys = candidate.identity_keys()
+            if any(key in taken_keys for key in keys):
+                continue
             downloader = download_fn or download_stock_candidate
             path, reason = await downloader(candidate, project_path, source, probe)
             if path:
+                for key in keys:
+                    taken_keys.add(key)
                 return candidate
             rejection_log[scene_index].append({"asset_id": candidate.asset_id, "reason": reason})
         return None

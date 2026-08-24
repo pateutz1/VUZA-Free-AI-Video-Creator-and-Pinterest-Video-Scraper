@@ -16,8 +16,10 @@ from semantic_media import (
     keyword_length_plan,
     parse_sentence_queries,
     query_broaden_chain,
+    query_relevance,
     search_with_cache,
     stock_query_plan,
+    visual_query_plan,
     write_source_manifest,
 )
 
@@ -76,6 +78,19 @@ class QueryParseTests(unittest.TestCase):
                 {"keyword": "gym", "_alts": ["gym squat", "gym lifting heavy barbell"]},
             ]),
             ["gym lifting heavy barbell", "gym squat", "gym"],
+        )
+        self.assertEqual(
+            visual_query_plan(
+                [{"keyword": "gym", "_alts": ["gym squat", "gym motivation", "gym lifting heavy barbell"]}],
+                "gym, fitness, motivation",
+            ),
+            ["gym lifting heavy barbell", "gym motivation", "gym squat", "gym"],
+        )
+        real = MediaCandidate(query="gym deadlift", title="athlete barbell deadlift gym")
+        fake = MediaCandidate(query="gym deadlift", title="3d anatomical deadlift tutorial")
+        self.assertGreater(
+            query_relevance(real, "crush the next rep", "gym barbell squat"),
+            query_relevance(fake, "crush the next rep", "gym barbell squat"),
         )
 
 

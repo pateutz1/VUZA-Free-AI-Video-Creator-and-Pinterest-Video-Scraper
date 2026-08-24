@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import os
 import re
 import requests
@@ -6,7 +7,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from urllib.parse import quote, urlparse, unquote
+from urllib.parse import quote, urlencode, urlparse, unquote
 import yt_dlp
 from tqdm import tqdm
 from PIL import Image
@@ -36,12 +37,148 @@ def get_async_playwright():
         raise RuntimeError("Pinterest and URL scraping require Playwright: pip install playwright && playwright install chromium") from exc
     return async_playwright
 
+PIN_HREF_RE = re.compile(r"/pin/([^/?#]+)", re.IGNORECASE)
+
+
+def parse_pinterest_pin_hrefs(hrefs):
+    pins = []
+    seen = set()
+    for href in hrefs or []:
+        match = PIN_HREF_RE.search(str(href or ""))
+        if not match:
+            continue
+        pin_id = unquote(match.group(1)).strip().strip("/")
+        if not pin_id or pin_id in seen:
+            continue
+        seen.add(pin_id)
+        pins.append(f"https://www.pinterest.com/pin/{pin_id}/")
+    return pins
+
+
+def is_pinterest_media_url(url):
+    lowered = str(url or "").lower().split("?", 1)[0]
+    return lowered.endswith((".mp4", ".m4v", ".mov", ".webm", ".m3u8")) or "pinimg.com/videos" in lowered
+
+
+def is_pinterest_direct_file_url(url):
+    lowered = str(url or "").lower().split("?", 1)[0]
+    return lowered.endswith((".mp4", ".m4v", ".mov", ".webm"))
+
+
+def pinterest_mp4_urls(url):
+    raw = str(url or "").split("?", 1)[0].strip()
+    if not raw:
+        return []
+    urls = []
+
+    def add(item):
+        if item and item not in urls and is_pinterest_direct_file_url(item):
+            urls.append(item)
+
+    add(raw)
+    lowered = raw.lower()
+    if ".m3u8" in lowered or "/hls/" in lowered or "/ihls/" in lowered:
+        converted = re.sub(r"(?i)/ihls/", "/720p/", raw)
+        converted = re.sub(r"(?i)/hls/", "/720p/", converted)
+        converted = re.sub(r"(?i)\.m3u8$", ".mp4", converted)
+        add(converted)
+        add(re.sub(r"(?i)_(t\d+|v\d+)\.mp4$", ".mp4", converted))
+        for quality in ("720p", "480p", "360p"):
+            add(re.sub(r"(?i)/(720p|480p|360p)/", f"/{quality}/", converted))
+    return urls
+
+
+def collect_pinterest_video_specs(node, found=None):
+    found = found if found is not None else []
+    if isinstance(node, dict):
+        url = str(node.get("url") or "")
+        if is_pinterest_media_url(url):
+            found.append(node)
+        for value in node.values():
+            collect_pinterest_video_specs(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            collect_pinterest_video_specs(value, found)
+    return found
+
+
+def pinterest_video_rendition(item):
+    best_file = None
+    best_key = (-1, -1)
+    for spec in collect_pinterest_video_specs(item):
+        if not isinstance(spec, dict):
+            continue
+        url = str(spec.get("url") or "")
+        width = int(spec.get("width") or 0)
+        height = int(spec.get("height") or 0)
+        native = 1 if is_pinterest_direct_file_url(url) else 0
+        cand = {
+            "url": url,
+            "width": width,
+            "height": height,
+            "duration": float(spec.get("duration") or 0),
+        }
+        if not native:
+            converted = pinterest_mp4_urls(url)
+            if not converted:
+                continue
+            cand["url"] = converted[0]
+        key = (native, width * height)
+        if key >= best_key:
+            best_key = key
+            best_file = cand
+    return best_file
+
+
+def parse_pinterest_pin_payload(data):
+    payload = data.get("resource_response") if isinstance(data, dict) else None
+    inner = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(inner, dict) and inner.get("id") and not (inner.get("results") or inner.get("pins")):
+        return [inner]
+    if isinstance(inner, dict):
+        return inner.get("results") or inner.get("pins") or []
+    if isinstance(inner, list):
+        return inner
+    return []
+
+
+def parse_pinterest_resource_results(data, want_video=False):
+    items = []
+    for item in parse_pinterest_pin_payload(data):
+        if not isinstance(item, dict):
+            continue
+        pin_id = str(item.get("id") or "").strip()
+        if not pin_id:
+            continue
+        rendition = pinterest_video_rendition(item)
+        if want_video and not rendition:
+            continue
+        source_page = f"https://www.pinterest.com/pin/{pin_id}/"
+        items.append({
+            "provider": "pinterest",
+            "asset_id": pin_id,
+            "url": (rendition or {}).get("url") or source_page,
+            "source_page": source_page,
+            "creator": ((item.get("pinner") or {}).get("username") if isinstance(item.get("pinner"), dict) else "") or "",
+            "duration": float((rendition or {}).get("duration") or 0),
+            "width": int((rendition or {}).get("width") or 0),
+            "height": int((rendition or {}).get("height") or 0),
+            "rendition": {"id": "pinterest_video" if rendition else "pin"},
+        })
+    return items
+
+
 class PinterestScraper:
     def __init__(self, output_dir="downloads/pinterest"):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         self.seen_ids = set()
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._warmed = False
 
     def _get_folder(self, query):
         safe_query = re.sub(r'[^\w\-]', '_', query)[:25]
@@ -49,32 +186,193 @@ class PinterestScraper:
         folder.mkdir(parents=True, exist_ok=True)
         return folder
 
-    async def get_pin_urls(self, query, media_type="videos", scroll_count=5):
-        search_url = f"https://www.pinterest.com/search/{media_type}/?q={quote(query)}"
-        print(f"🔍 Searching Pinterest {media_type}: {query}")
-        pins = []
-        async with get_async_playwright()() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page(user_agent=self.user_agent)
+    async def _ensure_page(self):
+        if self._page:
+            return self._page
+        playwright = get_async_playwright()
+        self._playwright = await playwright().start()
+        self._browser = await self._playwright.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        self._context = await self._browser.new_context(
+            user_agent=self.user_agent,
+            viewport={"width": 1280, "height": 720},
+            locale="en-US",
+        )
+        await self._context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        self._page = await self._context.new_page()
+        return self._page
+
+    async def aclose(self):
+        page, context, browser, playwright = self._page, self._context, self._browser, self._playwright
+        self._page = self._context = self._browser = self._playwright = None
+        self._warmed = False
+        for closer in (page, context, browser):
+            if closer is None:
+                continue
+            with contextlib.suppress(Exception):
+                await closer.close()
+        if playwright is not None:
+            with contextlib.suppress(Exception):
+                await playwright.stop()
+
+    async def _warm_session(self):
+        page = await self._ensure_page()
+        if self._warmed:
+            return page
+        try:
+            await page.goto("https://www.pinterest.com/", wait_until="commit", timeout=20000)
+        except Exception as exc:
+            print(f"⚠️ Pinterest warmup failed: {exc}")
+        self._warmed = True
+        return page
+
+    async def _fetch_search_resource(self, page, query, scope, csrftoken):
+        source_path = f"/search/{scope}/?q={quote(query)}"
+        payload = {
+            "source_url": source_path,
+            "data": json.dumps({
+                "options": {"query": query, "scope": scope, "page_size": 25},
+                "context": {},
+            }),
+        }
+        return await asyncio.wait_for(
+            page.evaluate(
+                """async ([apiUrl, fetchPayload, token]) => {
+                    const headers = {
+                        'accept': 'application/json, text/javascript, */*; q=0.01',
+                        'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                        'x-requested-with': 'XMLHttpRequest',
+                    };
+                    if (token) headers['x-csrftoken'] = token;
+                    const r = await fetch(apiUrl, {
+                        method: 'POST',
+                        credentials: 'include',
+                        headers,
+                        body: new URLSearchParams(fetchPayload).toString(),
+                    });
+                    return [r.status, await r.text()];
+                }""",
+                ["https://www.pinterest.com/resource/BaseSearchResource/get/", payload, csrftoken],
+            ),
+            timeout=20,
+        )
+
+    async def _resource_search(self, query, scope="pins"):
+        try:
+            page = await self._warm_session()
+            cookies = await self._context.cookies("https://www.pinterest.com")
+            csrftoken = next((cookie["value"] for cookie in cookies if cookie["name"] == "csrftoken"), "")
+            status, body = await self._fetch_search_resource(page, query, scope, csrftoken)
+            if int(status or 0) != 200:
+                print(f"⚠️ Pinterest API HTTP {status} for scope={scope}; retrying after search page")
+                source_path = f"/search/{scope}/?q={quote(query)}"
+                with contextlib.suppress(Exception):
+                    await page.goto(f"https://www.pinterest.com{source_path}", wait_until="commit", timeout=15000)
+                cookies = await self._context.cookies("https://www.pinterest.com")
+                csrftoken = next((cookie["value"] for cookie in cookies if cookie["name"] == "csrftoken"), "")
+                status, body = await self._fetch_search_resource(page, query, scope, csrftoken)
+            if int(status or 0) != 200:
+                print(f"⚠️ Pinterest API HTTP {status} for scope={scope}")
+                return []
             try:
-                await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
-                try:
-                    await page.wait_for_selector('a[href*="/pin/"]', timeout=15000)
-                except Exception:
-                    pass
-                for _ in range(scroll_count):
-                    await page.evaluate("window.scrollBy(0, 1500)")
-                    await asyncio.sleep(1)
-                hrefs = await page.evaluate('() => Array.from(document.querySelectorAll(\'a[href*="/pin/"]\')).map(a => a.href)')
-                seen = set()
-                for href in hrefs:
-                    match = re.search(r'/pin/(\d+)/?', href)
-                    if match and match.group(1) not in seen:
-                        pins.append(f"https://www.pinterest.com/pin/{match.group(1)}/")
-                        seen.add(match.group(1))
-            except Exception as exc:
-                print(f"⚠️ Pinterest search failed: {exc}")
-            finally: await browser.close()
+                data = json.loads(body)
+            except Exception:
+                print("⚠️ Pinterest API returned non-JSON")
+                return []
+            return parse_pinterest_resource_results(data, want_video=False)
+        except Exception as exc:
+            print(f"⚠️ Pinterest search failed ({scope} {query!r}): {exc}")
+            return []
+
+    async def _hydrate_pin_videos(self, pin_ids):
+        pin_ids = [str(pid) for pid in pin_ids if pid][:12]
+        if not pin_ids:
+            return []
+        try:
+            page = await self._warm_session()
+            cookies = await self._context.cookies("https://www.pinterest.com")
+            csrftoken = next((cookie["value"] for cookie in cookies if cookie["name"] == "csrftoken"), "")
+            rows = await asyncio.wait_for(
+                page.evaluate(
+                    """async ([ids, token]) => {
+                        const out = [];
+                        for (const id of ids) {
+                            const payload = {
+                                source_url: `/pin/${id}/`,
+                                data: JSON.stringify({options: {id, field_set_key: 'unauth_react_main_pin'}, context: {}}),
+                            };
+                            const headers = {
+                                'accept': 'application/json, text/javascript, */*; q=0.01',
+                                'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                                'x-requested-with': 'XMLHttpRequest',
+                            };
+                            if (token) headers['x-csrftoken'] = token;
+                            try {
+                                const r = await fetch('https://www.pinterest.com/resource/PinResource/get/', {
+                                    method: 'POST',
+                                    credentials: 'include',
+                                    headers,
+                                    body: new URLSearchParams(payload).toString(),
+                                });
+                                out.push([id, r.status, await r.text()]);
+                            } catch (e) {
+                                out.push([id, 0, '']);
+                            }
+                        }
+                        return out;
+                    }""",
+                    [pin_ids, csrftoken],
+                ),
+                timeout=45,
+            )
+        except Exception as exc:
+            print(f"⚠️ Pinterest pin hydrate failed: {exc}")
+            return []
+        items = []
+        for row in rows or []:
+            if not isinstance(row, (list, tuple)) or len(row) < 3:
+                continue
+            status, body = row[1], row[2]
+            if int(status or 0) != 200:
+                continue
+            try:
+                data = json.loads(body)
+            except Exception:
+                continue
+            items.extend(parse_pinterest_resource_results(data, want_video=True))
+        return self._video_candidates(items)
+
+    async def _dom_pin_urls(self, query, media_type="videos", scroll_count=5):
+        page = await self._ensure_page()
+        search_url = f"https://www.pinterest.com/search/{media_type}/?q={quote(query)}"
+        try:
+            await page.goto(search_url, wait_until="commit", timeout=15000)
+            try:
+                await page.wait_for_selector('a[href*="/pin/"]', timeout=15000)
+            except Exception:
+                pass
+            for _ in range(scroll_count):
+                await page.evaluate("window.scrollBy(0, 1500)")
+                await asyncio.sleep(1)
+            hrefs = await page.evaluate(
+                """() => Array.from(document.querySelectorAll('a[href*="/pin/"]')).map(a => a.href)"""
+            )
+            return parse_pinterest_pin_hrefs(hrefs)
+        except Exception as exc:
+            print(f"⚠️ Pinterest DOM search failed: {exc}")
+            return []
+
+    async def get_pin_urls(self, query, media_type="videos", scroll_count=5):
+        print(f"🔍 Searching Pinterest {media_type}: {query}")
+        scope = "videos" if media_type == "videos" else "pins"
+        items = await self._resource_search(query, scope=scope)
+        if not items and scope == "videos":
+            items = await self._resource_search(query, scope="pins")
+        pins = [item.get("source_page") for item in items if item.get("source_page")]
+        if not pins:
+            pins = await self._dom_pin_urls(query, media_type=media_type, scroll_count=scroll_count)
         print(f"📌 Found {len(pins)} pins")
         return pins
 
@@ -99,6 +397,44 @@ class PinterestScraper:
             except: continue
             if len(results) >= num_images: break
         return results[:num_images]
+
+    def _video_candidates(self, items):
+        videos = []
+        for item in items or []:
+            url = item.get("url") or ""
+            if not is_pinterest_direct_file_url(url):
+                continue
+            videos.append(item)
+        return videos
+
+    async def find_videos(self, query, aspect="9:16", min_duration=2, limit=20):
+        print(f"🔍 Searching Pinterest videos: {query}")
+        limit = max(1, int(limit or 20))
+        raw = await self._resource_search(query, scope="videos")
+        items = self._video_candidates(raw)
+        if len(items) < limit:
+            seen = {str(item.get("asset_id") or "") for item in items}
+            missing = [item.get("asset_id") for item in raw if str(item.get("asset_id") or "") not in seen]
+            items.extend(await self._hydrate_pin_videos(missing))
+        if len(items) < limit:
+            items.extend(self._video_candidates(await self._resource_search(query, scope="pins")))
+        candidates = []
+        seen = set()
+        for item in items:
+            pin_id = str(item.get("asset_id") or "")
+            if not pin_id or pin_id in seen or pin_id in self.seen_ids:
+                continue
+            if not is_pinterest_direct_file_url(item.get("url") or ""):
+                continue
+            seen.add(pin_id)
+            self.seen_ids.add(pin_id)
+            item = dict(item)
+            item["query"] = query
+            candidates.append(item)
+            if len(candidates) >= limit:
+                break
+        print(f"📌 Pinterest candidates: {len(candidates)}")
+        return candidates
 
     async def search_videos(self, query, num_videos=3, aspect="9:16"):
         urls = await self.get_pin_urls(query, media_type="videos", scroll_count=3)
@@ -151,35 +487,61 @@ class PexelsScraper:
             print(f"⚠️ Pexels image search failed: {exc}")
             return []
 
-    async def search_videos(self, query, num_videos=3, aspect="9:16"):
-        if not self.api_key: print("⚠️ Pexels API key not set"); return []
+    def find_videos(self, query, aspect="9:16", min_duration=2, limit=20):
+        if not self.api_key:
+            print("⚠️ Pexels API key not set")
+            return []
         print(f"🎬 Searching Pexels: {query}")
-        folder = self._get_folder(query)
         try:
-            per_page = min(80, max(20, num_videos * 10))
-            url = f"https://api.pexels.com/videos/search?query={quote(query)}&per_page={per_page}&orientation={pexels_orientation(aspect)}"
-            data = requests.get(url, headers=self.headers, timeout=15).json()
-            valid_vids = []
-            for v in data.get("videos", []):
-                vid_id = v.get("id")
-                if vid_id in self.seen_ids:
+            params = {
+                "query": query,
+                "per_page": 20,
+                "orientation": pexels_orientation(aspect),
+            }
+            url = f"https://api.pexels.com/videos/search?{urlencode(params)}"
+            data = requests.get(url, headers=self.headers, timeout=(30, 60), verify=True).json()
+            candidates = []
+            for video in data.get("videos") or []:
+                vid_id = video.get("id")
+                if not vid_id or vid_id in self.seen_ids:
                     continue
-                duration = v.get("duration") or 0
-                if 2 <= duration <= 25:
-                    files = [vf for vf in v.get("video_files", []) if vf.get("link") and vf.get("width")]
-                    files.sort(key=lambda vf: abs((vf.get("width") or 0) - 1920))
-                    best = next((vf for vf in files if matches_video_aspect(vf.get("width"), vf.get("height"), aspect) and is_hd_resolution(vf.get("width"), vf.get("height"))), None)
-                    if not best:
-                        best = next((vf for vf in files if vf.get("width") and vf["width"] <= 1920), None)
-                    if best:
-                        valid_vids.append((best["link"], vid_id))
-                        self.seen_ids.add(vid_id)
-                if len(valid_vids) >= num_videos:
+                duration = float(video.get("duration") or 0)
+                if duration < float(min_duration or 0):
+                    continue
+                best = pick_pexels_rendition(video.get("video_files") or [], aspect)
+                if not best or not best.get("link"):
+                    continue
+                width, height = int(best.get("width") or 0), int(best.get("height") or 0)
+                if aspect != "1:1" and not matches_orientation(width, height, aspect):
+                    continue
+                self.seen_ids.add(vid_id)
+                user = video.get("user") or {}
+                candidates.append({
+                    "provider": "pexels",
+                    "asset_id": str(vid_id),
+                    "url": best["link"],
+                    "source_page": video.get("url") or "",
+                    "creator": user.get("name") or "",
+                    "duration": duration,
+                    "width": width,
+                    "height": height,
+                    "query": query,
+                    "rendition": {"id": str(best.get("id") or ""), "width": width, "height": height},
+                })
+                if len(candidates) >= max(1, int(limit or 20)):
                     break
-            return await download_id_files(self.download_file, valid_vids, folder, "vid", "mp4", MIN_VIDEO_BYTES)
+            print(f"  Pexels candidates: {len(candidates)}")
+            return candidates
         except Exception as exc:
             print(f"⚠️ Pexels video search failed: {exc}")
             return []
+
+    async def search_videos(self, query, num_videos=3, aspect="9:16", min_duration=2):
+        if not self.api_key: print("⚠️ Pexels API key not set"); return []
+        folder = self._get_folder(query)
+        items = await asyncio.to_thread(self.find_videos, query, aspect, min_duration, max(20, num_videos))
+        valid_vids = [(item["url"], item["asset_id"]) for item in items[:num_videos]]
+        return await download_id_files(self.download_file, valid_vids, folder, "vid", "mp4", MIN_VIDEO_BYTES)
 
     def download_file(self, url, path):
         min_bytes = MIN_VIDEO_BYTES if str(path).lower().endswith(".mp4") else MIN_IMAGE_BYTES
@@ -226,28 +588,55 @@ class PixabayScraper:
             print(f"⚠️ Pixabay image search failed: {exc}")
             return []
 
-    async def search_videos(self, query, num_videos=3, aspect="9:16"):
-        if not self.api_key: print("⚠️ Pixabay API key not set"); return []
-        folder = self._get_folder(query)
+    def find_videos(self, query, aspect="9:16", min_duration=2, limit=50):
+        if not self.api_key:
+            print("⚠️ Pixabay API key not set")
+            return []
         try:
-            url = f"https://pixabay.com/api/videos/?key={self.api_key}&q={quote(query)}&per_page={min(80, max(20, num_videos * 10))}"
-            data = requests.get(url, timeout=15).json()
-            valid = []
-            for h in data.get("hits", []):
-                vid_id = h.get("id")
-                if vid_id in self.seen_ids:
+            params = {"q": query, "video_type": "all", "per_page": 50, "key": self.api_key}
+            url = f"https://pixabay.com/api/videos/?{urlencode(params)}"
+            data = requests.get(url, timeout=(30, 60), verify=True).json()
+            candidates = []
+            for hit in data.get("hits") or []:
+                vid_id = hit.get("id")
+                if not vid_id or vid_id in self.seen_ids:
                     continue
-                if 2 <= h.get("duration", 0) <= 25:
-                    v = h["videos"].get("medium") or h["videos"].get("small")
-                    if v and v.get("url"):
-                        valid.append((v["url"], vid_id))
-                        self.seen_ids.add(vid_id)
-                if len(valid) >= num_videos:
+                duration = float(hit.get("duration") or 0)
+                if duration < float(min_duration or 0):
+                    continue
+                rendition, rendition_id = pick_pixabay_rendition(hit.get("videos") or {}, aspect)
+                if not rendition:
+                    continue
+                width, height = int(rendition.get("width") or 0), int(rendition.get("height") or 0)
+                if aspect != "1:1" and not matches_orientation(width, height, aspect):
+                    continue
+                self.seen_ids.add(vid_id)
+                candidates.append({
+                    "provider": "pixabay",
+                    "asset_id": str(vid_id),
+                    "url": rendition.get("url") or "",
+                    "source_page": hit.get("pageURL") or "",
+                    "creator": hit.get("user") or "",
+                    "duration": duration,
+                    "width": width,
+                    "height": height,
+                    "query": query,
+                    "rendition": {"id": rendition_id, "width": width, "height": height},
+                })
+                if len(candidates) >= max(1, int(limit or 50)):
                     break
-            return await download_id_files(self.download_file, valid, folder, "v", "mp4", MIN_VIDEO_BYTES)
+            print(f"  Pixabay candidates: {len(candidates)}")
+            return candidates
         except Exception as exc:
             print(f"⚠️ Pixabay video search failed: {exc}")
             return []
+
+    async def search_videos(self, query, num_videos=3, aspect="9:16", min_duration=2):
+        if not self.api_key: print("⚠️ Pixabay API key not set"); return []
+        folder = self._get_folder(query)
+        items = await asyncio.to_thread(self.find_videos, query, aspect, min_duration, 50)
+        valid = [(item["url"], item["asset_id"]) for item in items[:max(num_videos, 8)]]
+        return await download_id_files(self.download_file, valid, folder, "v", "mp4", MIN_VIDEO_BYTES)
 
     def download_file(self, url, path):
         min_bytes = MIN_VIDEO_BYTES if str(path).lower().endswith(".mp4") else MIN_IMAGE_BYTES
@@ -275,12 +664,74 @@ def matches_video_aspect(width, height, aspect="9:16"):
     return ratio <= 0.85 and h >= 720
 
 
+def matches_orientation(width, height, aspect="9:16"):
+    try:
+        w, h = int(float(width or 0)), int(float(height or 0))
+    except (TypeError, ValueError):
+        return False
+    if w <= 0 or h <= 0:
+        return False
+    if aspect == "16:9":
+        return w > h
+    if aspect == "1:1":
+        return True
+    return h > w
+
+
 def is_hd_resolution(width, height):
     try:
         w, h = int(width or 0), int(height or 0)
     except (TypeError, ValueError):
         return False
     return max(w, h) >= 1080 and min(w, h) >= 720
+
+
+def target_resolution(aspect="9:16"):
+    if aspect == "16:9":
+        return 1920, 1080
+    if aspect == "1:1":
+        return 1080, 1080
+    return 1080, 1920
+
+
+def pick_pexels_rendition(video_files, aspect="9:16"):
+    files = [vf for vf in (video_files or []) if vf.get("link") and vf.get("width")]
+    if not files:
+        return None
+    target_w, target_h = target_resolution(aspect)
+    oriented = [vf for vf in files if matches_orientation(vf.get("width"), vf.get("height"), aspect)]
+    pool = oriented or files
+    exact = [
+        vf for vf in pool
+        if int(vf.get("width") or 0) == target_w and int(vf.get("height") or 0) == target_h
+    ]
+    if exact:
+        return exact[0]
+    hd = [
+        vf for vf in pool
+        if is_hd_resolution(vf.get("width"), vf.get("height")) and max(int(vf.get("width") or 0), int(vf.get("height") or 0)) <= 1920
+    ]
+    chosen = hd or [vf for vf in pool if max(int(vf.get("width") or 0), int(vf.get("height") or 0)) <= 1920] or pool
+    return max(chosen, key=lambda vf: int(vf.get("width") or 0) * int(vf.get("height") or 0))
+
+
+def pick_pixabay_rendition(videos, aspect="9:16"):
+    if not isinstance(videos, dict):
+        return None, None
+    target_w, _target_h = target_resolution(aspect)
+    for name in ("large", "medium", "small", "tiny"):
+        item = videos.get(name)
+        if not item or not item.get("url"):
+            continue
+        width, height = item.get("width") or 0, item.get("height") or 0
+        if aspect != "1:1" and not matches_orientation(width, height, aspect):
+            continue
+        if int(width or 0) >= target_w or is_hd_resolution(width, height):
+            return item, name
+    for name, item in videos.items():
+        if item and item.get("url") and (aspect == "1:1" or matches_orientation(item.get("width"), item.get("height"), aspect)):
+            return item, name
+    return None, None
 
 
 MIN_VIDEO_BYTES = 40000
@@ -331,36 +782,89 @@ class CoverrScraper:
     async def search_images(self, query, num_images=5):
         return []
 
-    async def search_videos(self, query, num_videos=3, aspect="9:16"):
+    def find_videos(self, query, aspect="9:16", min_duration=2, limit=20):
+        if not self.api_key:
+            print("⚠️ Coverr API key not set")
+            return []
+        try:
+            params = {
+                "query": query,
+                "page_size": 20,
+                "urls": "true",
+                "sort": "popular",
+            }
+            if aspect == "9:16":
+                params["filter"] = "is_vertical:true"
+            elif aspect == "16:9":
+                params["filter"] = "is_vertical:false"
+            url = f"https://api.coverr.co/videos?{urlencode(params)}"
+            data = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=(30, 60),
+                verify=True,
+            ).json()
+            hits = data.get("hits") if isinstance(data, dict) else None
+            if not isinstance(hits, list):
+                print("⚠️ Coverr video search returned an unsupported response")
+                return []
+            candidates = []
+            for item in hits:
+                vid_id = item.get("id") or item.get("_id")
+                if not vid_id or vid_id in self.seen_ids:
+                    continue
+                try:
+                    duration = float(item.get("duration") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if duration < float(min_duration or 0):
+                    continue
+                urls = item.get("urls") or {}
+                link = urls.get("mp4_download") or urls.get("mp4") or urls.get("mp4_preview") or item.get("mp4")
+                if not link:
+                    continue
+                width = item.get("max_width") or item.get("width") or 0
+                height = item.get("max_height") or item.get("height") or 0
+                is_vertical = item.get("is_vertical")
+                if aspect != "1:1":
+                    if width and height and not matches_orientation(width, height, aspect):
+                        continue
+                    if (not width or not height) and isinstance(is_vertical, bool):
+                        if is_vertical != (aspect == "9:16"):
+                            continue
+                    elif not width or not height:
+                        continue
+                self.seen_ids.add(vid_id)
+                creator = item.get("creator") or item.get("author") or {}
+                creator_name = creator.get("name") if isinstance(creator, dict) else (creator or "")
+                candidates.append({
+                    "provider": "coverr",
+                    "asset_id": str(vid_id),
+                    "url": link,
+                    "source_page": item.get("canonical_url") or item.get("url") or "",
+                    "creator": creator_name or "",
+                    "duration": duration,
+                    "width": int(width or 0),
+                    "height": int(height or 0),
+                    "query": query,
+                    "rendition": {"id": "mp4_download", "width": width, "height": height},
+                })
+                if len(candidates) >= max(1, int(limit or 20)):
+                    break
+            print(f"  Coverr candidates: {len(candidates)}")
+            return candidates
+        except Exception as exc:
+            print(f"⚠️ Coverr search failed: {exc}")
+            return []
+
+    async def search_videos(self, query, num_videos=3, aspect="9:16", min_duration=2):
         if not self.api_key:
             print("⚠️ Coverr API key not set")
             return []
         folder = self._get_folder(query)
-        try:
-            url = f"https://api.coverr.co/videos?query={quote(query)}&page_size={num_videos * 5}&urls=true"
-            data = requests.get(url, headers={"Authorization": f"Bearer {self.api_key}"}, timeout=20).json()
-            hits = data.get("hits") or data.get("videos") or []
-            valid = []
-            for item in hits:
-                vid_id = item.get("id") or item.get("_id")
-                if vid_id in self.seen_ids:
-                    continue
-                duration = item.get("duration") or 0
-                if duration and not (2 <= float(duration) <= 25):
-                    continue
-                urls = item.get("urls") or {}
-                link = urls.get("mp4_preview") or urls.get("mp4") or item.get("mp4")
-                width = item.get("width") or (item.get("max_width") if isinstance(item.get("max_width"), int) else 0)
-                height = item.get("height") or 0
-                if link and (not width or matches_video_aspect(width, height, aspect) or is_hd_resolution(width, height)):
-                    valid.append((link, vid_id))
-                    self.seen_ids.add(vid_id)
-                if len(valid) >= num_videos:
-                    break
-            return await download_id_files(self.download_file, valid, folder, "c", "mp4", MIN_VIDEO_BYTES)
-        except Exception as exc:
-            print(f"⚠️ Coverr search failed: {exc}")
-            return []
+        items = await asyncio.to_thread(self.find_videos, query, aspect, min_duration, 20)
+        valid = [(item["url"], item["asset_id"]) for item in items[:max(num_videos, 8)]]
+        return await download_id_files(self.download_file, valid, folder, "c", "mp4", MIN_VIDEO_BYTES)
 
     def download_file(self, url, path):
         try:
@@ -667,6 +1171,18 @@ class VideoDownloader:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+    async def download_url(self, url, media_id="pin"):
+        safe_id = re.sub(r"[^\w\-]", "_", str(media_id))[:48] or "pin"
+        ydl_opts = {
+            'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best',
+            'outtmpl': str(self.output_dir / f'vid_{safe_id}.%(ext)s'),
+            'quiet': True, 'ignoreerrors': True
+        }
+        try:
+            return await asyncio.to_thread(self._run_ydl, url, ydl_opts)
+        except Exception:
+            return None
+
     async def download_parallel(self, urls, max_count=3):
         print(f"🚀 Downloading {max_count} videos in parallel...")
         tasks = [self._dl_one(url, i) for i, url in enumerate(urls[:max_count])]
@@ -895,31 +1411,29 @@ class LLMProcessor:
             print("⚠️ LLM API key not set! Please add your AI API key in settings.")
             return []
 
-        stock_rules = """Keywords are Pinterest/Pexels/Pixabay SEARCH QUERIES.
+        stock_rules = """Keywords are Pinterest/Pexels/Pixabay/Coverr SEARCH QUERIES, one per narration sentence, in narration order.
 Rules:
-- Each keyword must be a concrete object, place, or action visible on camera.
-- Match the VIDEO TOPIC and script subject. Gym/fitness script → gym workout, barbell squat, treadmill running, dumbbells, athlete training. Cooking script → kitchen, chef, food prep.
-- NEVER use abstract mood words: resilience, warrior spirit, aspirational, transformative, empowerment, disciplined ambition, self-commitment.
-- NEVER use generic 1-word dumps: exercise, fitness, athlete, people, motivation, success, sport, training.
-- Keep one setting when the topic is one place (gym stays gym: no park, child, empty wall, stretching class).
-- 2-4 common English words. No hashtags. No poetry.
-Return format: Sentence → keyword"""
+- Each query must be 2-4 concrete English words (up to 6 only if needed).
+- Include the main subject or global visual anchor from the VIDEO TOPIC.
+- Describe a visible subject, action, environment, or defining object.
+- Stay grounded in the complete topic AND the current narration sentence.
+- NEVER use abstract concepts, slogans, emotions, camera instructions, hashtags, or vibe suffixes (aesthetic, lofi, cinematic).
+- Do not invent a different setting than the topic.
+Return format strictly: Sentence → keyword"""
         prompts = {
-            "aesthetic": f"Break the script into sentences. For each, give 1 concrete stock-footage keyword (2-4 words). You may append 'aesthetic' ONLY if the words still name a real scene (e.g. 'gym workout aesthetic'). {stock_rules}",
-            "lofi": f"""Break script into sentences. For each, give 1 concrete keyword then append 'lofi art'.
-Still name a real scene matching the topic (gym, rain window, coffee desk) — not abstract moods. {stock_rules}""",
-            "general": f"""Break this script into sentences. For each sentence, give 1 simple stock keyword (1-3 words).
-{stock_rules}""",
-            "suspense_cn": """把中文悬疑短视频旁白拆成适合配画面的短句。
-对每一句生成 1 个英文素材搜索关键词，必须是 Pexels/Pixabay 容易搜到的具体画面。
+            "aesthetic": f"Break the script into sentences in order. For each, give 1 concrete stock-footage query. {stock_rules}",
+            "lofi": f"Break the script into sentences in order. For each, give 1 concrete stock-footage query naming a real scene. {stock_rules}",
+            "general": f"Break this script into sentences in order. For each sentence, give 1 concrete English stock query. {stock_rules}",
+            "suspense_cn": """把中文悬疑短视频旁白按原句顺序拆开。
+对每一句生成 1 个英文素材搜索关键词，必须是 Pexels/Pixabay/Coverr 容易搜到的具体画面。
 规则:
 - 左边保留原中文旁白句子。
-- 右边只写英文关键词，1-4 个词，不要中文，不要抽象词。
-- 关键词要偏悬疑、夜晚、空房间、走廊、手机、门、窗、影子、雨、监控、脚步、老照片等可视化元素。
-- 不要输出解释、编号、场景描述或角色名。
+- 右边只写英文关键词，2-4 个词（必要时最多 6 个），不要中文，不要抽象词，不要 hashtag，不要 cinematic/aesthetic 后缀。
+- 关键词要包含主题里的可见主体，并描述当前句子能拍到的主体、动作、环境或物体。
+- 不要输出解释、编号、镜头指令或角色名。
 返回格式严格为: 中文句子 → english keyword""",
-            "futuristic": "Break script into sentences. For each, give 1 futuristic/cyberpunk keyword (2-4 words, end with 'futuristic'). Return: Sentence → keyword",
-            "black_and_white": "Break script into sentences. For each, give 1 noir/vintage keyword (2-4 words, end with 'black and white'). Return: Sentence → keyword"
+            "futuristic": f"Break script into sentences in order. For each, give 1 concrete stock query of a visible futuristic scene. {stock_rules}",
+            "black_and_white": f"Break script into sentences in order. For each, give 1 concrete stock query of a visible noir/vintage scene. {stock_rules}",
         }
         prompt = prompts.get(vibe, prompts["aesthetic"])
         lang = (language or "").strip()
@@ -949,6 +1463,30 @@ Still name a real scene matching the topic (gym, rain window, coffee desk) — n
                     return parsed
                 self.last_error = f"AI returned content, but it was not in “sentence → keyword” format: {content[:200]}"
         return []
+
+    def suggest_visual_query(self, sentence, topic="", failed_queries=None):
+        if not self.api_key:
+            return ""
+        failed = ", ".join(failed_queries or [])
+        prompt = (
+            "Give ONE 2-4 word English stock-footage search query for the narration sentence. "
+            "Concrete visible subject/action/environment only. Include the topic's main visual anchor. "
+            "No hashtags, slogans, emotions, camera instructions, or vibe suffixes."
+        )
+        user = f"Topic: {topic}\nSentence: {sentence}\nFailed: {failed}\nNew query:"
+        for model in self.models:
+            content = self._chat(
+                model,
+                [{"role": "system", "content": prompt}, {"role": "user", "content": user}],
+                timeout=20,
+                max_tokens=40,
+            )
+            if content:
+                from semantic_media import normalize_stock_query, is_concrete_query
+                query = normalize_stock_query(content.split("\n")[0].split("→")[-1].split("->")[-1])
+                if is_concrete_query(query):
+                    return query
+        return ""
 
     def generate_viral_metadata(self, script):
         if not self.api_key:
@@ -1097,16 +1635,8 @@ Rules:
         return data
 
     def _parse(self, text):
-        res = []
-        for line in text.split('\n'):
-            if '→' in line or '->' in line:
-                arrow = '→' if '→' in line else '->'
-                p = line.split(arrow, 1)
-                sentence = re.sub(r'^\s*[\-\*\d\.\)\uff08\uff09、]+\s*', '', p[0]).strip()
-                keyword = p[1].strip().strip('"').strip("'")
-                if sentence and keyword:
-                    res.append({"sentence": sentence, "keyword": keyword})
-        return res
+        from semantic_media import parse_sentence_queries
+        return parse_sentence_queries(text)
 
     def summarize_url(self, content):
         """Summarizes scraped web content into a video script."""

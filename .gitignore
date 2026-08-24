@@ -39,3 +39,4 @@ desktop.ini
 # Temp
 *.tmp
 *.log
+storage/cache_material_search/

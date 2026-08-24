@@ -1,8 +1,8 @@
 import asyncio
 import contextlib
-import hashlib
 import os
 import re
+import inspect
 import json
 import random
 import sys
@@ -24,7 +24,22 @@ for stream in (sys.stdout, sys.stderr):
 # Built by Ali R. | github.com/AliRash3ed
 # ═══════════════════════════════════════════════════════════════
 
-from aesthetic_scraper import PinterestScraper, PexelsScraper, PixabayScraper, CoverrScraper, PiAPIScraper, LLMProcessor, WebScraper, LLM_PROVIDER_PRESETS
+from aesthetic_scraper import PinterestScraper, PexelsScraper, PixabayScraper, CoverrScraper, PiAPIScraper, LLMProcessor, WebScraper, LLM_PROVIDER_PRESETS, pinterest_mp4_urls
+from media_quality import content_fingerprint, delete_rejected_file, download_http, redact_secret, validate_downloaded_video, MIN_VIDEO_BYTES
+from semantic_media import (
+    CoverageError,
+    MAX_ALT_QUERIES_PER_SCENE,
+    MediaCandidate,
+    SearchCache,
+    coverage_failures,
+    dedupe_candidates,
+    format_coverage_error,
+    rank_scene_candidates,
+    search_with_cache,
+    selected_record,
+    unique_usable_duration,
+    write_source_manifest,
+)
 
 app = FastAPI(title="VUZA — Free AI Video Creator")
 
@@ -473,12 +488,17 @@ def group_scenes_to_clip_budget(keyword_data, count, clip_duration):
         if not sentence:
             continue
         extra = estimated_speech_seconds(sentence)
+        incoming_files = list(item.get("_files") or [])
         if bucket is None:
             bucket = {"sentence": sentence, "keyword": keyword or "scene"}
+            if incoming_files:
+                bucket["_files"] = incoming_files
             spoken = extra
             continue
         if spoken < budget:
             bucket["sentence"] = f"{bucket['sentence']} {sentence}".strip()
+            if incoming_files:
+                bucket["_files"] = list(bucket.get("_files") or []) + incoming_files
             spoken += extra
             continue
         grouped.append(bucket)
@@ -594,12 +614,10 @@ BROAD_STOCK_TERMS = {
 }
 
 def file_fingerprint(path):
-    path = Path(path)
-    digest = hashlib.md5()
-    digest.update(str(path.stat().st_size).encode("ascii"))
-    with path.open("rb") as handle:
-        digest.update(handle.read(65536))
-    return digest.hexdigest()
+    return content_fingerprint(path)
+
+def keep_visually_clean_media(files, seen_hashes, sentence="", keyword="", limit=3):
+    return pick_unique_media(files, seen_hashes, sentence=sentence, keyword=keyword, limit=limit)
 
 def stock_keyword_variants(keyword):
     variants = []
@@ -725,58 +743,334 @@ async def universal_search(keyword, media_type, count, primary_source, project_p
     keywords = stock_keyword_variants(keyword)
     seen_hashes = seen_hashes if seen_hashes is not None else set()
 
-    all_sources = ["pexels", "pixabay", "coverr", "pinterest"]
     if primary_source == "coverr" and media_type != "video":
-        primary_source = "pexels"
-    ordered = [primary_source] + [s for s in all_sources if s != primary_source]
-    if media_type != "video":
-        ordered = [s for s in ordered if s != "coverr"]
+        return []
 
     collected = []
-    for src in ordered:
-        scraper = make_scraper(src, project_path, api_keys)
-        for k in keywords:
-            remaining = max(0, count - len(collected))
-            if remaining == 0:
+    scraper = make_scraper(primary_source, project_path, api_keys)
+    for k in keywords:
+        remaining = max(0, count - len(collected))
+        if remaining == 0:
+            return collected[:count]
+        res = await try_search(scraper, k, media_type, remaining, aspect=aspect)
+        picked = keep_visually_clean_media(res, seen_hashes, sentence=sentence, keyword=k, limit=remaining)
+        if picked:
+            print(f"  ✅ [{primary_source}:{k}] kept {len(picked)} unique clips")
+            collected.extend(picked)
+            if len(collected) >= count:
                 return collected[:count]
-            res = await try_search(scraper, k, media_type, remaining, aspect=aspect)
-            picked = pick_unique_media(res, seen_hashes, sentence=sentence, keyword=k, limit=remaining)
-            if picked:
-                print(f"  ✅ [{src}:{k}] kept {len(picked)} unique clips")
-                collected.extend(picked)
-                if len(collected) >= count:
-                    return collected[:count]
 
     if llm and sentence and llm.api_key:
         print(f"  🧠 AI Re-Ask for '{keyword}'...")
         try:
-            import requests as req
-            r = req.post(llm.api_url,
-                headers={"Authorization": f"Bearer {llm.api_key}", "Content-Type": "application/json"},
-                data=json.dumps({
-                    "model": llm.models[0],
-                    "messages": [
-                        {"role": "system", "content": "Give ONE 2-3 word stock-footage search query that matches the sentence visually. Concrete objects/actions only. Never reply with: exercise, fitness, athlete, people, motivation, success."},
-                        {"role": "user", "content": f"Sentence: {sentence}\nFailed: {', '.join(keywords)}\nNew keyword:"}
-                    ]
-                }), timeout=15)
-            if r.status_code == 200:
-                new_kw = r.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'").lower()
+            new_kw = llm.suggest_visual_query(sentence, topic=keyword, failed_queries=keywords)
+            if not new_kw:
+                import requests as req
+                r = req.post(llm.api_url,
+                    headers={"Authorization": f"Bearer {llm.api_key}", "Content-Type": "application/json"},
+                    data=json.dumps({
+                        "model": llm.models[0],
+                        "messages": [
+                            {"role": "system", "content": "Give ONE 2-3 word stock-footage search query that matches the sentence visually. Concrete objects/actions only."},
+                            {"role": "user", "content": f"Sentence: {sentence}\nFailed: {', '.join(keywords)}\nNew keyword:"}
+                        ]
+                    }), timeout=15)
+                if r.status_code == 200:
+                    new_kw = r.json()["choices"][0]["message"]["content"].strip().strip('"').strip("'").lower()
+            if new_kw:
                 print(f"  🆕 AI suggested: '{new_kw}'")
-                if new_kw.split()[0] not in BROAD_STOCK_TERMS:
-                    for src in ["pexels", "pixabay", "coverr"]:
-                        if src == "coverr" and media_type != "video":
-                            continue
-                        scraper = make_scraper(src, project_path, api_keys)
-                        remaining = max(1, count - len(collected))
-                        res = await try_search(scraper, new_kw, media_type, remaining, aspect=aspect)
-                        picked = pick_unique_media(res, seen_hashes, sentence=sentence, keyword=new_kw, limit=remaining)
-                        if picked:
-                            return picked
+                remaining = max(1, count - len(collected))
+                res = await try_search(scraper, new_kw, media_type, remaining, aspect=aspect)
+                picked = keep_visually_clean_media(res, seen_hashes, sentence=sentence, keyword=new_kw, limit=remaining)
+                if picked:
+                    return picked
         except Exception as e:
-            print(f"  ⚠️ AI Re-Ask failed: {e}")
+            print(f"  ⚠️ AI Re-Ask failed: {redact_secret(e)}")
 
     return collected
+
+STOCK_VIDEO_SOURCES = {"pexels", "pixabay", "coverr", "pinterest"}
+_SEARCH_CACHE = None
+
+
+def get_search_cache():
+    global _SEARCH_CACHE
+    if _SEARCH_CACHE is None:
+        _SEARCH_CACHE = SearchCache(directory=BASE_DIR / "storage" / "cache_material_search")
+    return _SEARCH_CACHE
+
+
+def candidate_from_dict(item, scene_index, query):
+    return MediaCandidate(
+        provider=str(item.get("provider") or ""),
+        asset_id=str(item.get("asset_id") or ""),
+        url=str(item.get("url") or ""),
+        source_page=str(item.get("source_page") or ""),
+        creator=str(item.get("creator") or ""),
+        query=query,
+        scene_index=scene_index,
+        duration=float(item.get("duration") or 0),
+        width=int(item.get("width") or 0),
+        height=int(item.get("height") or 0),
+        rendition=dict(item.get("rendition") or {}),
+        relevance=float(item.get("relevance") or 0),
+    )
+
+
+async def download_stock_candidate(candidate, project_path, source, probe=None):
+    folder = Path(project_path) / source / re.sub(r"[^\w\-]", "_", candidate.query or "scene")[:25]
+    folder.mkdir(parents=True, exist_ok=True)
+    prefix = {"pexels": "vid", "pixabay": "v", "coverr": "c"}.get(source, "vid")
+    safe_id = re.sub(r"[^\w\-]", "_", str(candidate.asset_id or "x"))[:48] or "x"
+    path = folder / f"{prefix}_{safe_id}.mp4"
+    existed = path.exists() and path.stat().st_size >= MIN_VIDEO_BYTES
+    try:
+        if source == "pinterest":
+            urls = pinterest_mp4_urls(candidate.url or "")
+            if not urls:
+                return None, "no direct video url"
+            newly = not existed
+            if not existed:
+                ok = False
+                for media_url in urls:
+                    ok = await asyncio.to_thread(download_http, media_url, path, 60, MIN_VIDEO_BYTES, True)
+                    if ok:
+                        break
+                if not ok:
+                    delete_rejected_file(path, newly_downloaded=True)
+                    return None, "download failed"
+        else:
+            newly = not existed
+            if not existed:
+                ok = await asyncio.to_thread(download_http, candidate.url, path, 60, MIN_VIDEO_BYTES, True)
+                if not ok:
+                    delete_rejected_file(path, newly_downloaded=True)
+                    return None, "download failed"
+        valid, info = await asyncio.to_thread(validate_downloaded_video, path, probe)
+        if not valid:
+            delete_rejected_file(path, newly_downloaded=not existed)
+            return None, info if isinstance(info, str) else "invalid video"
+        if isinstance(info, dict):
+            candidate.duration = candidate.duration or float(info.get("duration") or 0)
+            candidate.width = candidate.width or int(info.get("width") or 0)
+            candidate.height = candidate.height or int(info.get("height") or 0)
+            candidate.quality = f"ok fps={info.get('fps')}"
+        try:
+            candidate.fingerprint = content_fingerprint(path)
+        except OSError:
+            pass
+        candidate.local_path = str(path)
+        return str(path), "ok"
+    except Exception as exc:
+        print(f"  ⚠️ Download failed: {redact_secret(exc)}")
+        return None, "download failed"
+
+
+async def collect_stock_videos(
+    keyword_data,
+    source,
+    project_path,
+    api_keys=None,
+    aspect="9:16",
+    clip_duration=5,
+    count=1,
+    llm=None,
+    topic="",
+    narration_duration=None,
+    cache=None,
+    probe=None,
+    search_fn=None,
+    download_fn=None,
+):
+    """Search selected provider, round-robin download, then enforce unique duration coverage."""
+    clip_duration = max(2, min(12, float(clip_duration or 5)))
+    needed = max(1, int(count or 1))
+    cache = cache if cache is not None else get_search_cache()
+    scraper = make_scraper(source, project_path, api_keys)
+    rejection_log = {idx: [] for idx in range(len(keyword_data))}
+    alt_queries = {idx: [] for idx in range(len(keyword_data))}
+    seen_keys = set()
+
+    print("🧭 Query plan:")
+    for idx, item in enumerate(keyword_data):
+        print(f"  {idx + 1}. {item.get('keyword')}")
+
+    async def search_query(query, scene_index):
+        def live_search():
+            finder = getattr(scraper, "find_videos", None)
+            if finder is None:
+                return []
+            if inspect.iscoroutinefunction(finder):
+                raise RuntimeError("async finder must be awaited outside cache")
+            return [
+                candidate_from_dict(raw, scene_index, query)
+                for raw in (finder(query, aspect=aspect, min_duration=clip_duration, limit=20) or [])
+            ]
+
+        if search_fn:
+            raw_items = await search_fn(query, scene_index)
+            items = [
+                item if isinstance(item, MediaCandidate) else candidate_from_dict(item, scene_index, query)
+                for item in (raw_items or [])
+            ]
+            return items, "live"
+
+        finder = getattr(scraper, "find_videos", None)
+        if finder and inspect.iscoroutinefunction(finder):
+            try:
+                raw = await finder(query, aspect=aspect, min_duration=clip_duration, limit=20)
+            except Exception as exc:
+                print(f"⚠️ Provider search failed ({source} {query!r}): {redact_secret(exc)}")
+                return [], "error"
+            return [candidate_from_dict(item, scene_index, query) for item in (raw or [])], "live"
+
+        items, origin = await asyncio.to_thread(
+            search_with_cache,
+            cache,
+            source,
+            query,
+            int(clip_duration),
+            aspect,
+            live_search,
+        )
+        for item in items:
+            item.scene_index = scene_index
+            item.query = query
+        return items, origin
+
+    groups = []
+    for idx, item in enumerate(keyword_data):
+        query = item.get("keyword") or ""
+        found, origin = await search_query(query, idx)
+        ranked = rank_scene_candidates(found, sentence=item.get("sentence") or "", keyword=query)
+        unique = []
+        for candidate in ranked:
+            if not candidate.url or not candidate.asset_id:
+                rejection_log[idx].append({"asset_id": candidate.asset_id, "reason": "missing url or id"})
+                continue
+            if candidate.provider != "pinterest" and candidate.duration and candidate.duration < clip_duration:
+                rejection_log[idx].append({"asset_id": candidate.asset_id, "reason": "too short"})
+                continue
+            unique.append(candidate)
+        unique = dedupe_candidates(unique, seen_keys)
+        print(f"  provider={source} query={query!r} origin={origin} candidates={len(unique)}")
+        groups.append(unique)
+
+    selected = [[] for _ in keyword_data]
+    pointers = [0] * len(keyword_data)
+
+    async def take_next(scene_index):
+        group = groups[scene_index]
+        while pointers[scene_index] < len(group):
+            candidate = group[pointers[scene_index]]
+            pointers[scene_index] += 1
+            downloader = download_fn or download_stock_candidate
+            path, reason = await downloader(candidate, project_path, source, probe)
+            if path:
+                return candidate
+            rejection_log[scene_index].append({"asset_id": candidate.asset_id, "reason": reason})
+        return None
+
+    round_idx = 0
+    while round_idx < max(needed + 4, 1):
+        progressed = False
+        for scene_index, _group in enumerate(groups):
+            if len(selected[scene_index]) > round_idx:
+                continue
+            chosen = await take_next(scene_index)
+            if chosen:
+                selected[scene_index].append(chosen)
+                progressed = True
+        if not progressed:
+            break
+        round_idx += 1
+
+    async def fill_missing_with_alts():
+        if not llm:
+            return
+        for scene_index, item in enumerate(keyword_data):
+            if selected[scene_index]:
+                continue
+            if len(alt_queries[scene_index]) >= MAX_ALT_QUERIES_PER_SCENE:
+                continue
+            alt = llm.suggest_visual_query(
+                item.get("sentence") or "",
+                topic=topic,
+                failed_queries=[item.get("keyword")] + alt_queries[scene_index],
+            )
+            if not alt or alt == item.get("keyword"):
+                continue
+            alt_queries[scene_index].append(alt)
+            print(f"  🆕 alt query scene {scene_index + 1}: {alt}")
+            found, _origin = await search_query(alt, scene_index)
+            ranked = rank_scene_candidates(found, sentence=item.get("sentence") or "", keyword=alt)
+            extra = dedupe_candidates(ranked, seen_keys)
+            groups[scene_index].extend(extra)
+            chosen = await take_next(scene_index)
+            if chosen:
+                selected[scene_index].append(chosen)
+
+    await fill_missing_with_alts()
+
+    scenes_for_coverage = []
+    for item in keyword_data:
+        required = max(clip_duration, estimated_speech_seconds(item.get("sentence") or ""))
+        scenes_for_coverage.append({
+            "keyword": item.get("keyword"),
+            "required_duration": required,
+        })
+    estimated_narration = narration_duration
+    if estimated_narration is None:
+        estimated_narration = sum(estimated_speech_seconds(item.get("sentence") or "") for item in keyword_data)
+
+    unique_total = unique_usable_duration(selected, clip_duration)
+    failures, unique_total = coverage_failures(
+        selected, scenes_for_coverage, clip_duration, estimated_narration, source
+    )
+    print(
+        f"📏 unique usable {unique_total:.2f}s / narration {estimated_narration:.2f}s "
+        f"clip={clip_duration}s rejections={sum(len(v) for v in rejection_log.values())}"
+    )
+
+    manifest_scenes = []
+    for idx, item in enumerate(keyword_data):
+        chosen = selected[idx]
+        paths = [c.local_path for c in chosen if c.local_path]
+        if paths:
+            item["_files"] = paths
+            item["_candidates"] = chosen
+        else:
+            item["_error"] = describe_empty_media_result(source, "video")
+        manifest_scenes.append({
+            "index": idx,
+            "sentence": item.get("sentence"),
+            "query": item.get("keyword"),
+            "alternatives": alt_queries[idx],
+            "provider": source,
+            "selected": [selected_record(c) for c in chosen],
+            "rejections": rejection_log[idx],
+            "reused": False,
+        })
+    write_source_manifest(Path(project_path).parent if Path(project_path).name in {"video", "photo"} else project_path, {
+        "provider": source,
+        "clip_duration": clip_duration,
+        "narration_duration": estimated_narration,
+        "unique_usable_duration": unique_total,
+        "scenes": manifest_scenes,
+    })
+
+    if failures:
+        closer = getattr(scraper, "aclose", None)
+        if inspect.iscoroutinefunction(closer):
+            await closer()
+        raise CoverageError(
+            format_coverage_error(failures, source, clip_duration, estimated_narration, unique_total)
+        )
+    closer = getattr(scraper, "aclose", None)
+    if inspect.iscoroutinefunction(closer):
+        await closer()
+    return selected
+
 
 # ── Main Scraping ──
 async def run_scrape(request: ScrapeRequest):
@@ -833,48 +1127,82 @@ async def run_scrape(request: ScrapeRequest):
                     raise RuntimeError((llm.last_error if llm else "") or "No usable scenes were generated. Check that the script is not empty.")
 
                 raw_scenes = len(keyword_data)
-                keyword_data = group_scenes_to_clip_budget(
-                    keyword_data, count, settings.clip_duration
-                )
-                print(
-                    f"🎞️ Scenes: {raw_scenes} sentences → {len(keyword_data)} "
-                    f"({count}×{settings.clip_duration}s per scene)"
-                )
+                use_stock_pipeline = media_type == "video" and source in STOCK_VIDEO_SOURCES
+                if not use_stock_pipeline:
+                    keyword_data = group_scenes_to_clip_budget(
+                        keyword_data, count, settings.clip_duration
+                    )
+                    print(
+                        f"🎞️ Scenes: {raw_scenes} sentences → {len(keyword_data)} "
+                        f"({count}×{settings.clip_duration}s per scene)"
+                    )
 
                 total = len(keyword_data)
                 seen_hashes = set()
-                for idx, item in enumerate(keyword_data):
-                    scraping_status["message"] = f"Searching media {script_idx+1}/{len(scripts)} | {idx+1}/{total}..."
-                    try:
-                        res_files = await universal_search(
-                            keyword=item["keyword"], media_type=media_type, count=count,
-                            primary_source=source, project_path=project_path, api_keys=api_keys,
-                            vibe=request.vibe, sentence=item["sentence"], llm=llm,
-                            aspect=settings.ratio, local_files=local_files, seen_hashes=seen_hashes,
-                        )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        item["_error"] = describe_scene_media_error(exc)
-                        print(f"  ❌ Scene media failed ({item['keyword']}): {item['_error']}")
-                        if source == "piapi" or is_fatal_scene_media_error(item["_error"]):
-                            raise RuntimeError(item["_error"])
-                        set_status(progress=((script_idx) / len(scripts)) * 100 + ((idx + 1) / total) * (100 / len(scripts)) * 0.8)
-                        continue
-                    rel_paths = []
-                    valid_paths = existing_media_paths(res_files)
-                    valid_files = [str(path) for path in valid_paths]
-                    for path in valid_paths:
+                if use_stock_pipeline:
+                    scraping_status["message"] = f"Searching {source} media {script_idx+1}/{len(scripts)}..."
+                    await collect_stock_videos(
+                        keyword_data,
+                        source=source,
+                        project_path=project_path,
+                        api_keys=api_keys,
+                        aspect=settings.ratio,
+                        clip_duration=settings.clip_duration,
+                        count=count,
+                        llm=llm,
+                        topic=(request.query or script[:160]).strip(),
+                    )
+                    keyword_data = group_scenes_to_clip_budget(
+                        keyword_data, count, settings.clip_duration
+                    )
+                    print(
+                        f"🎞️ Scenes: {raw_scenes} sentences → {len(keyword_data)} "
+                        f"({count}×{settings.clip_duration}s per scene)"
+                    )
+                    for item in keyword_data:
+                        valid_paths = existing_media_paths(item.get("_files"))
+                        rel_paths = []
+                        for path in valid_paths:
+                            try:
+                                rel_paths.append("/" + str(path.relative_to(BASE_DIR)).replace("\\", "/"))
+                            except Exception:
+                                rel_paths.append(str(path))
+                        if rel_paths:
+                            scraping_status["results"].append({"keyword": item["keyword"], "sentence": item["sentence"], "files": rel_paths})
+                    set_status(progress=((script_idx + 0.8) / len(scripts)) * 100)
+                else:
+                    for idx, item in enumerate(keyword_data):
+                        scraping_status["message"] = f"Searching media {script_idx+1}/{len(scripts)} | {idx+1}/{total}..."
                         try:
-                            rel_paths.append("/" + str(path.relative_to(BASE_DIR)).replace("\\", "/"))
-                        except Exception:
-                            rel_paths.append(str(path))
-                    if rel_paths:
-                        item["_files"] = valid_files
-                        scraping_status["results"].append({"keyword": item["keyword"], "sentence": item["sentence"], "files": rel_paths})
-                    else:
-                        item["_error"] = describe_empty_media_result(source, media_type)
-                    set_status(progress=((script_idx) / len(scripts)) * 100 + ((idx + 1) / total) * (100 / len(scripts)) * 0.8)
+                            res_files = await universal_search(
+                                keyword=item["keyword"], media_type=media_type, count=count,
+                                primary_source=source, project_path=project_path, api_keys=api_keys,
+                                vibe=request.vibe, sentence=item["sentence"], llm=llm,
+                                aspect=settings.ratio, local_files=local_files, seen_hashes=seen_hashes,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            item["_error"] = describe_scene_media_error(exc)
+                            print(f"  ❌ Scene media failed ({item['keyword']}): {item['_error']}")
+                            if source == "piapi" or is_fatal_scene_media_error(item["_error"]):
+                                raise RuntimeError(item["_error"])
+                            set_status(progress=((script_idx) / len(scripts)) * 100 + ((idx + 1) / total) * (100 / len(scripts)) * 0.8)
+                            continue
+                        rel_paths = []
+                        valid_paths = existing_media_paths(res_files)
+                        valid_files = [str(path) for path in valid_paths]
+                        for path in valid_paths:
+                            try:
+                                rel_paths.append("/" + str(path.relative_to(BASE_DIR)).replace("\\", "/"))
+                            except Exception:
+                                rel_paths.append(str(path))
+                        if rel_paths:
+                            item["_files"] = valid_files
+                            scraping_status["results"].append({"keyword": item["keyword"], "sentence": item["sentence"], "files": rel_paths})
+                        else:
+                            item["_error"] = describe_empty_media_result(source, media_type)
+                        set_status(progress=((script_idx) / len(scripts)) * 100 + ((idx + 1) / total) * (100 / len(scripts)) * 0.8)
 
                 if request.auto_video:
                     validate_scene_images(keyword_data, project_path)

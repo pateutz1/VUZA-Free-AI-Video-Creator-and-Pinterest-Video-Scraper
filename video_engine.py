@@ -315,6 +315,9 @@ class VideoEngine:
         if bg_music and os.path.exists(bg_music):
             pass # We will add it at the end
 
+        used_source_keys = []
+        used_source_set = set()
+
         for i, item in enumerate(script_data):
             sentence = item["sentence"]
             keyword = item["keyword"]
@@ -334,12 +337,13 @@ class VideoEngine:
             ]
 
             media_folder = None
-            if (project_path / keyword).exists():
-                media_folder = project_path / keyword
-            else:
-                safe_keyword = re.sub(r'[^\w\-]', '_', keyword)[:40]
-                if safe_keyword and (project_path / safe_keyword).exists():
-                    media_folder = project_path / safe_keyword
+            if media_type != "video":
+                if (project_path / keyword).exists():
+                    media_folder = project_path / keyword
+                else:
+                    safe_keyword = re.sub(r'[^\w\-]', '_', keyword)[:40]
+                    if safe_keyword and (project_path / safe_keyword).exists():
+                        media_folder = project_path / safe_keyword
 
             folder_files = []
             if media_folder:
@@ -367,7 +371,13 @@ class VideoEngine:
             elif ratio == "1:1":
                 w, h = 1080, 1080
 
-            def build_visual_clip(file_path, clip_duration):
+            def source_key(file_path):
+                try:
+                    return str(Path(file_path).resolve())
+                except OSError:
+                    return str(file_path)
+
+            def build_visual_clip(file_path, clip_duration, allow_loop=False):
                 suffix = Path(file_path).suffix.lower()
                 try:
                     if suffix in video_exts:
@@ -378,8 +388,11 @@ class VideoEngine:
                             return None
                         if clip.duration >= clip_duration:
                             clip = clip.subclipped(0, clip_duration)
-                        elif clip.duration >= 1.5:
+                        elif allow_loop and clip.duration >= 1.5:
                             clip = clip.with_effects([vfx.Loop(duration=clip_duration)])
+                        elif clip.duration >= 1.5:
+                            # Stock video: use the unique source once, never stretch it by looping.
+                            pass
                         else:
                             clip.close()
                             return None
@@ -394,17 +407,46 @@ class VideoEngine:
                     print(f"⚠️ Skip clip {file_path}: {exc}")
                     return None
 
+            video_mode = media_type == "video" and bool(video_files)
+            if video_mode:
+                unique_first = []
+                seen_local = set()
+                adjacent = used_source_keys[-1] if used_source_keys else None
+                for file_path in preferred_files:
+                    key = source_key(file_path)
+                    if key == adjacent or key in seen_local:
+                        continue
+                    seen_local.add(key)
+                    if key not in used_source_set:
+                        unique_first.append(file_path)
+                preferred_pool = unique_first
+                if not preferred_pool:
+                    print(f"❌ No unique unused clip for scene {i + 1}: {keyword}")
+                    return None
+            else:
+                preferred_pool = preferred_files
+
             num_segments = 1
-            if duration > 5 and len(preferred_files) > 1:
+            if video_mode:
+                num_segments = max(1, int(round(duration / max(segment_seconds, 0.1))))
+                if duration / num_segments < 1.6:
+                    num_segments = max(1, int(duration / 1.6))
+            elif duration > 5 and len(preferred_pool) > 1:
                 num_segments = max(1, int(duration / segment_seconds))
                 if duration / num_segments < 1.6:
                     num_segments = max(1, int(duration / 1.6))
             segment_duration = duration / num_segments
+            if video_mode and len(preferred_pool) < num_segments:
+                print(
+                    f"❌ Scene {i + 1} needs {num_segments} unique clips for {duration:.2f}s "
+                    f"(clip_duration={segment_seconds}s) but only {len(preferred_pool)} unique sources remain"
+                )
+                return None
             parts = []
             used = []
-            for file_path in preferred_files:
-                needed = duration if num_segments == 1 else segment_duration
-                part = build_visual_clip(file_path, needed)
+            for file_path in preferred_pool:
+                needed = duration if (not video_mode and num_segments == 1) else segment_duration
+                part = build_visual_clip(file_path, needed, allow_loop=not video_mode)
                 if part is None:
                     continue
                 parts.append(part)
@@ -414,13 +456,28 @@ class VideoEngine:
             if not parts:
                 print(f"❌ No usable (non-black) clip for scene {i + 1}: {keyword}")
                 return None
-            if len(parts) == 1 and num_segments > 1:
-                rebuilt = build_visual_clip(used[0], duration)
+            if video_mode:
+                covered = sum(float(part.duration or 0) for part in parts)
+                if covered + 0.05 < duration:
+                    print(
+                        f"❌ Scene {i + 1} unique footage {covered:.2f}s cannot cover narration {duration:.2f}s "
+                        f"without looping one source"
+                    )
+                    return None
+            if (not video_mode) and len(parts) == 1 and num_segments > 1:
+                rebuilt = build_visual_clip(used[0], duration, allow_loop=True)
                 visual_clip = rebuilt or parts[0]
             elif len(parts) == 1:
                 visual_clip = parts[0]
             else:
                 visual_clip = concatenate_videoclips(parts, method="chain")
+            if video_mode:
+                for file_path in used:
+                    key = source_key(file_path)
+                    used_source_keys.append(key)
+                    used_source_set.add(key)
+                if getattr(visual_clip, "duration", 0) > duration + 0.05:
+                    visual_clip = visual_clip.subclipped(0, duration)
 
             try:
                 visual_clip = crop_center(visual_clip, w, h)

@@ -17,6 +17,7 @@ from app import (
     VALID_SOURCES,
     VideoSettings,
     app as fastapi_app,
+    group_scenes_to_clip_budget,
     is_fatal_scene_media_error,
     local_script_segments,
     normalized_script_inputs,
@@ -125,6 +126,27 @@ class LocalScriptSegmentTests(unittest.TestCase):
 
     def test_empty_script_produces_no_segments(self):
         self.assertEqual(local_script_segments(" \n\t "), [])
+
+
+class SceneBudgetTests(unittest.TestCase):
+    def test_short_sentences_merge_to_assets_times_clip_length(self):
+        rows = [
+            {"sentence": "One two three four five.", "keyword": f"k{i}"}
+            for i in range(12)
+        ]
+        grouped = group_scenes_to_clip_budget(rows, count=3, clip_duration=5)
+        self.assertLess(len(grouped), 12)
+        self.assertGreaterEqual(len(grouped), 1)
+
+    def test_long_sentence_stays_one_scene(self):
+        sentence = " ".join(["word"] * 80)
+        grouped = group_scenes_to_clip_budget(
+            [{"sentence": sentence, "keyword": "gym"}],
+            count=3,
+            clip_duration=5,
+        )
+        self.assertEqual(len(grouped), 1)
+        self.assertEqual(grouped[0]["keyword"], "gym")
 
 
 class StatusProgressTests(unittest.TestCase):
@@ -587,17 +609,19 @@ class ScrapeRequestValidationTests(unittest.TestCase):
         self.assertFalse(scraping_status["is_running"])
 
     def test_asset_only_script_reports_error_when_a_scene_has_no_media(self):
+        long_a = "这是第一段旁白需要足够的字数才能单独占满一个五秒镜头预算的画面。" * 3
+        long_b = "这是第二段旁白同样需要足够的字数才能单独占满下一个镜头预算的画面。" * 3
         request = ScrapeRequest(
             source="pexels",
             mode="script",
-            script="第一句。第二句。",
+            script=f"{long_a}。{long_b}。",
             auto_video=False,
             api_keys=ApiKeys(llm_key="sk-test"),
         )
         processor = Mock()
         processor.extract_keywords.return_value = [
-            {"sentence": "第一句。", "keyword": "scene_001"},
-            {"sentence": "第二句。", "keyword": "scene_002"},
+            {"sentence": long_a, "keyword": "scene_001"},
+            {"sentence": long_b, "keyword": "scene_002"},
         ]
 
         async def fake_universal_search(keyword, **kwargs):
@@ -618,17 +642,19 @@ class ScrapeRequestValidationTests(unittest.TestCase):
         self.assertFalse(scraping_status["is_running"])
 
     def test_script_batch_search_exception_keeps_scene_context(self):
+        long_a = "这是第一段旁白需要足够的字数才能单独占满一个五秒镜头预算的画面。" * 3
+        long_b = "这是第二段旁白同样需要足够的字数才能单独占满下一个镜头预算的画面。" * 3
         request = ScrapeRequest(
             source="pexels",
             mode="script",
-            script="第一句。第二句。",
+            script=f"{long_a}。{long_b}。",
             auto_video=False,
             api_keys=ApiKeys(llm_key="sk-test"),
         )
         processor = Mock()
         processor.extract_keywords.return_value = [
-            {"sentence": "第一句。", "keyword": "scene_001"},
-            {"sentence": "第二句。", "keyword": "scene_002"},
+            {"sentence": long_a, "keyword": "scene_001"},
+            {"sentence": long_b, "keyword": "scene_002"},
         ]
 
         async def fake_universal_search(keyword, **kwargs):

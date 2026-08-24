@@ -174,7 +174,7 @@ class PexelsScraper:
                     if best:
                         valid_vids.append((best["link"], vid_id))
                         self.seen_ids.add(vid_id)
-                if len(valid_vids) >= max(num_videos, 8):
+                if len(valid_vids) >= num_videos:
                     break
             return await download_id_files(self.download_file, valid_vids, folder, "vid", "mp4", MIN_VIDEO_BYTES)
         except Exception as exc:
@@ -242,7 +242,7 @@ class PixabayScraper:
                     if v and v.get("url"):
                         valid.append((v["url"], vid_id))
                         self.seen_ids.add(vid_id)
-                if len(valid) >= max(num_videos, 8):
+                if len(valid) >= num_videos:
                     break
             return await download_id_files(self.download_file, valid, folder, "v", "mp4", MIN_VIDEO_BYTES)
         except Exception as exc:
@@ -355,7 +355,7 @@ class CoverrScraper:
                 if link and (not width or matches_video_aspect(width, height, aspect) or is_hd_resolution(width, height)):
                     valid.append((link, vid_id))
                     self.seen_ids.add(vid_id)
-                if len(valid) >= max(num_videos, 8):
+                if len(valid) >= num_videos:
                     break
             return await download_id_files(self.download_file, valid, folder, "c", "mp4", MIN_VIDEO_BYTES)
         except Exception as exc:
@@ -669,7 +669,7 @@ class VideoDownloader:
 
     async def download_parallel(self, urls, max_count=3):
         print(f"🚀 Downloading {max_count} videos in parallel...")
-        tasks = [self._dl_one(url, i) for i, url in enumerate(urls[:max_count*2])]
+        tasks = [self._dl_one(url, i) for i, url in enumerate(urls[:max_count])]
         res = await asyncio.gather(*tasks)
         return [r for r in res if r][:max_count]
 

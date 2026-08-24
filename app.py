@@ -452,6 +452,43 @@ def local_script_segments(script):
         for idx, sentence in enumerate(rows)
     ]
 
+SPEECH_WORDS_PER_SEC = 2.5
+
+
+def estimated_speech_seconds(text):
+    words = re.findall(r"[A-Za-z0-9']+", text or "")
+    cjk = re.findall(r"[\u4e00-\u9fff]", text or "")
+    return (len(words) / SPEECH_WORDS_PER_SEC) + (len(cjk) / 4.5)
+
+
+def group_scenes_to_clip_budget(keyword_data, count, clip_duration):
+    """Merge consecutive sentences so one scene fills assets × clip length."""
+    budget = max(2.0, float(count or 1) * float(clip_duration or 5))
+    grouped = []
+    bucket = None
+    spoken = 0.0
+    for item in keyword_data or []:
+        sentence = (item.get("sentence") or "").strip()
+        keyword = (item.get("keyword") or "").strip()
+        if not sentence:
+            continue
+        extra = estimated_speech_seconds(sentence)
+        if bucket is None:
+            bucket = {"sentence": sentence, "keyword": keyword or "scene"}
+            spoken = extra
+            continue
+        if spoken < budget:
+            bucket["sentence"] = f"{bucket['sentence']} {sentence}".strip()
+            spoken += extra
+            continue
+        grouped.append(bucket)
+        bucket = {"sentence": sentence, "keyword": keyword or "scene"}
+        spoken = extra
+    if bucket:
+        grouped.append(bucket)
+    return grouped
+
+
 def resolved_local_files(request):
     names = [name for name in (request.local_files or []) if (name or "").strip()]
     resolved = []
@@ -699,8 +736,11 @@ async def universal_search(keyword, media_type, count, primary_source, project_p
     for src in ordered:
         scraper = make_scraper(src, project_path, api_keys)
         for k in keywords:
-            res = await try_search(scraper, k, media_type, max(count, 8), aspect=aspect)
-            picked = pick_unique_media(res, seen_hashes, sentence=sentence, keyword=k, limit=max(1, count))
+            remaining = max(0, count - len(collected))
+            if remaining == 0:
+                return collected[:count]
+            res = await try_search(scraper, k, media_type, remaining, aspect=aspect)
+            picked = pick_unique_media(res, seen_hashes, sentence=sentence, keyword=k, limit=remaining)
             if picked:
                 print(f"  ✅ [{src}:{k}] kept {len(picked)} unique clips")
                 collected.extend(picked)
@@ -728,8 +768,9 @@ async def universal_search(keyword, media_type, count, primary_source, project_p
                         if src == "coverr" and media_type != "video":
                             continue
                         scraper = make_scraper(src, project_path, api_keys)
-                        res = await try_search(scraper, new_kw, media_type, max(count, 8), aspect=aspect)
-                        picked = pick_unique_media(res, seen_hashes, sentence=sentence, keyword=new_kw, limit=max(1, count))
+                        remaining = max(1, count - len(collected))
+                        res = await try_search(scraper, new_kw, media_type, remaining, aspect=aspect)
+                        picked = pick_unique_media(res, seen_hashes, sentence=sentence, keyword=new_kw, limit=remaining)
                         if picked:
                             return picked
         except Exception as e:
@@ -760,6 +801,10 @@ async def run_scrape(request: ScrapeRequest):
         api_keys = request.api_keys or ApiKeys()
         settings = request.video_settings or VideoSettings()
         local_files = resolved_local_files(request) if source == "local" else []
+        print(
+            f"🎛️ Settings: {count} asset(s)/scene | "
+            f"{settings.clip_duration}s clip"
+        )
 
         if request.mode == "script":
             scripts = normalized_script_inputs(request)
@@ -787,13 +832,22 @@ async def run_scrape(request: ScrapeRequest):
                 if not keyword_data:
                     raise RuntimeError((llm.last_error if llm else "") or "No usable scenes were generated. Check that the script is not empty.")
 
+                raw_scenes = len(keyword_data)
+                keyword_data = group_scenes_to_clip_budget(
+                    keyword_data, count, settings.clip_duration
+                )
+                print(
+                    f"🎞️ Scenes: {raw_scenes} sentences → {len(keyword_data)} "
+                    f"({count}×{settings.clip_duration}s per scene)"
+                )
+
                 total = len(keyword_data)
                 seen_hashes = set()
                 for idx, item in enumerate(keyword_data):
                     scraping_status["message"] = f"Searching media {script_idx+1}/{len(scripts)} | {idx+1}/{total}..."
                     try:
                         res_files = await universal_search(
-                            keyword=item["keyword"], media_type=media_type, count=max(count, 4),
+                            keyword=item["keyword"], media_type=media_type, count=count,
                             primary_source=source, project_path=project_path, api_keys=api_keys,
                             vibe=request.vibe, sentence=item["sentence"], llm=llm,
                             aspect=settings.ratio, local_files=local_files, seen_hashes=seen_hashes,

@@ -1421,7 +1421,7 @@ class LLMProcessor:
             print(f"❌ {self.last_error}")
             return None
 
-    def extract_keywords(self, script, vibe="aesthetic", language="", topic="", scenes=None):
+    def extract_keywords(self, script, vibe="aesthetic", language="", topic="", scenes=None, word_counts=None):
         if not self.api_key:
             self.last_error = "No AI API key was provided. Add one in API settings."
             print("⚠️ LLM API key not set! Please add your AI API key in settings.")
@@ -1429,19 +1429,19 @@ class LLMProcessor:
 
         stock_rules = """Keywords are Pinterest/Pexels/Pixabay/Coverr SEARCH QUERIES in narration order.
 Rules:
-- Each query must be 3-5 concrete English words (2 only if needed).
-- Include a visible noun from the VIDEO TOPIC plus the action/object in that scene.
-- Stay in the topic's real setting. Do not illustrate slogans or metaphors as isolated body closeups.
-- No on-screen text, quotes, subtitles, logos, ads, camera instructions, hashtags, or vibe suffixes.
+- Follow the exact word count written in [N words] for each line.
+- Mix 1-word, 2-word, 3-word, and 4-word queries. The 1-word query must be the topic's main visible subject (gym, not motivation).
+- Every query must be footage of the VIDEO TOPIC setting plus a visible action from the narration.
+- No slogans, emotions, body-only closeups, on-screen text, hashtags, or vibe suffixes.
 Return format strictly: Sentence → keyword"""
         if scenes:
-            stock_rules = """You will receive numbered narration scenes (already grouped phrases).
+            stock_rules = """You will receive numbered narration scenes.
 Write exactly one stock-footage query per scene, same order.
 Rules:
-- 3-5 concrete English words (2 only if needed).
-- Include a visible noun from the VIDEO TOPIC plus the action in that scene.
-- Stay in the topic's real setting. Do not illustrate slogans or metaphors as isolated body closeups.
-- No on-screen text, quotes, subtitles, logos, ads, camera instructions, hashtags, or vibe suffixes.
+- Follow the exact word count in [N words] for that scene.
+- Mix 1-word, 2-word, 3-word, and 4-word queries. The 1-word query must be the topic's main visible subject.
+- Every query must show the VIDEO TOPIC setting (gym/workout if the topic is gym/fitness) plus a visible action from that scene.
+- No slogans, "person feeling", on-screen text, hashtags, or vibe suffixes.
 Return format strictly: <scene text> → keyword"""
         prompts = {
             "aesthetic": f"Give concrete stock-footage queries. {stock_rules}",
@@ -1470,13 +1470,17 @@ Return format strictly: <scene text> → keyword"""
             )
         topic = (topic or "").strip()
         if scenes:
-            numbered = "\n".join(f"{idx + 1}. {block}" for idx, block in enumerate(scenes))
-            user_content = f"Video topic: {topic or script[:160]}\n\nScenes:\n{numbered}"
+            counts = list(word_counts or [])
+            numbered = []
+            for idx, block in enumerate(scenes):
+                n = counts[idx] if idx < len(counts) else ((idx % 4) + 1)
+                numbered.append(f"{idx + 1}. [{n} words] {block}")
+            user_content = f"Video topic: {topic or script[:160]}\n\nScenes:\n" + "\n".join(numbered)
         else:
             user_content = script
             if topic:
                 user_content = f"Video topic: {topic}\n\nScript:\n{script}"
-        from semantic_media import fallback_stock_query, ground_query
+        from semantic_media import fallback_stock_query, ground_query, ensure_topic_anchor, fit_keyword_length
         for m in self.models:
             print(f"🤖 LLM ({m}) | Vibe: {vibe}")
             content = self._chat(
@@ -1491,7 +1495,10 @@ Return format strictly: <scene text> → keyword"""
                     out = []
                     for idx, sentence in enumerate(scenes):
                         raw = parsed[idx]["keyword"] if parsed and idx < len(parsed) else ""
-                        keyword = ground_query(raw, sentence, topic)
+                        keyword = ensure_topic_anchor(ground_query(raw, sentence, topic), topic)
+                        n = (word_counts[idx] if word_counts and idx < len(word_counts) else None)
+                        if n:
+                            keyword = fit_keyword_length(keyword, n, topic)
                         if not keyword:
                             keyword = fallback_stock_query(sentence, topic)
                         if keyword:
@@ -1503,8 +1510,13 @@ Return format strictly: <scene text> → keyword"""
                 self.last_error = f"AI returned content, but it was not in “sentence → keyword” format: {content[:200]}"
         if scenes:
             out = []
-            for sentence in scenes:
-                keyword = fallback_stock_query(sentence, topic)
+            for idx, sentence in enumerate(scenes):
+                n = word_counts[idx] if word_counts and idx < len(word_counts) else 3
+                keyword = fit_keyword_length(
+                    ensure_topic_anchor(fallback_stock_query(sentence, topic), topic),
+                    n,
+                    topic,
+                )
                 if keyword:
                     out.append({"sentence": sentence, "keyword": keyword})
             return out
@@ -1528,10 +1540,13 @@ Return format strictly: <scene text> → keyword"""
                 max_tokens=40,
             )
             if content:
-                from semantic_media import ground_query, is_concrete_query
-                query = ground_query(
-                    content.split("\n")[0].split("→")[-1].split("->")[-1],
-                    sentence,
+                from semantic_media import ensure_topic_anchor, ground_query, is_concrete_query
+                query = ensure_topic_anchor(
+                    ground_query(
+                        content.split("\n")[0].split("→")[-1].split("->")[-1],
+                        sentence,
+                        topic,
+                    ),
                     topic,
                 )
                 if is_concrete_query(query):

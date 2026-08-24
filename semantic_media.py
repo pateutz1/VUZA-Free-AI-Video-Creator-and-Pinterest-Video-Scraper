@@ -125,6 +125,90 @@ def ground_query(keyword, sentence="", topic=""):
     return fallback_stock_query(sentence, topic)
 
 
+ABSTRACT_TOPIC_WORDS = {
+    "motivation", "inspiration", "inspiring", "motivational", "mindset",
+    "success", "confidence", "hustle", "dopamine", "regret", "legend",
+}
+
+
+def topic_anchor_words(topic):
+    words = [
+        word.lower()
+        for word in re.findall(r"[A-Za-z]{3,}", topic or "")
+        if word.lower() not in QUERY_STOP
+    ]
+    visual = [word for word in words if word not in ABSTRACT_TOPIC_WORDS]
+    return (visual or words)[:3]
+
+
+def ensure_topic_anchor(keyword, topic=""):
+    kw = normalize_stock_query(keyword)
+    anchors = topic_anchor_words(topic)
+    if not kw:
+        return " ".join(anchors[:5])
+    if not anchors:
+        return kw
+    if any(anchor in kw.lower() for anchor in anchors):
+        return kw
+    return normalize_stock_query(f"{anchors[0]} {kw}")
+
+
+def query_broaden_chain(query, topic=""):
+    """Longest query first, then drop trailing words down to a 1-word topic noun."""
+    words = [word for word in normalize_stock_query(query).split() if word]
+    chain = []
+    seen = set()
+    while words:
+        item = " ".join(words)
+        key = item.lower()
+        if key not in seen:
+            seen.add(key)
+            chain.append(item)
+        words = words[:-1]
+    for anchor in topic_anchor_words(topic):
+        if anchor not in seen:
+            seen.add(anchor)
+            chain.append(anchor)
+            break
+    return chain
+
+
+def keyword_length_plan(count):
+    count = max(4, int(count or 4))
+    return [4 - (index % 4) for index in range(count)]
+
+
+def stock_query_plan(keyword_data):
+    seen = set()
+    queries = []
+    for item in keyword_data or []:
+        extras = item.get("_alts") or []
+        for raw in [item.get("keyword"), *extras]:
+            query = normalize_stock_query(raw)
+            key = query.lower()
+            if not query or key in seen:
+                continue
+            seen.add(key)
+            queries.append(query)
+    queries.sort(key=lambda item: (-len(item.split()), item.lower()))
+    return queries
+
+
+def fit_keyword_length(keyword, word_count, topic=""):
+    n = max(1, min(4, int(word_count or 1)))
+    kw = ensure_topic_anchor(keyword, topic)
+    words = [word for word in kw.split() if word]
+    anchors = topic_anchor_words(topic)
+    if anchors and (not words or words[0].lower() != anchors[0]):
+        rest = [word for word in words if word.lower() != anchors[0]]
+        words = [anchors[0]] + rest
+    if len(words) > n:
+        words = words[:n]
+    if not words and anchors:
+        words = anchors[:n]
+    return " ".join(words[:n])
+
+
 def is_concrete_query(keyword):
     query = normalize_stock_query(keyword)
     words = [word for word in query.split() if word]

@@ -244,6 +244,10 @@ class SourceContractTests(unittest.TestCase):
         self.assertIn("PiAPI is paid", html)
         self.assertIn("window.confirm", js)
         self.assertIn("piapi_confirmed: piapiConfirmed", js)
+        self.assertIn('id="keywords-input"', html)
+        self.assertIn('id="regenerate-keywords-btn"', html)
+        self.assertIn("/api/generate_keywords", js)
+        self.assertIn("keywords: readKeywords()", js)
         self.assertNotIn("volces.com", js)
 
 
@@ -269,6 +273,21 @@ class LlmEndpointValidationTests(unittest.TestCase):
                 {
                     "topic": "雨夜收到陌生短信",
                     "vibe": "suspense_cn",
+                    "api_keys": {"llm_key": " "},
+                },
+            ))
+
+        self.assertEqual(status, 400)
+        self.assertIn("requires an AI text API key", data["detail"])
+        processor.assert_not_called()
+
+    def test_api_generate_keywords_rejects_missing_llm_key_before_processor(self):
+        with patch("app.LLMProcessor") as processor:
+            status, data = asyncio.run(post_json(
+                "/api/generate_keywords",
+                {
+                    "topic": "gym, fitness, motivation",
+                    "script": "Feel the burn and lace up those shoes.",
                     "api_keys": {"llm_key": " "},
                 },
             ))

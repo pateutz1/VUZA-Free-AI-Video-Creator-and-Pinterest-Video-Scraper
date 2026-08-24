@@ -10,9 +10,14 @@ from semantic_media import (
     SearchCache,
     cache_key,
     coverage_failures,
+    ensure_topic_anchor,
+    fit_keyword_length,
     ground_query,
+    keyword_length_plan,
     parse_sentence_queries,
+    query_broaden_chain,
     search_with_cache,
+    stock_query_plan,
     write_source_manifest,
 )
 
@@ -47,6 +52,30 @@ class QueryParseTests(unittest.TestCase):
         self.assertIn(
             "dumbbells",
             ground_query("", "Drop the excuses those dumbbells don't care", "gym workout"),
+        )
+
+    def test_ensure_topic_anchor_prefixes_gym(self):
+        self.assertEqual(
+            ensure_topic_anchor("Person feeling burn", "gym, fitness, motivation, inspiration"),
+            "gym Person feeling burn",
+        )
+        self.assertEqual(
+            ensure_topic_anchor("gym treadmill sprint", "gym, fitness, motivation"),
+            "gym treadmill sprint",
+        )
+
+    def test_mixed_lengths_and_broaden_chain(self):
+        self.assertEqual(keyword_length_plan(3), [4, 3, 2, 1])
+        self.assertEqual(keyword_length_plan(4), [4, 3, 2, 1])
+        self.assertEqual(
+            fit_keyword_length("gym athlete pushing barbell", 2, "gym, fitness"),
+            "gym athlete",
+        )
+        self.assertEqual(
+            stock_query_plan([
+                {"keyword": "gym", "_alts": ["gym squat", "gym lifting heavy barbell"]},
+            ]),
+            ["gym lifting heavy barbell", "gym squat", "gym"],
         )
 
 

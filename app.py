@@ -33,7 +33,14 @@ from semantic_media import (
     SearchCache,
     coverage_failures,
     dedupe_candidates,
+    ensure_topic_anchor,
     format_coverage_error,
+    keyword_length_plan,
+    fit_keyword_length,
+    fallback_stock_query,
+    query_broaden_chain,
+    stock_query_plan,
+    normalize_stock_query,
     rank_scene_candidates,
     search_with_cache,
     selected_record,
@@ -118,6 +125,7 @@ class ScrapeRequest(BaseModel):
     publish_confirmed: bool = False
     local_files: Optional[List[str]] = None
     api_keys: Optional[ApiKeys] = None
+    keywords: Optional[List[str]] = None
 
 class VoicePreviewRequest(BaseModel):
     text: str = "This is a VUZA voice preview."
@@ -242,7 +250,70 @@ class GenerateScriptRequest(BaseModel):
     topic: str
     vibe: str = "aesthetic"
     language: str = "en-US"
+    count: int = 3
+    clip_duration: int = 5
     api_keys: Optional[ApiKeys] = None
+
+class GenerateKeywordsRequest(BaseModel):
+    topic: str
+    script: str
+    vibe: str = "aesthetic"
+    language: str = "en-US"
+    count: int = 3
+    clip_duration: int = 5
+    api_keys: Optional[ApiKeys] = None
+
+def apply_user_keywords(grouped, keywords, topic=""):
+    cleaned = []
+    seen = set()
+    for raw in keywords or []:
+        keyword = ensure_topic_anchor(normalize_stock_query(raw), topic)
+        key = keyword.lower()
+        if not keyword or key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(keyword)
+    if not cleaned or not grouped:
+        return None
+    cleaned.sort(key=lambda item: (-len(item.split()), item.lower()))
+    primary, alts = cleaned[0], cleaned[1:]
+    return [
+        {
+            "sentence": item.get("sentence") or "",
+            "keyword": primary,
+            "_alts": alts,
+        }
+        for item in grouped
+    ]
+
+
+def keywords_from_topic_and_script(llm, topic, script, vibe, language, count, clip_duration):
+    sentence_rows = [{"sentence": part, "keyword": "scene"} for part in split_script_sentences(script)]
+    grouped = group_scenes_to_clip_budget(sentence_rows, count, clip_duration)
+    scenes = [item["sentence"] for item in grouped]
+    n = 4
+    lengths = keyword_length_plan(n)
+    padded = list(scenes)
+    while len(padded) < n:
+        padded.append(script)
+    filled = llm.extract_keywords(
+        script,
+        vibe=vibe,
+        language=language,
+        topic=topic,
+        scenes=padded,
+        word_counts=lengths,
+    ) if padded else []
+    keywords = []
+    for index in range(n):
+        raw = ""
+        if filled and index < len(filled):
+            raw = filled[index].get("keyword") or ""
+        if not raw:
+            raw = fallback_stock_query(padded[index] if index < len(padded) else script, topic)
+        keywords.append(fit_keyword_length(ensure_topic_anchor(raw, topic), lengths[index], topic))
+    return [item for item in keywords if item]
+
 
 @app.post("/api/generate_script")
 async def generate_script(request: GenerateScriptRequest):
@@ -257,7 +328,34 @@ async def generate_script(request: GenerateScriptRequest):
     if not script:
         raise HTTPException(status_code=500, detail=llm.last_error or "Script generation failed. Check your AI API key.")
 
-    return {"script": script}
+    count = max(1, min(15, int(request.count or 3)))
+    clip_duration = max(2, min(12, int(request.clip_duration or 5)))
+    keywords = keywords_from_topic_and_script(
+        llm, request.topic, script, request.vibe, request.language, count, clip_duration
+    )
+    return {"script": script, "keywords": keywords}
+
+
+@app.post("/api/generate_keywords")
+async def generate_keywords(request: GenerateKeywordsRequest):
+    topic = (request.topic or "").strip()
+    script = (request.script or "").strip()
+    if not topic:
+        raise HTTPException(status_code=400, detail="Enter a topic first.")
+    if not script:
+        raise HTTPException(status_code=400, detail="Generate or paste a narration script first.")
+
+    api_keys = request.api_keys or ApiKeys()
+    require_llm_key(api_keys, "Keyword generation")
+    llm = LLMProcessor(api_key=api_keys.llm_key, api_url=api_keys.llm_url, model=api_keys.llm_model)
+    count = max(1, min(15, int(request.count or 3)))
+    clip_duration = max(2, min(12, int(request.clip_duration or 5)))
+    keywords = keywords_from_topic_and_script(
+        llm, topic, script, request.vibe, request.language, count, clip_duration
+    )
+    if not keywords:
+        raise HTTPException(status_code=500, detail=llm.last_error or "Keyword generation failed. Check your AI API key.")
+    return {"keywords": keywords}
 
 class ScrapeUrlRequest(BaseModel):
     url: str
@@ -901,21 +999,10 @@ async def collect_stock_videos(
     seen_keys = set()
 
     print("🧭 Query plan:")
-    for idx, item in enumerate(keyword_data):
-        print(f"  {idx + 1}. {item.get('keyword')}")
+    for idx, query in enumerate(stock_query_plan(keyword_data)):
+        print(f"  {idx + 1}. {query} ({len(query.split())} words)")
 
     async def search_query(query, scene_index):
-        def live_search():
-            finder = getattr(scraper, "find_videos", None)
-            if finder is None:
-                return []
-            if inspect.iscoroutinefunction(finder):
-                raise RuntimeError("async finder must be awaited outside cache")
-            return [
-                candidate_from_dict(raw, scene_index, query)
-                for raw in (finder(query, aspect=aspect, min_duration=clip_duration, limit=search_limit) or [])
-            ]
-
         if search_fn:
             raw_items = await search_fn(query, scene_index)
             items = [
@@ -924,28 +1011,47 @@ async def collect_stock_videos(
             ]
             return items, "live"
 
+        merged = []
+        origin = "live"
         finder = getattr(scraper, "find_videos", None)
-        if finder and inspect.iscoroutinefunction(finder):
-            try:
-                raw = await finder(query, aspect=aspect, min_duration=clip_duration, limit=search_limit)
-            except Exception as exc:
-                print(f"⚠️ Provider search failed ({source} {query!r}): {redact_secret(exc)}")
-                return [], "error"
-            return [candidate_from_dict(item, scene_index, query) for item in (raw or [])], "live"
+        for variant in query_broaden_chain(query, topic):
+            if finder and inspect.iscoroutinefunction(finder):
+                try:
+                    raw = await finder(variant, aspect=aspect, min_duration=clip_duration, limit=search_limit)
+                except Exception as exc:
+                    print(f"⚠️ Provider search failed ({source} {variant!r}): {redact_secret(exc)}")
+                    origin = "error"
+                    continue
+                print(f"  🔎 {variant!r} → {len(raw or [])} hits")
+                for item in raw or []:
+                    merged.append(candidate_from_dict(item, scene_index, variant))
+            else:
+                def live_search(variant=variant):
+                    inner = getattr(scraper, "find_videos", None)
+                    if inner is None:
+                        return []
+                    return [
+                        candidate_from_dict(raw, scene_index, variant)
+                        for raw in (inner(variant, aspect=aspect, min_duration=clip_duration, limit=search_limit) or [])
+                    ]
 
-        items, origin = await asyncio.to_thread(
-            search_with_cache,
-            cache,
-            source,
-            query,
-            int(clip_duration),
-            aspect,
-            live_search,
-        )
-        for item in items:
-            item.scene_index = scene_index
-            item.query = query
-        return items, origin
+                items, origin = await asyncio.to_thread(
+                    search_with_cache,
+                    cache,
+                    source,
+                    variant,
+                    int(clip_duration),
+                    aspect,
+                    live_search,
+                )
+                print(f"  🔎 {variant!r} → {len(items)} hits")
+                for item in items:
+                    item.scene_index = scene_index
+                    item.query = variant
+                merged.extend(items)
+            if len(merged) >= 8:
+                break
+        return merged, origin
 
     groups = []
     for idx, item in enumerate(keyword_data):
@@ -962,6 +1068,20 @@ async def collect_stock_videos(
                 continue
             unique.append(candidate)
         unique = dedupe_candidates(unique, seen_keys)
+        if len(unique) < 8 and not search_fn:
+            for alt in item.get("_alts") or []:
+                extra, extra_origin = await search_query(alt, idx)
+                extra_kept = []
+                for candidate in extra:
+                    if not candidate.url or not candidate.asset_id:
+                        continue
+                    if candidate.provider != "pinterest" and candidate.duration and candidate.duration < clip_duration:
+                        continue
+                    extra_kept.append(candidate)
+                unique = dedupe_candidates(unique + extra_kept, seen_keys)
+                origin = extra_origin or origin
+                if len(unique) >= 8:
+                    break
         print(f"  provider={source} query={query!r} origin={origin} candidates={len(unique)}")
         groups.append(unique)
 
@@ -1124,30 +1244,36 @@ async def run_scrape(request: ScrapeRequest):
                 project_path.mkdir(parents=True, exist_ok=True)
 
                 scraping_status["message"] = f"Analyzing script {script_idx+1}/{len(scripts)}..."
+                already_grouped = False
                 if source == "local":
                     keyword_data = local_script_segments(script)
                     llm = None
                 else:
                     llm = LLMProcessor(api_key=api_keys.llm_key, api_url=api_keys.llm_url, model=api_keys.llm_model)
                     use_stock_pipeline = media_type == "video" and source in STOCK_VIDEO_SOURCES
-                    if use_stock_pipeline:
-                        sentence_rows = [{"sentence": part, "keyword": "scene"} for part in split_script_sentences(script)]
-                        keyword_data = group_scenes_to_clip_budget(
-                            sentence_rows, count, settings.clip_duration
-                        )
+                    topic = (request.query or "").strip() or script[:160]
+                    sentence_rows = [{"sentence": part, "keyword": "scene"} for part in split_script_sentences(script)]
+                    grouped = group_scenes_to_clip_budget(
+                        sentence_rows, count, settings.clip_duration
+                    )
+                    mapped = apply_user_keywords(grouped, request.keywords, topic)
+                    already_grouped = bool(mapped) or use_stock_pipeline
+                    if mapped:
+                        keyword_data = mapped
+                    elif use_stock_pipeline:
                         keyword_data = llm.extract_keywords(
                             script,
                             vibe=request.vibe,
                             language=settings.language,
-                            topic=(request.query or script[:160]).strip(),
-                            scenes=[item["sentence"] for item in keyword_data],
+                            topic=topic,
+                            scenes=[item["sentence"] for item in grouped],
                         )
                     else:
                         keyword_data = llm.extract_keywords(
                             script,
                             vibe=request.vibe,
                             language=settings.language,
-                            topic=(request.query or script[:160]).strip(),
+                            topic=topic,
                         )
 
                 if not keyword_data:
@@ -1155,7 +1281,7 @@ async def run_scrape(request: ScrapeRequest):
 
                 raw_scenes = len(split_script_sentences(script)) if script else len(keyword_data)
                 use_stock_pipeline = media_type == "video" and source in STOCK_VIDEO_SOURCES
-                if not use_stock_pipeline:
+                if not already_grouped:
                     keyword_data = group_scenes_to_clip_budget(
                         keyword_data, count, settings.clip_duration
                     )

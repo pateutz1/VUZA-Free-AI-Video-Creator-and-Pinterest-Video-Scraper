@@ -13,6 +13,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const clearBtn = document.getElementById('clear-gallery');
     const analyzeBtn = document.getElementById('analyze-btn');
     const generateScriptBtn = document.getElementById('generate-script-btn');
+    const regenerateKeywordsBtn = document.getElementById('regenerate-keywords-btn');
+    const keywordsInput = document.getElementById('keywords-input');
     const topicInput = document.getElementById('topic-input');
     const analysisPanel = document.getElementById('analysis-panel');
     const aiTitle = document.getElementById('ai-title');
@@ -515,6 +517,23 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    function setKeywords(list) {
+        if (keywordsInput) keywordsInput.value = (list || []).join('\n');
+    }
+
+    function readKeywords() {
+        return (keywordsInput?.value || '').split('\n').map((line) => line.trim()).filter(Boolean);
+    }
+
+    function llmKeyPayload() {
+        const keys = getKeys();
+        return {
+            llm_key: keys.llm_key || '',
+            llm_url: keys.llm_url || 'https://openrouter.ai/api/v1/chat/completions',
+            llm_model: keys.llm_model || ''
+        };
+    }
+
     if (generateScriptBtn) {
         generateScriptBtn.addEventListener('click', async () => {
             const topic = topicInput.value.trim();
@@ -541,11 +560,9 @@ document.addEventListener('DOMContentLoaded', () => {
                         topic: topic,
                         vibe: vibe,
                         language: document.getElementById('language-select').value,
-                        api_keys: {
-                            llm_key: keys.llm_key || '',
-                            llm_url: keys.llm_url || 'https://openrouter.ai/api/v1/chat/completions',
-                            llm_model: keys.llm_model || ''
-                        }
+                        count: parseInt(countInput?.value || '3', 10) || 3,
+                        clip_duration: numVal('clip-duration', 5),
+                        api_keys: llmKeyPayload()
                     })
                 });
 
@@ -554,8 +571,11 @@ document.addEventListener('DOMContentLoaded', () => {
                     const firstScript = scriptsContainer.querySelector('.script-input') || scriptInput;
                     if (firstScript) {
                         firstScript.value = data.script;
-                        showToast('Script generated', 'success');
                     }
+                    if (Array.isArray(data.keywords)) {
+                        setKeywords(data.keywords);
+                    }
+                    showToast('Script and keywords generated', 'success');
                 } else {
                     showToast(await readErrorMessage(response, 'Script generation failed'), 'error');
                 }
@@ -564,6 +584,51 @@ document.addEventListener('DOMContentLoaded', () => {
             } finally {
                 generateScriptBtn.disabled = false;
                 generateScriptBtn.innerHTML = '<i class="fas fa-magic"></i> Generate script';
+            }
+        });
+    }
+
+    if (regenerateKeywordsBtn) {
+        regenerateKeywordsBtn.addEventListener('click', async () => {
+            const topic = (topicInput?.value || '').trim();
+            const script = ((scriptsContainer?.querySelector('.script-input') || scriptInput)?.value || '').trim();
+            if (!topic) { showToast('Enter a video topic first', 'error'); return; }
+            if (!script) { showToast('Generate or paste a narration script first', 'error'); return; }
+            const keys = getKeys();
+            if (!keys.llm_key) {
+                showApiSettings();
+                showToast('Add an AI text API key in API settings', 'error');
+                return;
+            }
+            persistKeys(keys);
+            regenerateKeywordsBtn.disabled = true;
+            regenerateKeywordsBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Regenerating...';
+            try {
+                const response = await fetch('/api/generate_keywords', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        topic,
+                        script,
+                        vibe: document.querySelector('input[name="vibe"]:checked')?.value || 'aesthetic',
+                        language: document.getElementById('language-select')?.value || 'en-US',
+                        count: parseInt(countInput?.value || '3', 10) || 3,
+                        clip_duration: numVal('clip-duration', 5),
+                        api_keys: llmKeyPayload()
+                    })
+                });
+                if (response.ok) {
+                    const data = await response.json();
+                    setKeywords(data.keywords || []);
+                    showToast('Keywords updated', 'success');
+                } else {
+                    showToast(await readErrorMessage(response, 'Keyword generation failed'), 'error');
+                }
+            } catch (error) {
+                showToast('Network error', 'error');
+            } finally {
+                regenerateKeywordsBtn.disabled = false;
+                regenerateKeywordsBtn.innerHTML = '<i class="fas fa-sync-alt"></i> Regenerate keywords';
             }
         });
     }
@@ -677,7 +742,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     scrapeBtn.addEventListener('click', async () => {
-        const query = queryInput ? queryInput.value.trim() : "";
+        const query = (topicInput && topicInput.value.trim()) || (queryInput ? queryInput.value.trim() : "");
 
         const scripts = Array.from(document.querySelectorAll('.script-input'))
                             .map(s => s.value.trim())
@@ -775,6 +840,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     query,
+                    keywords: readKeywords(),
                     script: scripts[0],
                     scripts: scripts,
                     source,

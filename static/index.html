@@ -251,6 +251,16 @@
                             </button>
                         </div>
                     </div>
+                    <div class="topic-generator">
+                        <label for="keywords-input"><i class="fas fa-key"></i> Stock search keywords</label>
+                        <p class="settings-note">Always 4 lines, longest first: 4-word, 3-word, 2-word, then 1-word. Search follows that order and drops words if too few clips match.</p>
+                        <div class="input-with-button">
+                            <textarea id="keywords-input" placeholder="gym lifting heavy barbell&#10;gym athlete squat&#10;gym squat&#10;gym" class="input topic-textarea"></textarea>
+                            <button type="button" id="regenerate-keywords-btn" class="secondary-btn">
+                                <i class="fas fa-sync-alt"></i> Regenerate keywords
+                            </button>
+                        </div>
+                    </div>
                     <div class="template-selector">
                         <label for="template-select">Quick templates</label>
                         <select id="template-select" class="custom-select">
@@ -618,7 +628,7 @@
     </div> <!-- end page-layout -->
 
     <div id="toast" class="toast hidden"></div>
-    <script src="/static/script.js?v=5.7"></script>
+    <script src="/static/script.js?v=6.0"></script>
 </body>
 
 </html>

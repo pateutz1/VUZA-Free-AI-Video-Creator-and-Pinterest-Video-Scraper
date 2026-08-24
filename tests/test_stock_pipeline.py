@@ -14,8 +14,15 @@ from aesthetic_scraper import (
     parse_pinterest_resource_results,
     pick_pexels_rendition,
 )
-from app import collect_stock_videos, keep_visually_clean_media, group_scenes_to_clip_budget, split_script_sentences
-from semantic_media import CoverageError, MediaCandidate, dedupe_candidates, round_robin_order, unique_usable_duration
+from app import (
+    apply_user_keywords,
+    collect_stock_videos,
+    group_scenes_to_clip_budget,
+    keep_visually_clean_media,
+    keywords_from_topic_and_script,
+    split_script_sentences,
+)
+from semantic_media import CoverageError, MediaCandidate, dedupe_candidates, round_robin_order, stock_query_plan, unique_usable_duration
 
 
 def _video(asset_id, duration, width, height, link="https://example.com/a.mp4"):
@@ -469,6 +476,48 @@ class KeywordParseHookTests(unittest.TestCase):
         )
         self.assertGreaterEqual(len(sentences), 7)
         self.assertLess(len(grouped), len(sentences))
+
+    def test_apply_user_keywords_maps_onto_scenes(self):
+        grouped = [
+            {"sentence": "Feel the burn.", "keyword": "scene"},
+            {"sentence": "Lace up those shoes.", "keyword": "scene"},
+        ]
+        mapped = apply_user_keywords(
+            grouped,
+            ["gym", "gym squat", "gym lifting heavy barbell"],
+            "gym, fitness, motivation",
+        )
+        self.assertEqual(mapped[0]["keyword"], "gym lifting heavy barbell")
+        self.assertEqual(mapped[1]["keyword"], "gym lifting heavy barbell")
+        self.assertEqual(mapped[0]["_alts"], ["gym squat", "gym"])
+        self.assertEqual(
+            stock_query_plan(mapped),
+            ["gym lifting heavy barbell", "gym squat", "gym"],
+        )
+
+    def test_keywords_from_topic_always_four_longest_first(self):
+        class FakeLLM:
+            def extract_keywords(self, script, vibe="", language="", topic="", scenes=None, word_counts=None):
+                return [
+                    {"sentence": (scenes or [""])[0], "keyword": "gym athlete pushing barbell"},
+                    {"sentence": (scenes or ["", ""])[1] if scenes and len(scenes) > 1 else "", "keyword": "gym athlete training"},
+                    {"sentence": (scenes or ["", "", ""])[2] if scenes and len(scenes) > 2 else "", "keyword": "gym squat"},
+                    {"sentence": (scenes or ["", "", "", ""])[3] if scenes and len(scenes) > 3 else "", "keyword": "gym"},
+                ]
+
+        keywords = keywords_from_topic_and_script(
+            FakeLLM(),
+            "gym, fitness, motivation, inspiration",
+            "Stop scrolling—your future self is waiting for the next rep! "
+            "Every drop of sweat is a tiny victory. Consistency beats intensity.",
+            "aesthetic",
+            "en-US",
+            3,
+            5,
+        )
+        self.assertEqual(len(keywords), 4)
+        self.assertEqual([len(item.split()) for item in keywords], [4, 3, 2, 1])
+        self.assertTrue(all(item.split()[0] == "gym" for item in keywords))
 
 
 if __name__ == "__main__":

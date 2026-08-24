@@ -132,6 +132,8 @@ document.addEventListener('DOMContentLoaded', () => {
         if (keys.yt_client_id) document.getElementById('yt-client-id').value = keys.yt_client_id;
         if (keys.yt_client_secret) document.getElementById('yt-client-secret').value = keys.yt_client_secret;
         if (keys.eleven_key) document.getElementById('eleven-key').value = keys.eleven_key;
+        if (keys.azure_speech_key) document.getElementById('azure-speech-key').value = keys.azure_speech_key;
+        if (keys.azure_speech_region) document.getElementById('azure-speech-region').value = keys.azure_speech_region;
         loadProvider(id);
     }
 
@@ -252,6 +254,41 @@ document.addEventListener('DOMContentLoaded', () => {
             const keyEl = document.getElementById(inputId);
             if (keyEl) keyEl.addEventListener('input', persistKeysSoon);
         });
+        const azureBtn = document.getElementById('test-azure-tts-btn');
+        if (azureBtn) azureBtn.addEventListener('click', testAzureTtsApi);
+    }
+
+    async function testAzureTtsApi() {
+        const statusEl = document.getElementById('azure-tts-test-status');
+        const btn = document.getElementById('test-azure-tts-btn');
+        const api_key = (document.getElementById('azure-speech-key')?.value || '').trim();
+        const region = (document.getElementById('azure-speech-region')?.value || '').trim();
+        if (statusEl) statusEl.textContent = 'Testing...';
+        if (btn) btn.disabled = true;
+        try {
+            const response = await fetch('/api/tts/azure/test', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ api_key, region }),
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                const message = typeof data.detail === 'string' ? data.detail : 'Azure TTS V2 API test failed';
+                if (statusEl) statusEl.textContent = message;
+                showToast(message, 'error');
+                return;
+            }
+            persistKeys(getKeys());
+            const okMsg = data.note ? `OK · ${data.note}` : 'OK';
+            if (statusEl) statusEl.textContent = okMsg;
+            showToast(`Azure TTS V2 ${okMsg}`, 'success');
+        } catch (error) {
+            const message = 'Could not reach VUZA to test this API';
+            if (statusEl) statusEl.textContent = message;
+            showToast(message, 'error');
+        } finally {
+            if (btn) btn.disabled = false;
+        }
     }
 
     function saveKeys() {
@@ -278,7 +315,9 @@ document.addEventListener('DOMContentLoaded', () => {
             coverr_key: valueOf('coverr-key'),
             yt_client_id: valueOf('yt-client-id'),
             yt_client_secret: valueOf('yt-client-secret'),
-            eleven_key: valueOf('eleven-key')
+            eleven_key: valueOf('eleven-key'),
+            azure_speech_key: valueOf('azure-speech-key'),
+            azure_speech_region: valueOf('azure-speech-region')
         };
         const merged = { ...saved };
         const stale = ["seedream_key", "seedream_url", "seedream_model", "replicate_key", "replicate_model", "piapi_key", "piapi_model"];
@@ -308,6 +347,7 @@ document.addEventListener('DOMContentLoaded', () => {
         'llm-key', 'llm-url', 'llm-model', 'llm-preset',
         'pexels-key', 'pixabay-key', 'coverr-key',
         'yt-client-id', 'yt-client-secret', 'eleven-key',
+        'azure-speech-key', 'azure-speech-region',
         'query', 'url-input', 'topic-input', 'keywords-input', 'script',
         'local-files', 'ai-title', 'ai-desc', 'ai-hashtags', 'ai-thumb-prompt',
     ]);
@@ -393,7 +433,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const saveBtn = document.getElementById('save-keys-btn');
     if (saveBtn) saveBtn.addEventListener('click', saveKeys);
-    ['eleven-key', 'yt-client-id', 'yt-client-secret'].forEach((id) => {
+    ['eleven-key', 'yt-client-id', 'yt-client-secret', 'azure-speech-key', 'azure-speech-region'].forEach((id) => {
         const el = document.getElementById(id);
         if (el) el.addEventListener('input', persistKeysSoon);
     });
@@ -504,59 +544,49 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const languageSelect = document.getElementById('language-select');
     const voiceSelect = document.getElementById('voice-select');
+    const ELEVEN_VOICES = [
+        { name: 'Adam (ElevenLabs)', value: 'eleven_pNInz6obpg8ndclQU7Nc' },
+        { name: 'Antoni (ElevenLabs)', value: 'eleven_ErXwBPLxhSj618Y4yxKI' },
+        { name: 'Bella (ElevenLabs)', value: 'eleven_EXAVITQu4vr4xnSDxMaL' }
+    ];
 
-    const voiceMap = {
-        'en-US': [
-            { name: 'Christopher (free)', value: 'en-US-ChristopherNeural' },
-            { name: 'Jenny (free)', value: 'en-US-JennyNeural' },
-            { name: 'Adam (ElevenLabs)', value: 'eleven_pNInz6obpg8ndclQU7Nc' },
-            { name: 'Antoni (ElevenLabs)', value: 'eleven_ErXwBPLxhSj618Y4yxKI' },
-            { name: 'Bella (ElevenLabs)', value: 'eleven_EXAVITQu4vr4xnSDxMaL' }
-        ],
-        'en-GB': [
-            { name: 'Ryan', value: 'en-GB-RyanNeural' },
-            { name: 'Sonia', value: 'en-GB-SoniaNeural' },
-            { name: 'Libby', value: 'en-GB-LibbyNeural' },
-            { name: 'Thomas', value: 'en-GB-ThomasNeural' }
-        ],
-        'es-ES': [
-            { name: 'Alvaro', value: 'es-ES-AlvaroNeural' },
-            { name: 'Elvira', value: 'es-ES-ElviraNeural' }
-        ],
-        'fr-FR': [
-            { name: 'Henri', value: 'fr-FR-HenriNeural' },
-            { name: 'Denise', value: 'fr-FR-DeniseNeural' }
-        ],
-        'de-DE': [
-            { name: 'Conrad', value: 'de-DE-ConradNeural' },
-            { name: 'Katja', value: 'de-DE-KatjaNeural' }
-        ],
-        'it-IT': [
-            { name: 'Diego', value: 'it-IT-DiegoNeural' },
-            { name: 'Elsa', value: 'it-IT-ElsaNeural' }
-        ],
-        'hi-IN': [
-            { name: 'Madhur', value: 'hi-IN-MadhurNeural' },
-            { name: 'Swara', value: 'hi-IN-SwaraNeural' }
-        ],
-        'ur-PK': [
-            { name: 'Asad', value: 'ur-PK-AsadNeural' },
-            { name: 'Uzma', value: 'ur-PK-UzmaNeural' }
-        ],
-        'zh-CN': [
-            { name: 'Yunyang (male)', value: 'zh-CN-YunyangNeural' },
-            { name: 'Xiaoxiao (female)', value: 'zh-CN-XiaoxiaoNeural' }
-        ],
-        'ja-JP': [
-            { name: 'Keita', value: 'ja-JP-KeitaNeural' },
-            { name: 'Nanami', value: 'ja-JP-NanamiNeural' }
-        ]
-    };
+    function rebuildThemedSelect(select) {
+        const wrap = select?.closest('.source-dropdown');
+        if (wrap && typeof wrap.rebuildThemed === 'function') wrap.rebuildThemed();
+    }
 
-    function updateVoices() {
-        const lang = languageSelect.value;
-        const voices = voiceMap[lang] || [];
-        voiceSelect.innerHTML = voices.map(v => `<option value="${v.value}">${v.name}</option>`).join('') + '<option value="none">No voice (assets only)</option>';
+    function updateTtsNotes() {
+        const server = document.getElementById('tts-server')?.value || 'azure-tts-v1';
+        const v1 = document.getElementById('azure-v1-note');
+        const v2 = document.getElementById('azure-v2-note');
+        if (v1) v1.style.display = server === 'azure-tts-v1' ? '' : 'none';
+        if (v2) v2.style.display = server === 'azure-tts-v2' ? '' : 'none';
+    }
+
+    async function refreshVoiceList(preferred) {
+        if (!voiceSelect) return;
+        updateTtsNotes();
+        const server = document.getElementById('tts-server')?.value || 'azure-tts-v1';
+        const lang = languageSelect?.value || 'en-US';
+        const keep = preferred || voiceSelect.value;
+        let voices = [];
+        if (server === 'elevenlabs') {
+            voices = ELEVEN_VOICES;
+        } else {
+            try {
+                const response = await fetch(`/api/voices?server=${encodeURIComponent(server)}&language=${encodeURIComponent(lang)}`);
+                const data = await response.json();
+                voices = data.voices || [];
+            } catch (error) {
+                voices = [];
+            }
+        }
+        voiceSelect.innerHTML = voices.map((item) => (
+            `<option value="${item.value}">${item.label || item.name}</option>`
+        )).join('') + '<option value="none">No voice (assets only)</option>';
+        const ok = Array.from(voiceSelect.options).some((opt) => opt.value === keep);
+        voiceSelect.value = ok ? keep : (voiceSelect.options[0]?.value || 'none');
+        rebuildThemedSelect(voiceSelect);
     }
 
     function applySuspenseDefaults() {
@@ -575,11 +605,13 @@ document.addEventListener('DOMContentLoaded', () => {
         setChecked('emoji-subs-off');
         setChecked('vibe-suspense');
 
-        if (languageSelect) {
-            languageSelect.value = 'zh-CN';
-            updateVoices();
+        const ttsServer = document.getElementById('tts-server');
+        if (ttsServer) {
+            ttsServer.value = 'azure-tts-v1';
+            rebuildThemedSelect(ttsServer);
         }
-        if (voiceSelect) voiceSelect.value = 'zh-CN-YunyangNeural';
+        if (languageSelect) languageSelect.value = 'zh-CN';
+        refreshVoiceList('zh-CN-YunyangNeural-Male');
 
         if (musicSelect) musicSelect.value = 'none';
 
@@ -599,8 +631,7 @@ document.addEventListener('DOMContentLoaded', () => {
     updateCaptionPositionUi();
 
     if (languageSelect) {
-        languageSelect.addEventListener('change', updateVoices);
-        updateVoices();
+        languageSelect.addEventListener('change', () => refreshVoiceList());
     }
 
     switchMode('script');
@@ -628,13 +659,13 @@ document.addEventListener('DOMContentLoaded', () => {
         input.addEventListener('change', onSourceOrAutoVideoChange);
     });
 
-    function initSourceDropdown() {
-        const select = document.getElementById('source-select');
-        const wrap = document.getElementById('source-dropdown');
-        const toggle = document.getElementById('source-dropdown-toggle');
-        const label = document.getElementById('source-dropdown-label');
-        const menu = document.getElementById('source-dropdown-menu');
-        if (!select || !wrap || !toggle || !label || !menu) return;
+    function initThemedDropdown(wrap) {
+        if (!wrap) return;
+        const select = wrap.querySelector('select');
+        const toggle = wrap.querySelector('.source-dropdown-toggle');
+        const label = wrap.querySelector('.themed-dropdown-label') || wrap.querySelector('span');
+        const menu = wrap.querySelector('.source-dropdown-menu');
+        if (!select || !toggle || !label || !menu) return;
 
         function syncLabel() {
             const opt = select.options[select.selectedIndex];
@@ -650,10 +681,15 @@ document.addEventListener('DOMContentLoaded', () => {
             menu.hidden = !open;
         }
 
-        menu.innerHTML = Array.from(select.options).map((opt) => (
-            `<li role="option" data-value="${opt.value}">${opt.textContent}</li>`
-        )).join('');
-        syncLabel();
+        function rebuild() {
+            menu.innerHTML = Array.from(select.options).map((opt) => (
+                `<li role="option" data-value="${opt.value}">${opt.textContent}</li>`
+            )).join('');
+            syncLabel();
+        }
+
+        wrap.rebuildThemed = rebuild;
+        rebuild();
 
         toggle.addEventListener('click', (event) => {
             event.stopPropagation();
@@ -672,7 +708,8 @@ document.addEventListener('DOMContentLoaded', () => {
             if (event.key === 'Escape') setOpen(false);
         });
     }
-    initSourceDropdown();
+    document.querySelectorAll('.source-dropdown').forEach(initThemedDropdown);
+    document.getElementById('tts-server')?.addEventListener('change', () => refreshVoiceList());
 
     function updateProviderFallbackVisibility() {
         const wrap = document.getElementById('provider-fallback-wrap');
@@ -686,48 +723,40 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     updateProviderFallbackVisibility();
 
-    function restorePanelSettings() {
+    async function restorePanelSettings() {
         let saved;
         try {
             saved = JSON.parse(localStorage.getItem(PANEL_SETTINGS_KEY) || 'null');
         } catch (error) {
-            return;
+            saved = null;
         }
-        if (!saved || typeof saved !== 'object') return;
         restoringPanel = true;
         try {
-            Object.entries(saved.radios || {}).forEach(([name, value]) => {
-                const el = document.querySelector(`input[type="radio"][name="${name}"][value="${value}"]`);
-                if (el) el.checked = true;
-            });
-            const fields = saved.fields || {};
-            Object.entries(fields).forEach(([id, value]) => {
-                if (id === 'voice-select') return;
-                const el = document.getElementById(id);
-                if (!el || PANEL_SKIP_IDS.has(id)) return;
-                if (el.tagName === 'SELECT') {
-                    const ok = Array.from(el.options).some((opt) => opt.value === value);
-                    if (ok) el.value = value;
-                } else if (el.type === 'checkbox') {
-                    el.checked = Boolean(value);
-                } else {
-                    el.value = value;
-                    if (el.type === 'range' || el.type === 'number') syncRangeLabel(el);
-                }
-            });
-            if (typeof updateVoices === 'function') updateVoices();
-            const voiceEl = document.getElementById('voice-select');
-            if (voiceEl && fields['voice-select']) {
-                const ok = Array.from(voiceEl.options).some((opt) => opt.value === fields['voice-select']);
-                if (ok) voiceEl.value = fields['voice-select'];
+            const fields = saved?.fields || {};
+            if (saved && typeof saved === 'object') {
+                Object.entries(saved.radios || {}).forEach(([name, value]) => {
+                    const el = document.querySelector(`input[type="radio"][name="${name}"][value="${value}"]`);
+                    if (el) el.checked = true;
+                });
+                Object.entries(fields).forEach(([id, value]) => {
+                    if (id === 'voice-select') return;
+                    const el = document.getElementById(id);
+                    if (!el || PANEL_SKIP_IDS.has(id)) return;
+                    if (el.tagName === 'SELECT') {
+                        const ok = Array.from(el.options).some((opt) => opt.value === value);
+                        if (ok) el.value = value;
+                    } else if (el.type === 'checkbox') {
+                        el.checked = Boolean(value);
+                    } else {
+                        el.value = value;
+                        if (el.type === 'range' || el.type === 'number') syncRangeLabel(el);
+                    }
+                });
+                if (saved.mode === 'single' || saved.mode === 'script') switchMode(saved.mode);
             }
-            if (saved.mode === 'single' || saved.mode === 'script') switchMode(saved.mode);
-            const sourceSelect = document.getElementById('source-select');
-            const sourceLabel = document.getElementById('source-dropdown-label');
-            if (sourceSelect && sourceLabel) {
-                const opt = sourceSelect.options[sourceSelect.selectedIndex];
-                if (opt) sourceLabel.textContent = opt.textContent;
-            }
+            rebuildThemedSelect(document.getElementById('tts-server'));
+            rebuildThemedSelect(document.getElementById('source-select'));
+            await refreshVoiceList(fields['voice-select']);
             updateCaptionPositionUi();
             updateProviderFallbackVisibility();
             updatePrimaryButtonText();
@@ -984,7 +1013,10 @@ document.addEventListener('DOMContentLoaded', () => {
                         language: document.getElementById('language-select').value,
                         voice_rate: numVal('voice-rate', 100) / 100,
                         voice_volume: numVal('voice-volume', 100) / 100,
-                        eleven_key: keys.eleven_key || ''
+                        eleven_key: keys.eleven_key || '',
+                        tts_server: document.getElementById('tts-server')?.value || 'azure-tts-v1',
+                        azure_speech_key: keys.azure_speech_key || '',
+                        azure_speech_region: keys.azure_speech_region || ''
                     })
                 });
                 if (!response.ok) {
@@ -1112,6 +1144,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     local_files: localFiles,
                     video_settings: {
                         ratio, voice, subtitles, language,
+                        tts_server: document.getElementById('tts-server')?.value || 'azure-tts-v1',
                         subtitle_style: subtitleStyle, music, filter,
                         emoji_subtitles: emojiSubtitles,
                         watermark: watermark,
@@ -1142,7 +1175,9 @@ document.addEventListener('DOMContentLoaded', () => {
                         coverr_key: keys.coverr_key || '',
                         yt_client_id: keys.yt_client_id || '',
                         yt_client_secret: keys.yt_client_secret || '',
-                        eleven_key: keys.eleven_key || ''
+                        eleven_key: keys.eleven_key || '',
+                        azure_speech_key: keys.azure_speech_key || '',
+                        azure_speech_region: keys.azure_speech_region || ''
                     }
                 })
             });

@@ -9,7 +9,7 @@
         content="VUZA free AI video creator: turn a topic or script into stock footage, voiceover, subtitles, and a 9:16 short.">
     <meta name="keywords"
         content="VUZA, free ai video creator, faceless video generator, money printer tool, pinterest video scraper, pinterest scraper, free pictory ai alternative, free invideo alternative, moneyprinter turbo, pexels video downloader, pixabay scraper, edge tts, ai voiceover, auto subtitles, open source video tool, python video creator, script to video, tiktok video maker, youtube shorts creator, instagram reels, ai automation, free video generation, content creation tool">
-    <link rel="stylesheet" href="/static/style.css?v=5.5">
+    <link rel="stylesheet" href="/static/style.css?v=5.6">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap"
         rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
@@ -143,6 +143,25 @@
                                 <label>ElevenLabs API key <a href="https://elevenlabs.io/api" target="_blank" class="get-key">Get key →</a></label>
                                 <input type="password" id="eleven-key" placeholder="Optional ElevenLabs API key" autocomplete="off">
                             </div>
+                        </div>
+                    </div>
+
+                    <div class="settings-row">
+                        <h4><i class="fas fa-cloud"></i> Azure TTS V2 (optional)</h4>
+                        <p class="settings-note">Required only for Azure TTS V2. <a href="https://portal.azure.com/#view/Microsoft_Azure_ProjectOxford/CognitiveServicesHub/~/SpeechServices" target="_blank" class="get-key">Azure Portal →</a></p>
+                        <div class="key-grid two-col">
+                            <div class="key-field">
+                                <label>Speech region</label>
+                                <input type="text" id="azure-speech-region" placeholder="eastus" autocomplete="off">
+                            </div>
+                            <div class="key-field">
+                                <label>Speech API key</label>
+                                <input type="password" id="azure-speech-key" placeholder="Azure Speech key" autocomplete="off">
+                            </div>
+                        </div>
+                        <div class="stock-test-row">
+                            <button type="button" class="secondary-btn" id="test-azure-tts-btn">Test API</button>
+                            <p class="settings-note prov-status" id="azure-tts-test-status"></p>
                         </div>
                     </div>
 
@@ -292,7 +311,7 @@
                                 <option value="round_robin">Round-Robin</option>
                             </select>
                             <button type="button" class="source-dropdown-toggle" id="source-dropdown-toggle" aria-expanded="false" aria-haspopup="listbox">
-                                <span id="source-dropdown-label">Mixkit</span>
+                                <span id="source-dropdown-label" class="themed-dropdown-label">Mixkit</span>
                                 <i class="fas fa-chevron-down source-dropdown-caret"></i>
                             </button>
                             <ul class="source-dropdown-menu" id="source-dropdown-menu" role="listbox" hidden></ul>
@@ -420,12 +439,35 @@
                             </select>
                         </div>
                         <div class="setting-card">
+                            <div class="setting-label">Voiceover service</div>
+                            <div class="source-dropdown" id="tts-server-dropdown">
+                                <select id="tts-server" class="source-select-native" tabindex="-1" aria-hidden="true">
+                                    <option value="azure-tts-v1" selected>Azure TTS V1</option>
+                                    <option value="azure-tts-v2">Azure TTS V2</option>
+                                    <option value="elevenlabs">ElevenLabs</option>
+                                </select>
+                                <button type="button" class="source-dropdown-toggle" aria-expanded="false" aria-haspopup="listbox">
+                                    <span class="themed-dropdown-label">Azure TTS V1</span>
+                                    <i class="fas fa-chevron-down source-dropdown-caret"></i>
+                                </button>
+                                <ul class="source-dropdown-menu" role="listbox" hidden></ul>
+                            </div>
+                            <p class="settings-note" id="azure-v1-note">Azure TTS V1 is free Edge TTS. No API key.</p>
+                            <p class="settings-note" id="azure-v2-note" style="display:none">Requires an Azure Speech region and API key. Add them in API settings.</p>
+                        </div>
+                        <div class="setting-card">
                             <div class="setting-label">AI voice</div>
-                            <select id="voice-select" class="custom-select">
-                                <option value="en-US-ChristopherNeural" selected>Christopher (free)</option>
-                                <option value="en-US-JennyNeural">Jenny (free)</option>
-                                <option value="none">🔇 No voice (assets only)</option>
-                            </select>
+                            <div class="source-dropdown" id="voice-dropdown">
+                                <select id="voice-select" class="source-select-native" tabindex="-1" aria-hidden="true">
+                                    <option value="en-US-ChristopherNeural-Male" selected>en-US-Christopher-Male</option>
+                                    <option value="none">No voice (assets only)</option>
+                                </select>
+                                <button type="button" class="source-dropdown-toggle" aria-expanded="false" aria-haspopup="listbox">
+                                    <span class="themed-dropdown-label">en-US-Christopher-Male</span>
+                                    <i class="fas fa-chevron-down source-dropdown-caret"></i>
+                                </button>
+                                <ul class="source-dropdown-menu" role="listbox" hidden></ul>
+                            </div>
                             <button type="button" id="voice-preview-btn" class="secondary-btn">Preview voice</button>
                         </div>
                         <div class="setting-card">
@@ -674,7 +716,7 @@
     </div>
 
     <div id="toast" class="toast hidden"></div>
-    <script src="/static/script.js?v=7.6"></script>
+    <script src="/static/script.js?v=7.8"></script>
 </body>
 
 </html>

@@ -788,6 +788,8 @@ body {
     border-top: 1px solid rgba(139, 92, 246, 0.22);
     border-radius: 4px 4px 14px 14px;
     box-shadow: 0 16px 32px rgba(0, 0, 0, 0.55), 0 0 18px var(--primary-glow);
+    max-height: 280px;
+    overflow-y: auto;
 }
 
 .source-dropdown-menu [role="option"] {

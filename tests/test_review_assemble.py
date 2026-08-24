@@ -17,9 +17,10 @@ from app import (
     group_scenes_to_clip_budget,
     pending_assembly,
     scraping_status,
+    azure_voice_options,
 )
 from semantic_media import MediaCandidate
-from video_engine import best_crop_box, scene_visual_plan, subtitle_top, resolve_font_path
+from video_engine import best_crop_box, scene_visual_plan, subtitle_top, resolve_font_path, parse_azure_voice_name, azure_v2_synthesis_name
 
 
 def _candidate(provider, asset_id, path):
@@ -236,6 +237,36 @@ class CaptionLayoutTests(unittest.TestCase):
         self.assertTrue(path)
         self.assertIn("static", path.replace("\\", "/").lower())
         self.assertTrue(path.endswith("BeVietnamPro-Bold.ttf"))
+
+
+class AzureVoiceTests(unittest.TestCase):
+    def test_parse_strips_gender_suffix(self):
+        self.assertEqual(parse_azure_voice_name("en-US-ChristopherNeural-Male"), "en-US-ChristopherNeural")
+
+    def test_v2_synthesis_name_strips_marker(self):
+        self.assertEqual(
+            azure_v2_synthesis_name("en-US-AndrewMultilingualNeural-V2-Male"),
+            "en-US-AndrewMultilingualNeural",
+        )
+        self.assertEqual(azure_v2_synthesis_name("en-US-ChristopherNeural-Male"), "")
+
+    def test_v1_list_matches_language_and_excludes_v2(self):
+        rows = azure_voice_options("azure-tts-v1", "en-US")
+        self.assertTrue(rows)
+        self.assertTrue(all(row["name"].startswith("en-US") for row in rows))
+        self.assertFalse(any("-V2" in row["name"] for row in rows))
+        self.assertTrue(any("Christopher" in row["value"] for row in rows))
+
+    def test_v2_includes_locale_neural_and_multilingual(self):
+        rows = azure_voice_options("azure-tts-v2", "en-US")
+        names = [row["name"] for row in rows]
+        self.assertTrue(any("Christopher" in name for name in names))
+        self.assertTrue(any("-V2" in name for name in names))
+        self.assertTrue(any("Multilingual" in name for name in names))
+        self.assertTrue(any(name.startswith("en-US") for name in names))
+        spanish = azure_voice_options("azure-tts-v2", "es-ES")
+        self.assertTrue(any(row["name"].startswith("es-ES") for row in spanish))
+        self.assertTrue(any("Multilingual" in row["name"] for row in spanish))
 
 
 class StatusReviewStateTests(unittest.TestCase):

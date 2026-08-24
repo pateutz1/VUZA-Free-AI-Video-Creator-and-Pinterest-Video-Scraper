@@ -1,4 +1,5 @@
 import asyncio
+import html
 import os
 import re
 import sys
@@ -81,6 +82,18 @@ def subtitle_top(frame_h, text_h, position="bottom", custom_pct=70.0):
     y = frame_h * (pct / 100.0) - text_h / 2.0
     margin = 24
     return max(margin, min(max(margin, frame_h - text_h - margin), y))
+
+
+def parse_azure_voice_name(name):
+    return (name or "").replace("-Female", "").replace("-Male", "").strip()
+
+
+def azure_v2_synthesis_name(name):
+    parsed = parse_azure_voice_name(name)
+    if parsed.endswith("-V2"):
+        return parsed[:-3]
+    return ""
+
 
 def contains_cjk(text):
     return bool(re.search(r'[\u3400-\u9fff]', text or ""))
@@ -308,12 +321,19 @@ class VideoEngine:
         self.temp_dir = self.output_dir / "temp"
         self.temp_dir.mkdir(exist_ok=True)
         self.eleven_key = None
+        self.azure_speech_key = None
+        self.azure_speech_region = None
+        self.tts_server = "azure-tts-v1"
 
     def set_eleven_key(self, key):
         self.eleven_key = key
 
+    def set_azure_speech(self, key, region):
+        self.azure_speech_key = (key or "").strip()
+        self.azure_speech_region = (region or "").strip()
+
     async def generate_voiceover(self, text, idx, voice="en-US-ChristopherNeural", language="en-US", voice_rate=1.0, voice_volume=1.0, timeout_seconds=60):
-        """Generates TTS audio for a single sentence with retries. Supports Edge-TTS and ElevenLabs."""
+        """Generates TTS audio for a single sentence with retries. Supports Edge-TTS, Azure V2, and ElevenLabs."""
         if not text or not text.strip():
             return None
 
@@ -335,12 +355,18 @@ class VideoEngine:
         if voice.startswith("eleven_"):
             return await self._generate_elevenlabs(text, idx, voice.replace("eleven_", ""))
 
+        azure_name = parse_azure_voice_name(voice)
+        v2_name = azure_v2_synthesis_name(voice)
+        use_v2 = self.tts_server == "azure-tts-v2" or bool(v2_name)
+        if use_v2:
+            return await self._generate_azure_v2(text, idx, v2_name or azure_name, voice_rate, voice_volume, timeout_seconds)
+
         rate_pct = int(round((float(voice_rate or 1.0) - 1.0) * 100))
         rate = f"{rate_pct:+d}%"
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                communicate = Communicate(text, voice, rate=rate)
+                communicate = Communicate(text, azure_name, rate=rate)
                 path = self.temp_dir / f"speech_{idx}.mp3"
                 await asyncio.wait_for(communicate.save(str(path)), timeout=timeout_seconds)
                 if float(voice_volume or 1.0) != 1.0 and path.exists():
@@ -356,6 +382,56 @@ class VideoEngine:
                 else:
                     print(f"❌ TTS Error after {max_retries} attempts: {e}")
                     return None
+
+    async def _generate_azure_v2(self, text, idx, voice_name, voice_rate, voice_volume, timeout_seconds):
+        if not self.azure_speech_key or not self.azure_speech_region:
+            print("⚠️ Azure Speech key or region missing")
+            return None
+        path = self.temp_dir / f"speech_{idx}.mp3"
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(self._azure_v2_rest, text, voice_name, voice_rate, path),
+                timeout=timeout_seconds,
+            )
+        except Exception as e:
+            print(f"❌ Azure TTS V2 error: {e}")
+            return None
+        if not path.exists():
+            return None
+        if float(voice_volume or 1.0) != 1.0:
+            from moviepy import AudioFileClip
+            clip = AudioFileClip(str(path)).with_volume_scaled(float(voice_volume))
+            clip.write_audiofile(str(path), logger=None)
+            clip.close()
+        return str(path)
+
+    def _azure_v2_rest(self, text, voice_name, voice_rate, path):
+        import requests
+        rate = max(0.25, min(4.0, float(voice_rate or 1.0)))
+        parts = voice_name.split("-", 2)
+        locale = "-".join(parts[:2]) if len(parts) >= 2 else "en-US"
+        ssml = (
+            '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+            f'xml:lang="{html.escape(locale)}">'
+            f'<voice name="{html.escape(voice_name, quote=True)}">'
+            f'<prosody rate="{rate:g}">{html.escape(text)}</prosody>'
+            "</voice></speak>"
+        )
+        url = f"https://{self.azure_speech_region}.tts.speech.microsoft.com/cognitiveservices/v1"
+        response = requests.post(
+            url,
+            headers={
+                "Ocp-Apim-Subscription-Key": self.azure_speech_key,
+                "Content-Type": "application/ssml+xml",
+                "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+                "User-Agent": "VUZA",
+            },
+            data=ssml.encode("utf-8"),
+            timeout=45,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"Azure TTS HTTP {response.status_code}: {response.text[:240]}")
+        path.write_bytes(response.content)
 
     async def _generate_elevenlabs(self, text, idx, voice_id):
         """Generates TTS using ElevenLabs API."""

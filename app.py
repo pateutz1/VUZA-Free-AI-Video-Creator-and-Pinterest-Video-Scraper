@@ -85,6 +85,7 @@ pending_assembly = {}
 class VideoSettings(BaseModel):
     ratio: str = "9:16"
     voice: str = "en-US-ChristopherNeural"
+    tts_server: str = "azure-tts-v1"
     subtitles: bool = True
     language: str = "en-US"
     subtitle_style: str = "high_retention"
@@ -119,6 +120,8 @@ class ApiKeys(BaseModel):
     yt_client_id: str = ""
     yt_client_secret: str = ""
     eleven_key: str = ""
+    azure_speech_key: str = ""
+    azure_speech_region: str = ""
 
 class ScrapeRequest(BaseModel):
     query: Optional[str] = None
@@ -150,6 +153,9 @@ class VoicePreviewRequest(BaseModel):
     voice_rate: float = 1.0
     voice_volume: float = 1.0
     eleven_key: str = ""
+    tts_server: str = "azure-tts-v1"
+    azure_speech_key: str = ""
+    azure_speech_region: str = ""
 
 class LlmTestRequest(BaseModel):
     provider: str = ""
@@ -160,6 +166,10 @@ class LlmTestRequest(BaseModel):
 class StockTestRequest(BaseModel):
     provider: str = ""
     api_key: str = ""
+
+class AzureTtsTestRequest(BaseModel):
+    api_key: str = ""
+    region: str = ""
 
 LLM_PROVIDER_MODELS = {
     "openrouter": [
@@ -317,6 +327,35 @@ async def test_stock(request: StockTestRequest):
     print(f"✅ Stock test ok: {provider} hits={count}")
     return {"ok": True, "provider": provider, "hits": count}
 
+@app.post("/api/tts/azure/test")
+async def test_azure_tts(request: AzureTtsTestRequest):
+    import requests as req
+    api_key = (request.api_key or "").strip()
+    region = (request.region or "").strip()
+    if not region:
+        raise HTTPException(status_code=400, detail="Enter an Azure Speech region first.")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Enter an Azure Speech API key first.")
+    url = f"https://{region}.api.cognitive.microsoft.com/sts/v1.0/issueToken"
+
+    def ping():
+        return req.post(
+            url,
+            headers={"Ocp-Apim-Subscription-Key": api_key, "Content-Length": "0"},
+            timeout=(8, 15),
+        )
+
+    try:
+        response = await asyncio.to_thread(ping)
+    except req.RequestException as exc:
+        raise HTTPException(status_code=400, detail=f"Could not reach Azure Speech: {exc}") from exc
+    if response.status_code in (401, 403):
+        raise HTTPException(status_code=400, detail="Azure Speech rejected this region or API key.")
+    if response.status_code != 200 or not (response.text or "").strip():
+        raise HTTPException(status_code=400, detail=f"Azure Speech: HTTP {response.status_code}")
+    print(f"✅ Azure TTS V2 test ok: region={region}")
+    return {"ok": True, "note": f"token issued · {region}"}
+
 @app.get("/api/music")
 async def list_music():
     music_dir = BASE_DIR / "static" / "music"
@@ -330,6 +369,46 @@ async def list_music():
         print(f"⚠️ Mixkit music catalog unavailable: {exc}")
     files.extend(track["id"] for track in mixkit_tracks)
     return {"files": files, "mixkit_tracks": mixkit_tracks}
+
+AZURE_VOICES_PATH = BASE_DIR / "data" / "azure_voices.json"
+_azure_voices_cache = None
+
+def load_azure_voices():
+    global _azure_voices_cache
+    if _azure_voices_cache is None:
+        with open(AZURE_VOICES_PATH, encoding="utf-8") as handle:
+            _azure_voices_cache = json.load(handle)
+    return _azure_voices_cache
+
+def azure_voice_options(server="azure-tts-v1", language="en-US"):
+    want_v2 = (server or "") == "azure-tts-v2"
+    lang = (language or "en-US").strip().lower()
+    rows = []
+    for item in load_azure_voices():
+        name = item.get("name") or ""
+        gender = item.get("gender") or ""
+        is_v2 = name.endswith("-V2") or "-V2" in name
+        is_multi = "Multilingual" in name
+        locale_ok = bool(lang) and name.lower().startswith(lang)
+        if want_v2:
+            if not (locale_ok or is_multi or is_v2):
+                continue
+        else:
+            if is_v2:
+                continue
+            if lang and not locale_ok:
+                continue
+        value = f"{name}-{gender}" if gender else name
+        label = f"{name.replace('Neural', '')}-{gender}".replace("--", "-") if gender else name.replace("Neural", "")
+        rows.append({"value": value, "label": label, "name": name, "gender": gender})
+    rows.sort(key=lambda row: (0 if row["name"].lower().startswith(lang) else 1, row["label"]))
+    return rows
+
+@app.get("/api/voices")
+async def list_voices(server: str = "azure-tts-v1", language: str = "en-US"):
+    if server == "elevenlabs":
+        return {"voices": []}
+    return {"voices": azure_voice_options(server, language)}
 
 @app.post("/api/analyze")
 async def analyze_script(request: ScrapeRequest):
@@ -518,6 +597,8 @@ async def tts_preview(request: VoicePreviewRequest):
     engine = load_video_engine()(output_dir=DOWNLOAD_DIR / "_preview")
     if request.eleven_key:
         engine.set_eleven_key(request.eleven_key)
+    engine.tts_server = request.tts_server or "azure-tts-v1"
+    engine.set_azure_speech(request.azure_speech_key, request.azure_speech_region)
     path = await engine.generate_voiceover(
         text,
         0,
@@ -1732,6 +1813,11 @@ async def run_video_assembly(
     engine = load_video_engine()(output_dir=project_path.parent)
     if api_keys.eleven_key:
         engine.set_eleven_key(api_keys.eleven_key)
+    engine.tts_server = getattr(settings, "tts_server", "azure-tts-v1") or "azure-tts-v1"
+    engine.set_azure_speech(
+        getattr(api_keys, "azure_speech_key", "") or "",
+        getattr(api_keys, "azure_speech_region", "") or "",
+    )
     voice = settings.voice if settings.voice != "none" else None
     if not voice:
         raise RuntimeError("Auto video requires a TTS voice; voice=none cannot produce one narration file per scene.")

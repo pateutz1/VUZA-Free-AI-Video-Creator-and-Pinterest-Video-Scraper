@@ -6,6 +6,7 @@ from pathlib import Path
 from edge_tts import Communicate
 from moviepy import VideoFileClip, ImageClip, AudioFileClip, TextClip, CompositeVideoClip, concatenate_videoclips
 from moviepy.video import fx as vfx
+from media_quality import frame_is_unusable, frames_are_frozen
 
 for stream in (sys.stdout, sys.stderr):
     if hasattr(stream, "reconfigure"):
@@ -115,27 +116,15 @@ def crop_center(clip, w, h):
         clip = clip.cropped(y1=int((ch - new_h) / 2), height=new_h)
     return clip.resized((w, h))
 
-def frame_is_unusable(frame):
-    import numpy as np
-    arr = np.asarray(frame)
-    if arr.size == 0:
-        return True
-    return float(arr.mean()) < 16 or float(arr.std()) < 7
-
 def clip_is_unusable(clip):
     if clip is None or getattr(clip, "duration", 0) < 1.15:
         return True
     try:
-        import numpy as np
         times = [clip.duration * t for t in (0.25, 0.5, 0.75)]
         frames = [clip.get_frame(min(t, max(clip.duration - 0.02, 0))) for t in times]
         if any(frame_is_unusable(f) for f in frames):
             return True
-        diffs = [
-            float(np.mean(np.abs(frames[i].astype("float32") - frames[0].astype("float32"))))
-            for i in range(1, len(frames))
-        ]
-        return bool(diffs) and max(diffs) < 2.5
+        return frames_are_frozen(frames)
     except Exception:
         return False
 
@@ -324,8 +313,7 @@ class VideoEngine:
             audio_path = str(self.temp_dir / f"speech_{i}.mp3")
 
             if not os.path.exists(audio_path) or os.path.getsize(audio_path) <= 0:
-                print(f"❌ Missing TTS for scene {i + 1}: {audio_path}")
-                return None
+                raise RuntimeError(f"Missing TTS for scene {i + 1}: {audio_path}")
 
             # Create Audio Clip
             audio_clip = AudioFileClip(audio_path)
@@ -353,8 +341,7 @@ class VideoEngine:
                 ])
             files = explicit_files or folder_files
             if not files:
-                print(f"❌ Empty media folder for scene {i + 1}: {keyword}")
-                return None
+                raise RuntimeError(f"Empty media folder for scene {i + 1}: {keyword}")
 
             image_exts = {'.jpg', '.jpeg', '.png', '.webp'}
             video_exts = {'.mp4', '.mov', '.m4v', '.webm'}
@@ -421,8 +408,7 @@ class VideoEngine:
                         unique_first.append(file_path)
                 preferred_pool = unique_first
                 if not preferred_pool:
-                    print(f"❌ No unique unused clip for scene {i + 1}: {keyword}")
-                    return None
+                    raise RuntimeError(f"No unique unused clip for scene {i + 1}: {keyword}")
             else:
                 preferred_pool = preferred_files
 
@@ -437,11 +423,10 @@ class VideoEngine:
                     num_segments = max(1, int(duration / 1.6))
             segment_duration = duration / num_segments
             if video_mode and len(preferred_pool) < num_segments:
-                print(
-                    f"❌ Scene {i + 1} needs {num_segments} unique clips for {duration:.2f}s "
+                raise RuntimeError(
+                    f"Scene {i + 1} needs {num_segments} unique clips for {duration:.2f}s "
                     f"(clip_duration={segment_seconds}s) but only {len(preferred_pool)} unique sources remain"
                 )
-                return None
             parts = []
             used = []
             for file_path in preferred_pool:
@@ -454,16 +439,14 @@ class VideoEngine:
                 if len(parts) >= num_segments:
                     break
             if not parts:
-                print(f"❌ No usable (non-black) clip for scene {i + 1}: {keyword}")
-                return None
+                raise RuntimeError(f"No usable (non-black) clip for scene {i + 1}: {keyword}")
             if video_mode:
                 covered = sum(float(part.duration or 0) for part in parts)
                 if covered + 0.05 < duration:
-                    print(
-                        f"❌ Scene {i + 1} unique footage {covered:.2f}s cannot cover narration {duration:.2f}s "
+                    raise RuntimeError(
+                        f"Scene {i + 1} unique footage {covered:.2f}s cannot cover narration {duration:.2f}s "
                         f"without looping one source"
                     )
-                    return None
             if (not video_mode) and len(parts) == 1 and num_segments > 1:
                 rebuilt = build_visual_clip(used[0], duration, allow_loop=True)
                 visual_clip = rebuilt or parts[0]
@@ -614,9 +597,11 @@ class VideoEngine:
             final_clips.append(visual_clip)
 
         if len(final_clips) != len(script_data):
-            print(f"❌ Scene assembly incomplete: expected {len(script_data)}, got {len(final_clips)}")
-            return None
-        if not final_clips: return None
+            raise RuntimeError(
+                f"Scene assembly incomplete: expected {len(script_data)}, got {len(final_clips)}"
+            )
+        if not final_clips:
+            raise RuntimeError("Scene assembly incomplete: no clips produced")
 
         # Concatenate
         final_video = concatenate_videoclips(final_clips, method="chain")
@@ -645,7 +630,6 @@ class VideoEngine:
         output_filename = self.output_dir / (output_name or "final_aesthetic_video.mp4")
         final_video.write_videofile(str(output_filename), fps=24, codec='libx264', audio_codec='aac', threads=4)
         if not output_filename.exists() or output_filename.stat().st_size <= 0:
-            print(f"❌ Video export failed or empty: {output_filename}")
-            return None
+            raise RuntimeError(f"Video export failed or empty: {output_filename}")
         print(f"✅ Video Saved: {output_filename}")
         return str(output_filename)

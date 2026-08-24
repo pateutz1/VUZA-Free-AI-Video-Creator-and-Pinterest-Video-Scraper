@@ -430,6 +430,8 @@ class PinterestParseTests(unittest.TestCase):
         self.assertTrue(is_text_heavy_pin({"title": "full body kettlebell workout"}))
         self.assertTrue(is_text_heavy_pin({"title": "Reverse lunge 3 x 10"}))
         self.assertTrue(is_text_heavy_pin({"title": "gym session \U0001F525"}))
+        self.assertTrue(is_text_heavy_pin({"title": "Don't do this DB Hammer Curls"}))
+        self.assertTrue(is_text_heavy_pin({"title": "Wanna get buff physique like"}))
 
     def test_hls_only_converts_to_mp4(self):
         from aesthetic_scraper import pinterest_mp4_urls, pinterest_video_rendition
@@ -490,15 +492,18 @@ class KeywordParseHookTests(unittest.TestCase):
         ]
         mapped = apply_user_keywords(
             grouped,
-            ["gym", "gym squat", "gym lifting heavy barbell"],
+            ["gym motivation workout", "gym dedication challenge", "gym fitness", "gym"],
             "gym, fitness, motivation",
         )
-        self.assertEqual(mapped[0]["keyword"], "gym lifting heavy barbell")
-        self.assertEqual(mapped[1]["keyword"], "gym lifting heavy barbell")
-        self.assertEqual(mapped[0]["_alts"], ["gym squat", "gym"])
+        self.assertEqual(mapped[0]["keyword"], "gym motivation workout")
+        self.assertEqual(mapped[1]["keyword"], "gym motivation workout")
+        self.assertEqual(
+            mapped[0]["_alts"],
+            ["gym dedication challenge", "gym fitness", "gym"],
+        )
         self.assertEqual(
             stock_query_plan(mapped),
-            ["gym lifting heavy barbell", "gym squat", "gym"],
+            ["gym motivation workout", "gym dedication challenge", "gym fitness", "gym"],
         )
 
     def test_keywords_from_topic_always_four_longest_first(self):

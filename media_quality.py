@@ -109,7 +109,7 @@ def download_http(url, path, timeout=60, min_bytes=MIN_VIDEO_BYTES, verify=True)
 def probe_video(path):
     from moviepy import VideoFileClip
 
-    clip = VideoFileClip(str(path))
+    clip = VideoFileClip(str(path), audio=False)
     try:
         width, height = clip.size if clip.size else (0, 0)
         return {
@@ -120,6 +120,61 @@ def probe_video(path):
         }
     finally:
         clip.close()
+
+
+def caption_line_score(gray):
+    """Fraction of frame height occupied by the thickest locally-bright letter row-run."""
+    import numpy as np
+
+    gray = np.asarray(gray, dtype="float32")
+    if gray.ndim != 2 or gray.size == 0:
+        return 0.0
+    height, width = gray.shape
+    if height < 16 or width < 16:
+        return 0.0
+    step = max(1, height // 240)
+    small = gray[::step, ::step]
+    rows, cols = small.shape
+    hits = np.zeros(rows, dtype=np.uint8)
+    max_letter = max(3, int(cols * 0.38))
+    for y in range(rows):
+        row = small[y]
+        median = float(np.median(row))
+        hot = row > max(median + 45, 155)
+        padded = np.concatenate([[0], hot.astype(np.int8), [0]])
+        delta = np.diff(padded)
+        starts = np.where(delta == 1)[0]
+        ends = np.where(delta == -1)[0]
+        widths = ends - starts
+        letters = widths[(widths >= 2) & (widths <= max_letter)]
+        cover = float(letters.sum()) / max(cols, 1)
+        if 2 <= len(letters) <= 20 and 0.07 <= cover <= 0.65:
+            hits[y] = 1
+    best = run = 0
+    for value in hits:
+        run = run + 1 if value else 0
+        best = max(best, run)
+    return best / max(rows, 1)
+
+
+def red_banner_score(frame):
+    import numpy as np
+
+    frame = np.asarray(frame)
+    if frame.ndim != 3 or frame.shape[2] < 3:
+        return 0.0
+    red = frame[:, :, 0].astype("float32")
+    green = frame[:, :, 1].astype("float32")
+    blue = frame[:, :, 2].astype("float32")
+    mask = (red > 155) & (green < 90) & (blue < 90)
+    height, width = mask.shape
+    top = mask[: max(1, int(height * 0.28))]
+    scores = [float(top.mean())]
+    third = max(1, width // 3)
+    scores.append(float(top[:, :third].mean()))
+    scores.append(float(top[:, third: 2 * third].mean()))
+    scores.append(float(top[:, 2 * third:].mean()))
+    return max(scores)
 
 
 def overlay_text_score(gray):
@@ -170,30 +225,59 @@ def overlay_text_score(gray):
     return max(top, mid, bottom)
 
 
+def frame_is_unusable(frame):
+    import numpy as np
+
+    arr = np.asarray(frame)
+    if arr.size == 0:
+        return True
+    return float(arr.mean()) < 16 or float(arr.std()) < 7
+
+
+def frames_are_frozen(frames):
+    import numpy as np
+
+    if len(frames) < 2:
+        return False
+    first = frames[0].astype("float32")
+    diffs = [
+        float(np.mean(np.abs(frame.astype("float32") - first)))
+        for frame in frames[1:]
+    ]
+    return bool(diffs) and max(diffs) < 2.5
+
+
+def frame_has_overlay(frame):
+    import numpy as np
+
+    if frame is None:
+        return False
+    gray = np.mean(frame, axis=2)
+    if overlay_text_score(gray) >= 0.28:
+        return True
+    if caption_line_score(gray) >= 0.05:
+        return True
+    if red_banner_score(frame) >= 0.04:
+        return True
+    return False
+
+
 def video_has_overlay_text(path):
     try:
         from moviepy import VideoFileClip
-        import numpy as np
     except Exception:
         return False
     clip = None
     try:
-        clip = VideoFileClip(str(path))
+        clip = VideoFileClip(str(path), audio=False)
         duration = float(clip.duration or 0)
         if duration <= 0:
             return False
-        stamps = [
-            min(max(duration * 0.05, 0), max(duration - 0.05, 0)),
-            min(max(duration * 0.35, 0), max(duration - 0.05, 0)),
-        ]
+        stamps = [min(max(duration * 0.08, 0), max(duration - 0.05, 0))]
         if duration > 2:
-            stamps.append(min(max(duration * 0.7, 0), max(duration - 0.05, 0)))
+            stamps.append(min(max(duration * 0.4, 0), max(duration - 0.05, 0)))
         for stamp in stamps:
-            frame = clip.get_frame(stamp)
-            if frame is None:
-                continue
-            gray = np.mean(frame, axis=2)
-            if overlay_text_score(gray) >= 0.28:
+            if frame_has_overlay(clip.get_frame(stamp)):
                 return True
         return False
     except Exception:
@@ -206,20 +290,58 @@ def video_has_overlay_text(path):
                 pass
 
 
+def probe_and_scan_overlay(path):
+    from moviepy import VideoFileClip
+
+    clip = VideoFileClip(str(path), audio=False)
+    try:
+        width, height = clip.size if clip.size else (0, 0)
+        info = {
+            "duration": float(clip.duration or 0),
+            "fps": float(clip.fps or 0),
+            "width": int(width or 0),
+            "height": int(height or 0),
+        }
+        duration = info["duration"]
+        if duration <= 0 or info["fps"] <= 0:
+            return info, "non-positive duration or fps"
+        overlay_stamps = [min(max(duration * 0.08, 0), max(duration - 0.05, 0))]
+        if duration > 2:
+            overlay_stamps.append(min(max(duration * 0.4, 0), max(duration - 0.05, 0)))
+        for stamp in overlay_stamps:
+            if frame_has_overlay(clip.get_frame(stamp)):
+                return info, "text overlay"
+        quality_frames = []
+        for frac in (0.25, 0.5, 0.75):
+            stamp = min(max(duration * frac, 0), max(duration - 0.05, 0))
+            frame = clip.get_frame(stamp)
+            if frame_is_unusable(frame):
+                return info, "dark or frozen"
+            quality_frames.append(frame)
+        if frames_are_frozen(quality_frames):
+            return info, "dark or frozen"
+        return info, None
+    finally:
+        clip.close()
+
+
 def validate_downloaded_video(path, probe=None):
     path = Path(path)
     if not path.is_file() or path.stat().st_size < MIN_VIDEO_BYTES:
         return False, "empty or too small"
     try:
-        info = (probe or probe_video)(path)
+        if probe is None:
+            info, reason = probe_and_scan_overlay(path)
+            if reason:
+                return False, reason
+        else:
+            info = probe(path)
     except Exception as exc:
         return False, f"undecodable: {type(exc).__name__}"
     duration = float(info.get("duration") or 0)
     fps = float(info.get("fps") or 0)
     if duration <= 0 or fps <= 0:
         return False, "non-positive duration or fps"
-    if probe is None and video_has_overlay_text(path):
-        return False, "text overlay"
     return True, info
 
 

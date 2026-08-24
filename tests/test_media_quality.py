@@ -4,9 +4,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from media_quality import (
+    caption_line_score,
     content_fingerprint,
     delete_rejected_file,
     download_http,
+    frame_is_unusable,
+    frames_are_frozen,
     is_signed_url,
     overlay_text_score,
     redact_secret,
@@ -80,3 +83,21 @@ class MediaQualityTests(unittest.TestCase):
         boxed = np.full((90, 90), 40.0)
         boxed[18:48, 4:34] = 220.0
         self.assertGreaterEqual(overlay_text_score(boxed), 0.28)
+        words = np.full((120, 100), 40.0)
+        for x0 in (8, 30, 52, 74):
+            words[78:102, x0:x0 + 12] = 220.0
+        self.assertGreaterEqual(caption_line_score(words), 0.05)
+        self.assertLess(caption_line_score(clean), 0.05)
+
+    def test_dark_and_frozen_frames(self):
+        import numpy as np
+
+        dark = np.zeros((40, 40, 3), dtype="uint8")
+        self.assertTrue(frame_is_unusable(dark))
+        textured = np.tile(np.linspace(40, 180, 40, dtype="uint8"), (40, 1))
+        textured = np.stack([textured, textured, textured], axis=2)
+        self.assertFalse(frame_is_unusable(textured))
+        self.assertTrue(frames_are_frozen([textured, textured, textured]))
+        moving = textured.copy()
+        moving[:10] = 200
+        self.assertFalse(frames_are_frozen([textured, moving]))

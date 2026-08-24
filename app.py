@@ -43,6 +43,7 @@ from semantic_media import (
     visual_query_plan,
     normalize_stock_query,
     rank_scene_candidates,
+    interleave_candidates_by_query,
     search_with_cache,
     selected_record,
     unique_usable_duration,
@@ -276,7 +277,6 @@ def apply_user_keywords(grouped, keywords, topic=""):
         cleaned.append(keyword)
     if not cleaned or not grouped:
         return None
-    cleaned.sort(key=lambda item: (-len(item.split()), item.lower()))
     primary, alts = cleaned[0], cleaned[1:]
     return [
         {
@@ -1085,13 +1085,16 @@ async def collect_stock_videos(
         pool = [candidate for candidate in pool if keep_candidate(candidate, 0)]
         pool = dedupe_candidates(pool)
         print(f"  provider={source} origin={origin} pool={len(pool)} queries={len(plan or [])}")
+        plan_queries = plan or stock_query_plan(keyword_data)
         for idx, item in enumerate(keyword_data):
             ranked = rank_scene_candidates(
                 pool,
                 sentence=item.get("sentence") or "",
                 keyword=f"{item.get('keyword') or ''} {topic}",
             )
-            groups.append(ranked)
+            mixed = interleave_candidates_by_query(ranked, plan_queries)
+            print(f"  mix scene {idx + 1}: " + ", ".join(f"{query!r}" for query in plan_queries))
+            groups.append(mixed)
 
     selected = [[] for _ in keyword_data]
     pointers = [0] * len(keyword_data)
@@ -1106,11 +1109,14 @@ async def collect_stock_videos(
             if any(key in taken_keys for key in keys):
                 continue
             downloader = download_fn or download_stock_candidate
+            print(f"  ⬇️ scene {scene_index + 1} {candidate.query!r} id={candidate.asset_id}")
             path, reason = await downloader(candidate, project_path, source, probe)
             if path:
+                print(f"  ✅ kept {Path(path).name}")
                 for key in keys:
                     taken_keys.add(key)
                 return candidate
+            print(f"  🚫 skip {candidate.asset_id}: {reason}")
             rejection_log[scene_index].append({"asset_id": candidate.asset_id, "reason": reason})
         return None
 

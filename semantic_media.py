@@ -199,7 +199,6 @@ def stock_query_plan(keyword_data):
                 continue
             seen.add(key)
             queries.append(query)
-    queries.sort(key=lambda item: (-len(item.split()), item.lower()))
     return queries
 
 
@@ -353,6 +352,41 @@ def round_robin_order(groups):
         if not yielded:
             return
         index += 1
+
+
+def interleave_candidates_by_query(candidates, queries):
+    """One clip from each search query before a second clip from any query."""
+    order = []
+    seen = set()
+    for raw in queries or []:
+        key = normalize_stock_query(raw).lower()
+        if key and key not in seen:
+            seen.add(key)
+            order.append(key)
+    buckets = {key: [] for key in order}
+    extra = []
+    for candidate in candidates or []:
+        key = normalize_stock_query(candidate.query).lower()
+        if key in buckets:
+            buckets[key].append(candidate)
+        else:
+            extra.append(candidate)
+    merged = []
+    index = 0
+    while True:
+        added = False
+        for key in order:
+            bucket = buckets[key]
+            if index < len(bucket):
+                merged.append(bucket[index])
+                added = True
+        if index < len(extra):
+            merged.append(extra[index])
+            added = True
+        if not added:
+            break
+        index += 1
+    return merged
 
 
 def unique_usable_duration(selected_by_scene, clip_duration):

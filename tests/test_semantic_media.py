@@ -13,6 +13,7 @@ from semantic_media import (
     ensure_topic_anchor,
     fit_keyword_length,
     ground_query,
+    interleave_candidates_by_query,
     keyword_length_plan,
     parse_sentence_queries,
     query_broaden_chain,
@@ -77,20 +78,39 @@ class QueryParseTests(unittest.TestCase):
             stock_query_plan([
                 {"keyword": "gym", "_alts": ["gym squat", "gym lifting heavy barbell"]},
             ]),
-            ["gym lifting heavy barbell", "gym squat", "gym"],
+            ["gym", "gym squat", "gym lifting heavy barbell"],
         )
         self.assertEqual(
             visual_query_plan(
                 [{"keyword": "gym", "_alts": ["gym squat", "gym motivation", "gym lifting heavy barbell"]}],
                 "gym, fitness, motivation",
             ),
-            ["gym lifting heavy barbell", "gym motivation", "gym squat", "gym"],
+            ["gym", "gym squat", "gym motivation", "gym lifting heavy barbell"],
         )
         real = MediaCandidate(query="gym deadlift", title="athlete barbell deadlift gym")
         fake = MediaCandidate(query="gym deadlift", title="3d anatomical deadlift tutorial")
         self.assertGreater(
             query_relevance(real, "crush the next rep", "gym barbell squat"),
             query_relevance(fake, "crush the next rep", "gym barbell squat"),
+        )
+
+
+class InterleaveQueryTests(unittest.TestCase):
+    def test_interleave_takes_one_clip_per_query_first(self):
+        ranked = [
+            MediaCandidate(asset_id="a2", query="gym rep power"),
+            MediaCandidate(asset_id="a1", query="gym rep power"),
+            MediaCandidate(asset_id="b1", query="gym dumbbell battle rep"),
+            MediaCandidate(asset_id="c1", query="gym fitness"),
+            MediaCandidate(asset_id="d1", query="gym"),
+        ]
+        mixed = interleave_candidates_by_query(
+            ranked,
+            ["gym dumbbell battle rep", "gym rep power", "gym fitness", "gym"],
+        )
+        self.assertEqual(
+            [item.asset_id for item in mixed[:4]],
+            ["b1", "a2", "c1", "d1"],
         )
 
 

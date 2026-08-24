@@ -53,6 +53,12 @@ CAPTION_PIN_RE = re.compile(
     r"|try this"
     r"|workout plan"
     r"|workout routine"
+    r"|don.?t do this"
+    r"|hammer curls?"
+    r"|wanna get"
+    r"|want to"
+    r"|physique like"
+    r"|your move"
     r")",
     re.I,
 )

@@ -43,7 +43,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let candidateVideos = [];
     let activeTaskId = '';
     let pollConnectionErrorShown = false;
-    let allowedMusic = new Set(['none', 'random', 'custom', 'coverr', 'mixkit', 'pixabay', 'sonilo']);
+    let allowedMusic = new Set(['none', 'random', 'custom', 'coverr', 'mixkit', 'sonilo', 'auto-fallback']);
 
     const settingsToggle = document.getElementById('settings-toggle');
     const settingsBody = document.getElementById('settings-body');
@@ -488,7 +488,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function refreshMusicOptions() {
-        allowedMusic = new Set(['none', 'random', 'custom', 'coverr', 'mixkit', 'pixabay', 'sonilo']);
+        allowedMusic = new Set(['none', 'random', 'custom', 'coverr', 'mixkit', 'sonilo', 'auto-fallback']);
         updateMusicSourceUi();
     }
 
@@ -497,8 +497,8 @@ document.addEventListener('DOMContentLoaded', () => {
         if (source === 'custom') return 'Upload a file or enter a local path.';
         if (source === 'coverr') return 'Matches Coverr free stock music to the vibe/topic. Coverr API key optional.';
         if (source === 'mixkit') return 'Matches Mixkit free stock music. No API key.';
-        if (source === 'pixabay') return 'Matches Pixabay music. Uses your Pixabay API key.';
         if (source === 'sonilo') return 'Generates licensed music with Sonilo AI. Add the key in API settings.';
+        if (source === 'auto-fallback') return 'Tries Mixkit, then Coverr, then Sonilo AI if those fail. Sonilo key needed only for the last step.';
         return 'No background music is mixed into the video.';
     }
 
@@ -508,7 +508,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const styleCard = document.getElementById('music-style-card');
         const note = document.getElementById('music-source-note');
         if (customCard) customCard.classList.toggle('hidden', source !== 'custom');
-        if (styleCard) styleCard.classList.toggle('hidden', !['coverr', 'mixkit', 'pixabay', 'sonilo'].includes(source));
+        if (styleCard) styleCard.classList.toggle('hidden', !['coverr', 'mixkit', 'sonilo', 'auto-fallback'].includes(source));
         if (note) note.textContent = musicSourceNote(source);
     }
 
@@ -825,7 +825,9 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             rebuildThemedSelect(document.getElementById('tts-server'));
             rebuildThemedSelect(document.getElementById('source-select'));
-            if (musicSelect && fields['music-select'] && !allowedMusic.has(fields['music-select'])) {
+            if (musicSelect && fields['music-select'] === 'pixabay') {
+                musicSelect.value = 'auto-fallback';
+            } else if (musicSelect && fields['music-select'] && !allowedMusic.has(fields['music-select'])) {
                 const pathEl = document.getElementById('music-custom-path');
                 if (pathEl && !pathEl.value) pathEl.value = fields['music-select'];
                 musicSelect.value = 'custom';
@@ -1162,11 +1164,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (!allowedMusic.has(music)) {
             showToast('Background music option is invalid. Choose again.', 'error');
-            return;
-        }
-        if (music === 'pixabay' && !keys.pixabay_key) {
-            showApiSettings();
-            showToast('Pixabay music needs a Pixabay API key.', 'error');
             return;
         }
         if (music === 'sonilo' && !keys.sonilo_key) {

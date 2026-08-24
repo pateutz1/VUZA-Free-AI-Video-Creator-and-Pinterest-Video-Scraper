@@ -1504,50 +1504,226 @@ def coverr_music_tracks(query, api_key="", limit=8):
     return tracks[:limit]
 
 
-def pixabay_music_tracks(query, api_key, limit=8):
-    if not api_key:
-        return []
-    try:
-        response = requests.get(
-            "https://pixabay.com/api/audio/",
-            params={
-                "key": api_key,
-                "q": query or "background music",
-                "audio_type": "music",
-                "per_page": min(20, max(int(limit or 8), 3)),
-            },
-            timeout=(20, 40),
-            verify=True,
-        )
-        response.raise_for_status()
-        hits = response.json().get("hits") or []
-    except Exception as exc:
-        print(f"⚠️ Pixabay music search failed: {exc}")
-        return []
+def pixabay_music_tracks(query, api_key="", limit=8):
+    """Pixabay has no public music API (docs cover images + videos only).
+    `/api/audio/` returns 403 for normal keys, so this scrapes music pages."""
+    del api_key  # kept for call-site compatibility; not used
+    return pixabay_music_scrape(query, limit=limit)
+
+
+_PIXABAY_MUSIC_ITEM_RE = re.compile(r"/music/([a-z0-9-]+-\d+)/?", re.I)
+_PIXABAY_OG_AUDIO_RE = re.compile(
+    r'<meta[^>]+(?:property|name)=["\']og:audio["\'][^>]+content=["\']([^"\']+)["\']',
+    re.I,
+)
+_PIXABAY_BOOTSTRAP_RE = re.compile(r"/bootstrap/([a-f0-9]+)\.json", re.I)
+_PIXABAY_CONTENT_URL_RE = re.compile(
+    r'"contentUrl"\s*:\s*"((?:https:)?\\?/\\?/cdn\.pixabay\.com[^"]+\.mp3[^"]*)"',
+    re.I,
+)
+_PIXABAY_MUSIC_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://pixabay.com/music/",
+}
+
+
+def _pixabay_audio_from_html(html):
+    text = (html or "").replace("\\/", "/")
+    urls = []
+    for url in _AUDIO_FILE_RE.findall(text):
+        if "pixabay.com" in url:
+            urls.append(url)
+    for match in _PIXABAY_OG_AUDIO_RE.finditer(text):
+        urls.append(match.group(1).replace("\\/", "/"))
+    for match in _PIXABAY_CONTENT_URL_RE.finditer(html or ""):
+        urls.append(match.group(1).replace("\\/", "/"))
+    return urls
+
+
+def _pixabay_track_id(url, path=""):
+    match = re.search(r"audio-(\d+)", url or "")
+    if match:
+        return match.group(1)
+    match = re.search(r"-(\d+)/?$", path or "")
+    if match:
+        return match.group(1)
+    digits = re.findall(r"(\d{5,})", url or "")
+    return digits[-1] if digits else ""
+
+
+def _pixabay_tracks_from_bootstrap(payload, limit=8):
+    page = payload.get("page") if isinstance(payload, dict) else {}
+    results = page.get("results") if isinstance(page, dict) else []
     tracks = []
-    for hit in hits:
-        if not isinstance(hit, dict):
+    seen = set()
+    for item in results or []:
+        if not isinstance(item, dict):
             continue
-        nested = hit.get("audio") if isinstance(hit.get("audio"), dict) else {}
-        medias = hit.get("medias") if isinstance(hit.get("medias"), dict) else {}
-        url = (
-            hit.get("downloadURL")
-            or hit.get("previewURL")
-            or nested.get("url")
-            or (medias.get("large") or {}).get("url")
-            or (medias.get("medium") or {}).get("url")
-            or ""
-        )
-        if not url:
+        sources = item.get("sources") if isinstance(item.get("sources"), dict) else {}
+        url = (sources.get("src") or "").strip()
+        if not url or ".mp3" not in url.lower() or url in seen:
             continue
+        seen.add(url)
         tracks.append({
-            "id": str(hit.get("id") or len(tracks) + 1),
-            "title": (hit.get("tags") or "Pixabay track").split(",")[0].strip(),
+            "id": str(item.get("id") or _pixabay_track_id(url) or len(tracks) + 1),
+            "title": (item.get("name") or item.get("title") or "Pixabay track").strip(),
             "url": url,
         })
         if len(tracks) >= limit:
             break
     return tracks
+
+
+def _pixabay_tracks_from_html(html, limit=8):
+    tracks, seen, item_paths = [], set(), []
+    if "Just a moment" in (html or ""):
+        return tracks, item_paths
+    for url in _pixabay_audio_from_html(html):
+        if url in seen:
+            continue
+        seen.add(url)
+        tracks.append({
+            "id": _pixabay_track_id(url) or str(len(tracks) + 1),
+            "title": "Pixabay track",
+            "url": url,
+        })
+        if len(tracks) >= limit:
+            return tracks, item_paths
+    for match in _PIXABAY_MUSIC_ITEM_RE.finditer(html or ""):
+        path = f"/music/{match.group(1)}/"
+        if path not in item_paths:
+            item_paths.append(path)
+    return tracks, item_paths
+
+
+def _pixabay_bootstrap_from_html(html, fetch_json, limit=8):
+    match = _PIXABAY_BOOTSTRAP_RE.search(html or "")
+    if not match:
+        return []
+    try:
+        payload = fetch_json(f"https://pixabay.com/bootstrap/{match.group(1)}.json")
+    except Exception:
+        return []
+    return _pixabay_tracks_from_bootstrap(payload, limit=limit)
+
+
+def _pixabay_music_from_browser(search_url, limit=8):
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        print(f"⚠️ Pixabay music scrape needs Playwright: {exc}")
+        return []
+    tracks = []
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            context = browser.new_context(
+                user_agent=_PIXABAY_MUSIC_HEADERS["User-Agent"],
+                locale="en-US",
+            )
+            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            page = context.new_page()
+            page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+            with contextlib.suppress(Exception):
+                page.wait_for_selector('a[href*="/music/"]', timeout=15000)
+            html = page.content()
+            if "Just a moment" in (html or ""):
+                context.close()
+                browser.close()
+                print("⚠️ Pixabay music search still blocked by Cloudflare.")
+                return []
+
+            def fetch_json(url):
+                payload = page.evaluate(
+                    """async (bootUrl) => {
+                        const response = await fetch(bootUrl, { credentials: 'include' });
+                        if (!response.ok) return null;
+                        return await response.json();
+                    }""",
+                    url,
+                )
+                return payload or {}
+
+            tracks = _pixabay_bootstrap_from_html(html, fetch_json, limit=limit)
+            if not tracks:
+                tracks, item_paths = _pixabay_tracks_from_html(html, limit=limit)
+                seen = {item.get("url", "").split("?", 1)[0] for item in tracks}
+                for path in item_paths[: max(limit, 8)]:
+                    if len(tracks) >= limit:
+                        break
+                    detail = f"https://pixabay.com{path}"
+                    try:
+                        page.goto(detail, wait_until="domcontentloaded", timeout=30000)
+                        with contextlib.suppress(Exception):
+                            page.wait_for_function(
+                                "() => document.documentElement.innerHTML.includes('download/audio')",
+                                timeout=12000,
+                            )
+                        for url in _pixabay_audio_from_html(page.content()):
+                            key = url.split("?", 1)[0]
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            tracks.append({
+                                "id": _pixabay_track_id(url, path) or str(len(tracks) + 1),
+                                "title": path.strip("/").split("/")[-1],
+                                "url": url,
+                            })
+                            if len(tracks) >= limit:
+                                break
+                    except Exception:
+                        continue
+            context.close()
+            browser.close()
+    except Exception as exc:
+        print(f"⚠️ Pixabay music browser scrape failed: {exc}")
+        return []
+    return tracks[:limit]
+
+
+def pixabay_music_scrape(query, limit=8):
+    slug = re.sub(r"[^a-z0-9]+", "-", (query or "cinematic").lower()).strip("-") or "cinematic"
+    if slug.count("-") > 2:
+        slug = slug.split("-")[0]
+    search_url = f"https://pixabay.com/music/search/{slug}/"
+    tracks, item_paths = [], []
+    try:
+        resp = requests.get(search_url, timeout=(20, 40), headers=_PIXABAY_MUSIC_HEADERS)
+        html = resp.text if resp.status_code == 200 else ""
+        if html and "Just a moment" not in html:
+            tracks = _pixabay_bootstrap_from_html(
+                html,
+                lambda url: requests.get(url, timeout=(20, 40), headers=_PIXABAY_MUSIC_HEADERS).json(),
+                limit=limit,
+            )
+            if not tracks:
+                tracks, item_paths = _pixabay_tracks_from_html(html, limit=limit)
+            for path in item_paths[: max(limit, 8)]:
+                if len(tracks) >= limit:
+                    break
+                detail = requests.get(f"https://pixabay.com{path}", timeout=(20, 40), headers=_PIXABAY_MUSIC_HEADERS)
+                if detail.status_code != 200 or "Just a moment" in (detail.text or ""):
+                    continue
+                for url in _pixabay_audio_from_html(detail.text):
+                    tracks.append({
+                        "id": _pixabay_track_id(url, path) or str(len(tracks) + 1),
+                        "title": path.strip("/").split("/")[-1],
+                        "url": url,
+                    })
+                    if len(tracks) >= limit:
+                        break
+    except Exception as exc:
+        print(f"⚠️ Pixabay music scrape failed: {exc}")
+        tracks = []
+    if tracks:
+        return tracks[:limit]
+    print(f"⚠️ Pixabay HTTP scrape empty; opening {search_url}")
+    return _pixabay_music_from_browser(search_url, limit=limit)
 
 
 class VideoDownloader:

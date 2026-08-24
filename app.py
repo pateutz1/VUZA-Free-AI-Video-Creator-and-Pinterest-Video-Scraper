@@ -26,7 +26,7 @@ for stream in (sys.stdout, sys.stderr):
 # ═══════════════════════════════════════════════════════════════
 
 import base64
-from aesthetic_scraper import PinterestScraper, PexelsScraper, PixabayScraper, CoverrScraper, MixkitScraper, LLMProcessor, WebScraper, LLM_PROVIDER_PRESETS, pinterest_mp4_urls, pinterest_pin_page, download_pinterest_with_ytdlp, mixkit_music_tracks, mixkit_music_search, coverr_music_tracks, pixabay_music_tracks, music_match_query, MIXKIT_MUSIC_MOODS, VIBE_TO_MUSIC_MOOD
+from aesthetic_scraper import PinterestScraper, PexelsScraper, PixabayScraper, CoverrScraper, MixkitScraper, LLMProcessor, WebScraper, LLM_PROVIDER_PRESETS, pinterest_mp4_urls, pinterest_pin_page, download_pinterest_with_ytdlp, mixkit_music_tracks, mixkit_music_search, coverr_music_tracks, music_match_query, MIXKIT_MUSIC_MOODS, VIBE_TO_MUSIC_MOOD
 from media_quality import content_fingerprint, delete_rejected_file, download_http, last_download_error, redact_secret, reset_download_fail_logs, validate_downloaded_video, MIN_VIDEO_BYTES
 from semantic_media import (
     CoverageError,
@@ -200,7 +200,7 @@ VALID_MODES = {"single", "script"}
 VALID_TRANSITIONS = {"none", "fade", "zoom_in", "zoom_out", "slide"}
 ALLOWED_UPLOAD_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".m4v", ".webm"}
 ALLOWED_MUSIC_SUFFIXES = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg"}
-MUSIC_SOURCES = ("none", "random", "custom", "coverr", "mixkit", "pixabay", "sonilo")
+MUSIC_SOURCES = ("none", "random", "custom", "coverr", "mixkit", "sonilo", "auto-fallback")
 
 # ── Routes ──
 @app.get("/")
@@ -1059,11 +1059,12 @@ def require_media_files(files, label):
 
 MIXKIT_MUSIC_CACHE_TTL = 6 * 3600  # seconds
 MIXKIT_MUSIC_TRACKS_PER_MOOD = 6
-MIXKIT_MUSIC_DOWNLOAD_DIR = DOWNLOAD_DIR / "_mixkit_music"
-COVERR_MUSIC_DOWNLOAD_DIR = DOWNLOAD_DIR / "_coverr_music"
-PIXABAY_MUSIC_DOWNLOAD_DIR = DOWNLOAD_DIR / "_pixabay_music"
-SONILO_MUSIC_DOWNLOAD_DIR = DOWNLOAD_DIR / "_sonilo_music"
-CUSTOM_MUSIC_DIR = DOWNLOAD_DIR / "_custom_music"
+STATIC_MUSIC_DIR = BASE_DIR / "static" / "music"
+MIXKIT_MUSIC_DOWNLOAD_DIR = STATIC_MUSIC_DIR
+COVERR_MUSIC_DOWNLOAD_DIR = STATIC_MUSIC_DIR
+PIXABAY_MUSIC_DOWNLOAD_DIR = STATIC_MUSIC_DIR
+SONILO_MUSIC_DOWNLOAD_DIR = STATIC_MUSIC_DIR
+CUSTOM_MUSIC_DIR = STATIC_MUSIC_DIR
 _mixkit_music_cache = {"tracks": [], "fetched_at": 0.0}
 
 
@@ -1250,8 +1251,6 @@ def validate_background_music(settings, api_keys=None):
     if kind == "custom":
         resolve_custom_music_file(getattr(settings, "custom_music", "") or "")
         return
-    if kind == "pixabay" and not (keys.pixabay_key or "").strip():
-        raise RuntimeError("Pixabay music needs a Pixabay API key. Add it in API settings.")
     if kind == "sonilo" and not (keys.sonilo_key or "").strip():
         raise RuntimeError("Sonilo AI needs an API key. Add it in API settings.")
     if kind == "file":
@@ -1294,11 +1293,23 @@ def resolve_background_music(settings, api_keys=None, vibe="", duration_seconds=
     if kind == "coverr":
         tracks = coverr_music_tracks(query, api_key=(keys.coverr_key or "").strip(), limit=8)
         return download_matched_track(tracks, COVERR_MUSIC_DOWNLOAD_DIR, "cv", "Coverr")
-    if kind == "pixabay":
-        if not (keys.pixabay_key or "").strip():
-            raise RuntimeError("Pixabay music needs a Pixabay API key. Add it in API settings.")
-        tracks = pixabay_music_tracks(query, keys.pixabay_key, limit=8)
-        return download_matched_track(tracks, PIXABAY_MUSIC_DOWNLOAD_DIR, "px", "Pixabay")
+    if kind == "auto-fallback":
+        style = (getattr(settings, "music_style", "") or "").strip()
+        mood = VIBE_TO_MUSIC_MOOD.get((vibe or getattr(settings, "vibe", "") or "").strip(), "cinematic")
+        try:
+            tracks = mixkit_music_search(style or mood, limit=8)
+            return download_matched_track(tracks, MIXKIT_MUSIC_DOWNLOAD_DIR, "mk", "Mixkit")
+        except RuntimeError as exc:
+            print(f"⚠️ Mixkit music failed: {exc}")
+        try:
+            tracks = coverr_music_tracks(query, api_key=(keys.coverr_key or "").strip(), limit=8)
+            return download_matched_track(tracks, COVERR_MUSIC_DOWNLOAD_DIR, "cv", "Coverr")
+        except RuntimeError as exc:
+            print(f"⚠️ Coverr music failed: {exc}")
+        if (keys.sonilo_key or "").strip():
+            print("⚠️ Mixkit and Coverr failed; trying Sonilo AI.")
+            return resolve_sonilo_music(settings, keys, duration_seconds)
+        raise RuntimeError("Mixkit and Coverr found no tracks. Add a Sonilo API key for AI fallback, or pick another source.")
     if kind == "sonilo":
         return resolve_sonilo_music(settings, keys, duration_seconds)
     raise RuntimeError("Invalid background music source.")

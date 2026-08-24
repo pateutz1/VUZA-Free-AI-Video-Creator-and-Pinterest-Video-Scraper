@@ -210,10 +210,45 @@ class BackgroundMusicResolutionTests(unittest.TestCase):
             path = resolve_background_music(settings)
         self.assertTrue(path.endswith("cinematic.mp3"))
 
-    def test_pixabay_source_requires_key(self):
-        settings = VideoSettings(music="pixabay")
-        with self.assertRaisesRegex(RuntimeError, "Pixabay API key"):
-            validate_background_music(settings, ApiKeys())
+    def test_pixabay_music_scrapes_without_key(self):
+        from aesthetic_scraper import pixabay_music_tracks
+        html = '''
+        <a href="/music/cinematic-visions-123456/">track</a>
+        <meta property="og:audio" content="https://cdn.pixabay.com/download/audio/2024/01/01/audio-123456.mp3">
+        '''
+        listing = '<a href="/music/cinematic-visions-123456/">Cinematic</a>'
+        with patch("aesthetic_scraper.requests.get") as fake_get:
+            def reply(url, **kwargs):
+                mock = type("R", (), {})()
+                mock.status_code = 200
+                mock.text = html if "cinematic-visions-123456" in url else listing
+                return mock
+            fake_get.side_effect = reply
+            tracks = pixabay_music_tracks("cinematic", api_key="", limit=3)
+        self.assertTrue(tracks)
+        self.assertIn("123456", tracks[0]["id"])
+        self.assertTrue(tracks[0]["url"].endswith(".mp3"))
+
+    def test_pixabay_parses_search_bootstrap_results(self):
+        from aesthetic_scraper import _pixabay_bootstrap_from_html, _pixabay_tracks_from_bootstrap
+        payload = {
+            "page": {
+                "results": [{
+                    "id": 15045,
+                    "name": "Electronic Stylish Rock",
+                    "sources": {"src": "https://cdn.pixabay.com/audio/2022/01/18/audio_d0a13f69d2.mp3"},
+                }]
+            }
+        }
+        tracks = _pixabay_tracks_from_bootstrap(payload, limit=3)
+        self.assertEqual(tracks[0]["id"], "15045")
+        self.assertEqual(tracks[0]["title"], "Electronic Stylish Rock")
+        html = "var x = '/bootstrap/abc123def456.json';"
+        from_html = _pixabay_bootstrap_from_html(html, lambda url: payload, limit=3)
+        self.assertEqual(from_html[0]["url"], payload["page"]["results"][0]["sources"]["src"])
+
+    def test_auto_fallback_does_not_require_sonilo_key(self):
+        validate_background_music(VideoSettings(music="auto-fallback"), ApiKeys())
 
     def test_sonilo_source_requires_key(self):
         settings = VideoSettings(music="sonilo")
@@ -240,6 +275,19 @@ class BackgroundMusicResolutionTests(unittest.TestCase):
             self.addCleanup(lambda: cache_path.unlink(missing_ok=True))
             path = resolve_background_music(VideoSettings(music="mixkit", music_style="cinematic"))
         self.assertTrue(path.endswith("mk_mixkit-55.mp3"))
+
+    def test_auto_fallback_uses_coverr_when_mixkit_empty(self):
+        track = {"id": "cv-9", "title": "Fallback", "url": "https://cdn.coverr.co/audios/9/preview.mp3"}
+        with patch("app.mixkit_music_search", return_value=[]), \
+             patch("app.coverr_music_tracks", return_value=[track]), \
+             patch("app.download_http", return_value=True):
+            from app import COVERR_MUSIC_DOWNLOAD_DIR
+            cache_path = COVERR_MUSIC_DOWNLOAD_DIR / "cv_cv-9.mp3"
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(b"x" * 9000)
+            self.addCleanup(lambda: cache_path.unlink(missing_ok=True))
+            path = resolve_background_music(VideoSettings(music="auto-fallback", music_style="electronic"))
+        self.assertTrue(path.endswith("cv_cv-9.mp3"))
 
 
 class MixkitMusicTests(unittest.TestCase):
@@ -311,6 +359,8 @@ class MixkitMusicTests(unittest.TestCase):
         self.assertIn("mixkit", data["sources"])
         self.assertIn("coverr", data["sources"])
         self.assertIn("sonilo", data["sources"])
+        self.assertIn("auto-fallback", data["sources"])
+        self.assertNotIn("pixabay", data["sources"])
 
     def test_mixkit_parses_nested_itemlist_recordings(self):
         from aesthetic_scraper import mixkit_music_recordings, mixkit_music_tracks

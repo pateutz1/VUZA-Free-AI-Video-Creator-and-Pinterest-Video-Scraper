@@ -663,10 +663,23 @@ class VideoEngine:
                 raise RuntimeError(f"No usable (non-black) clip for scene {i + 1}: {keyword}")
             if video_mode:
                 covered = sum(float(part.duration or 0) for part in parts)
+                if covered + 0.05 < speech_duration and used:
+                    gap = speech_duration - covered
+                    print(
+                        f"  ⚠️ Scene {i + 1} unique footage {covered:.2f}s < narration {speech_duration:.2f}s; "
+                        f"looping last clip +{gap:.2f}s"
+                    )
+                    rebuilt = build_visual_clip(
+                        used[-1],
+                        float(parts[-1].duration or 0) + gap,
+                        allow_loop=True,
+                    )
+                    if rebuilt is not None:
+                        parts[-1] = rebuilt
+                    covered = sum(float(part.duration or 0) for part in parts)
                 if covered + 0.05 < speech_duration:
                     raise RuntimeError(
-                        f"Scene {i + 1} unique footage {covered:.2f}s cannot cover narration {speech_duration:.2f}s "
-                        f"without looping one source"
+                        f"Scene {i + 1} unique footage {covered:.2f}s cannot cover narration {speech_duration:.2f}s"
                     )
             if (not video_mode) and len(parts) == 1 and num_segments > 1:
                 rebuilt = build_visual_clip(used[0], duration, allow_loop=True)

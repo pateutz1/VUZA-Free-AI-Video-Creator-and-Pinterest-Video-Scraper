@@ -43,7 +43,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let candidateVideos = [];
     let activeTaskId = '';
     let pollConnectionErrorShown = false;
-    let allowedMusic = new Set(['none', 'cinematic.mp3']);
+    let allowedMusic = new Set(['none', 'random', 'custom', 'coverr', 'mixkit', 'pixabay', 'sonilo']);
 
     const settingsToggle = document.getElementById('settings-toggle');
     const settingsBody = document.getElementById('settings-body');
@@ -129,6 +129,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (keys.pexels_key) document.getElementById('pexels-key').value = keys.pexels_key;
         if (keys.pixabay_key) document.getElementById('pixabay-key').value = keys.pixabay_key;
         if (keys.coverr_key) document.getElementById('coverr-key').value = keys.coverr_key;
+        if (keys.sonilo_key) document.getElementById('sonilo-key').value = keys.sonilo_key;
         if (keys.yt_client_id) document.getElementById('yt-client-id').value = keys.yt_client_id;
         if (keys.yt_client_secret) document.getElementById('yt-client-secret').value = keys.yt_client_secret;
         if (keys.eleven_key) document.getElementById('eleven-key').value = keys.eleven_key;
@@ -256,6 +257,8 @@ document.addEventListener('DOMContentLoaded', () => {
         });
         const azureBtn = document.getElementById('test-azure-tts-btn');
         if (azureBtn) azureBtn.addEventListener('click', testAzureTtsApi);
+        const soniloBtn = document.getElementById('test-sonilo-btn');
+        if (soniloBtn) soniloBtn.addEventListener('click', testSoniloApi);
     }
 
     async function testAzureTtsApi() {
@@ -291,6 +294,38 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    async function testSoniloApi() {
+        const statusEl = document.getElementById('sonilo-test-status');
+        const btn = document.getElementById('test-sonilo-btn');
+        const api_key = (document.getElementById('sonilo-key')?.value || '').trim();
+        if (statusEl) statusEl.textContent = 'Testing...';
+        if (btn) btn.disabled = true;
+        try {
+            const response = await fetch('/api/music/sonilo/test', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ api_key }),
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                const message = typeof data.detail === 'string' ? data.detail : 'Sonilo API test failed';
+                if (statusEl) statusEl.textContent = message;
+                showToast(message, 'error');
+                return;
+            }
+            persistKeys(getKeys());
+            const okMsg = data.note ? `OK · ${data.note}` : 'OK';
+            if (statusEl) statusEl.textContent = okMsg;
+            showToast(`Sonilo ${okMsg}`, 'success');
+        } catch (error) {
+            const message = 'Could not reach VUZA to test this API';
+            if (statusEl) statusEl.textContent = message;
+            showToast(message, 'error');
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
     function saveKeys() {
         saveCurrentProvider();
         persistKeys(getKeys());
@@ -313,6 +348,7 @@ document.addEventListener('DOMContentLoaded', () => {
             pexels_key: valueOf('pexels-key'),
             pixabay_key: valueOf('pixabay-key'),
             coverr_key: valueOf('coverr-key'),
+            sonilo_key: valueOf('sonilo-key'),
             yt_client_id: valueOf('yt-client-id'),
             yt_client_secret: valueOf('yt-client-secret'),
             eleven_key: valueOf('eleven-key'),
@@ -345,11 +381,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const PANEL_SETTINGS_KEY = 'vuza_panel_settings';
     const PANEL_SKIP_IDS = new Set([
         'llm-key', 'llm-url', 'llm-model', 'llm-preset',
-        'pexels-key', 'pixabay-key', 'coverr-key',
+        'pexels-key', 'pixabay-key', 'coverr-key', 'sonilo-key',
         'yt-client-id', 'yt-client-secret', 'eleven-key',
         'azure-speech-key', 'azure-speech-region',
         'query', 'url-input', 'topic-input', 'keywords-input', 'script',
-        'local-files', 'ai-title', 'ai-desc', 'ai-hashtags', 'ai-thumb-prompt',
+        'local-files', 'music-upload', 'ai-title', 'ai-desc', 'ai-hashtags', 'ai-thumb-prompt',
     ]);
     const RANGE_LABELS = {
         count: ['count-val', (v) => v],
@@ -381,6 +417,10 @@ document.addEventListener('DOMContentLoaded', () => {
             if (!el.id || PANEL_SKIP_IDS.has(el.id)) return;
             fields[el.id] = el.type === 'checkbox' ? el.checked : el.value;
         });
+        ['music-style', 'music-custom-path'].forEach((id) => {
+            const el = document.getElementById(id);
+            if (el) fields[id] = el.value;
+        });
         return { radios, fields, mode: typeof currentMode === 'string' ? currentMode : 'script' };
     }
 
@@ -400,6 +440,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function isPanelSettingControl(el) {
         if (!el || el.closest('#settings-body')) return false;
         if (el.id && PANEL_SKIP_IDS.has(el.id)) return false;
+        if (el.id === 'music-style' || el.id === 'music-custom-path') return true;
         return el.matches('select, input[type="radio"], input[type="checkbox"], input[type="range"], input[type="number"], input[type="color"]');
     }
 
@@ -433,7 +474,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const saveBtn = document.getElementById('save-keys-btn');
     if (saveBtn) saveBtn.addEventListener('click', saveKeys);
-    ['eleven-key', 'yt-client-id', 'yt-client-secret', 'azure-speech-key', 'azure-speech-region'].forEach((id) => {
+    ['eleven-key', 'yt-client-id', 'yt-client-secret', 'azure-speech-key', 'azure-speech-region', 'sonilo-key'].forEach((id) => {
         const el = document.getElementById(id);
         if (el) el.addEventListener('input', persistKeysSoon);
     });
@@ -447,26 +488,46 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function refreshMusicOptions() {
-        if (!musicSelect) return;
-        const current = musicSelect.value;
-        try {
-            const response = await fetch('/api/music');
+        allowedMusic = new Set(['none', 'random', 'custom', 'coverr', 'mixkit', 'pixabay', 'sonilo']);
+        updateMusicSourceUi();
+    }
+
+    function musicSourceNote(source) {
+        if (source === 'random') return 'Picks a random track from static/music.';
+        if (source === 'custom') return 'Upload a file or enter a local path.';
+        if (source === 'coverr') return 'Matches Coverr free stock music to the vibe/topic. Coverr API key optional.';
+        if (source === 'mixkit') return 'Matches Mixkit free stock music. No API key.';
+        if (source === 'pixabay') return 'Matches Pixabay music. Uses your Pixabay API key.';
+        if (source === 'sonilo') return 'Generates licensed music with Sonilo AI. Add the key in API settings.';
+        return 'No background music is mixed into the video.';
+    }
+
+    function updateMusicSourceUi() {
+        const source = musicSelect?.value || 'none';
+        const customCard = document.getElementById('music-custom-card');
+        const styleCard = document.getElementById('music-style-card');
+        const note = document.getElementById('music-source-note');
+        if (customCard) customCard.classList.toggle('hidden', source !== 'custom');
+        if (styleCard) styleCard.classList.toggle('hidden', !['coverr', 'mixkit', 'pixabay', 'sonilo'].includes(source));
+        if (note) note.textContent = musicSourceNote(source);
+    }
+
+    async function ensureCustomMusicUploaded() {
+        const input = document.getElementById('music-upload');
+        const pathEl = document.getElementById('music-custom-path');
+        const statusEl = document.getElementById('music-upload-status');
+        if (input?.files?.length) {
+            const body = new FormData();
+            body.append('file', input.files[0]);
+            const response = await fetch('/api/upload/music', { method: 'POST', body });
+            if (!response.ok) {
+                throw new Error(await readErrorMessage(response, 'Music upload failed'));
+            }
             const data = await response.json();
-            const files = data.files || ['none'];
-            const mixkitLabels = {};
-            (data.mixkit_tracks || []).forEach(track => {
-                const genre = track.genre ? ` (${track.genre})` : '';
-                mixkitLabels[track.id] = `🎵 ${track.title}${genre} — Mixkit`;
-            });
-            allowedMusic = new Set(files);
-            musicSelect.innerHTML = files.map(name => {
-                const label = name === 'none' ? 'No music' : (mixkitLabels[name] || name);
-                return `<option value="${name}">${label}</option>`;
-            }).join('');
-            musicSelect.value = files.includes(current) ? current : 'none';
-        } catch (error) {
-            allowedMusic = new Set(['none', 'cinematic.mp3']);
+            if (pathEl) pathEl.value = data.path || '';
+            if (statusEl) statusEl.textContent = data.name ? `Uploaded: ${data.name}` : 'Uploaded';
         }
+        return (pathEl?.value || '').trim();
     }
 
     if (!tabSingle || !tabScript) return;
@@ -613,7 +674,11 @@ document.addEventListener('DOMContentLoaded', () => {
         if (languageSelect) languageSelect.value = 'zh-CN';
         refreshVoiceList('zh-CN-YunyangNeural-Male');
 
-        if (musicSelect) musicSelect.value = 'none';
+        if (musicSelect) {
+            musicSelect.value = 'none';
+            rebuildThemedSelect(musicSelect);
+            updateMusicSourceUi();
+        }
 
         const subtitleStyle = document.getElementById('subtitle-style');
         if (subtitleStyle) subtitleStyle.value = 'high_retention';
@@ -710,6 +775,10 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     document.querySelectorAll('.source-dropdown').forEach(initThemedDropdown);
     document.getElementById('tts-server')?.addEventListener('change', () => refreshVoiceList());
+    musicSelect?.addEventListener('change', () => {
+        updateMusicSourceUi();
+        rebuildThemedSelect(musicSelect);
+    });
 
     function updateProviderFallbackVisibility() {
         const wrap = document.getElementById('provider-fallback-wrap');
@@ -756,6 +825,13 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             rebuildThemedSelect(document.getElementById('tts-server'));
             rebuildThemedSelect(document.getElementById('source-select'));
+            if (musicSelect && fields['music-select'] && !allowedMusic.has(fields['music-select'])) {
+                const pathEl = document.getElementById('music-custom-path');
+                if (pathEl && !pathEl.value) pathEl.value = fields['music-select'];
+                musicSelect.value = 'custom';
+            }
+            rebuildThemedSelect(musicSelect);
+            updateMusicSourceUi();
             await refreshVoiceList(fields['voice-select']);
             updateCaptionPositionUi();
             updateProviderFallbackVisibility();
@@ -1088,6 +1164,16 @@ document.addEventListener('DOMContentLoaded', () => {
             showToast('Background music option is invalid. Choose again.', 'error');
             return;
         }
+        if (music === 'pixabay' && !keys.pixabay_key) {
+            showApiSettings();
+            showToast('Pixabay music needs a Pixabay API key.', 'error');
+            return;
+        }
+        if (music === 'sonilo' && !keys.sonilo_key) {
+            showApiSettings();
+            showToast('Sonilo AI needs an API key. Add it in API settings.', 'error');
+            return;
+        }
 
         if (autoVideo && voice === 'none') {
             showToast('Auto video needs a TTS voice. Turn off auto video for asset-only mode.', 'error');
@@ -1129,6 +1215,15 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             persistKeys(keys);
+            let customMusic = (document.getElementById('music-custom-path')?.value || '').trim();
+            if (music === 'custom') {
+                customMusic = await ensureCustomMusicUploaded();
+                if (!customMusic) {
+                    showToast('Upload a music file or enter a path.', 'error');
+                    setLoading(false);
+                    return;
+                }
+            }
             const response = await fetch('/api/scrape', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -1146,6 +1241,9 @@ document.addEventListener('DOMContentLoaded', () => {
                         ratio, voice, subtitles, language,
                         tts_server: document.getElementById('tts-server')?.value || 'azure-tts-v1',
                         subtitle_style: subtitleStyle, music, filter,
+                        music_style: document.getElementById('music-style')?.value || '',
+                        custom_music: customMusic,
+                        music_query: query,
                         emoji_subtitles: emojiSubtitles,
                         watermark: watermark,
                         clip_duration: numVal('clip-duration', 5),
@@ -1177,7 +1275,8 @@ document.addEventListener('DOMContentLoaded', () => {
                         yt_client_secret: keys.yt_client_secret || '',
                         eleven_key: keys.eleven_key || '',
                         azure_speech_key: keys.azure_speech_key || '',
-                        azure_speech_region: keys.azure_speech_region || ''
+                        azure_speech_region: keys.azure_speech_region || '',
+                        sonilo_key: keys.sonilo_key || ''
                     }
                 })
             });

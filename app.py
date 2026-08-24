@@ -25,7 +25,8 @@ for stream in (sys.stdout, sys.stderr):
 # Built by Ali R. | github.com/AliRash3ed
 # ═══════════════════════════════════════════════════════════════
 
-from aesthetic_scraper import PinterestScraper, PexelsScraper, PixabayScraper, CoverrScraper, MixkitScraper, LLMProcessor, WebScraper, LLM_PROVIDER_PRESETS, pinterest_mp4_urls, pinterest_pin_page, download_pinterest_with_ytdlp, mixkit_music_tracks, MIXKIT_MUSIC_MOODS
+import base64
+from aesthetic_scraper import PinterestScraper, PexelsScraper, PixabayScraper, CoverrScraper, MixkitScraper, LLMProcessor, WebScraper, LLM_PROVIDER_PRESETS, pinterest_mp4_urls, pinterest_pin_page, download_pinterest_with_ytdlp, mixkit_music_tracks, mixkit_music_search, coverr_music_tracks, pixabay_music_tracks, music_match_query, MIXKIT_MUSIC_MOODS, VIBE_TO_MUSIC_MOOD
 from media_quality import content_fingerprint, delete_rejected_file, download_http, last_download_error, redact_secret, reset_download_fail_logs, validate_downloaded_video, MIN_VIDEO_BYTES
 from semantic_media import (
     CoverageError,
@@ -90,6 +91,9 @@ class VideoSettings(BaseModel):
     language: str = "en-US"
     subtitle_style: str = "high_retention"
     music: str = "none"
+    music_style: str = ""
+    custom_music: str = ""
+    music_query: str = ""
     filter: str = "none"
     vibe: str = "aesthetic"
     emoji_subtitles: bool = False
@@ -122,6 +126,7 @@ class ApiKeys(BaseModel):
     eleven_key: str = ""
     azure_speech_key: str = ""
     azure_speech_region: str = ""
+    sonilo_key: str = ""
 
 class ScrapeRequest(BaseModel):
     query: Optional[str] = None
@@ -171,6 +176,9 @@ class AzureTtsTestRequest(BaseModel):
     api_key: str = ""
     region: str = ""
 
+class SoniloTestRequest(BaseModel):
+    api_key: str = ""
+
 LLM_PROVIDER_MODELS = {
     "openrouter": [
         "deepseek/deepseek-v4-pro",
@@ -191,6 +199,8 @@ VALID_MEDIA_TYPES = {"photo", "video"}
 VALID_MODES = {"single", "script"}
 VALID_TRANSITIONS = {"none", "fade", "zoom_in", "zoom_out", "slide"}
 ALLOWED_UPLOAD_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".m4v", ".webm"}
+ALLOWED_MUSIC_SUFFIXES = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg"}
+MUSIC_SOURCES = ("none", "random", "custom", "coverr", "mixkit", "pixabay", "sonilo")
 
 # ── Routes ──
 @app.get("/")
@@ -356,19 +366,37 @@ async def test_azure_tts(request: AzureTtsTestRequest):
     print(f"✅ Azure TTS V2 test ok: region={region}")
     return {"ok": True, "note": f"token issued · {region}"}
 
+@app.post("/api/music/sonilo/test")
+async def test_sonilo(request: SoniloTestRequest):
+    import requests as req
+    api_key = (request.api_key or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Enter a Sonilo API key first.")
+
+    def ping():
+        return req.get(
+            "https://api.sonilo.com/v1/account/services",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=(8, 15),
+        )
+
+    try:
+        response = await asyncio.to_thread(ping)
+    except req.RequestException as exc:
+        raise HTTPException(status_code=400, detail=f"Could not reach Sonilo: {exc}") from exc
+    if response.status_code in (401, 403):
+        raise HTTPException(status_code=400, detail="Sonilo rejected this API key.")
+    if response.status_code == 402:
+        raise HTTPException(status_code=400, detail="Sonilo: add credits before generating music.")
+    if response.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Sonilo: HTTP {response.status_code}")
+    print("✅ Sonilo test ok")
+    return {"ok": True, "note": "account services reachable"}
+
 @app.get("/api/music")
 async def list_music():
-    music_dir = BASE_DIR / "static" / "music"
-    files = ["none"]
-    if music_dir.exists():
-        files.extend(sorted(p.name for p in music_dir.iterdir() if p.suffix.lower() in {".mp3", ".wav", ".m4a"} and p.stat().st_size > 0))
-    mixkit_tracks = []
-    try:
-        mixkit_tracks = await asyncio.to_thread(mixkit_music_catalog)
-    except Exception as exc:
-        print(f"⚠️ Mixkit music catalog unavailable: {exc}")
-    files.extend(track["id"] for track in mixkit_tracks)
-    return {"files": files, "mixkit_tracks": mixkit_tracks}
+    files = list_local_music_files()
+    return {"files": ["none"] + files, "local_files": files, "sources": list(MUSIC_SOURCES)}
 
 AZURE_VOICES_PATH = BASE_DIR / "data" / "azure_voices.json"
 _azure_voices_cache = None
@@ -589,6 +617,20 @@ async def upload_material(file: UploadFile = File(...)):
     dest.write_bytes(content)
     return {"path": dest.name, "url": "/uploads/" + dest.name}
 
+@app.post("/api/upload/music")
+async def upload_music(file: UploadFile = File(...)):
+    filename = sanitize_upload_filename(file.filename or "track.mp3")
+    suffix = Path(filename).suffix.lower()
+    if suffix not in ALLOWED_MUSIC_SUFFIXES:
+        raise HTTPException(status_code=400, detail=f"Unsupported music type: {suffix or 'unknown'}. Use MP3, M4A, AAC, WAV, FLAC, or OGG.")
+    CUSTOM_MUSIC_DIR.mkdir(parents=True, exist_ok=True)
+    dest = CUSTOM_MUSIC_DIR / f"{uuid.uuid4().hex}_{filename}"
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded music file is empty.")
+    dest.write_bytes(content)
+    return {"path": dest.name, "name": filename}
+
 @app.post("/api/tts/preview")
 async def tts_preview(request: VoicePreviewRequest):
     text = (request.text or "").strip()[:180]
@@ -708,7 +750,7 @@ def validate_scrape_request_options(request):
             raise RuntimeError("Auto video requires a TTS voice. Turn off auto video for asset-only mode.")
         if (settings.transition or "fade") not in VALID_TRANSITIONS:
             raise RuntimeError("Invalid clip transition. Choose none, fade, zoom_in, zoom_out, or slide.")
-        resolve_background_music(settings)
+        validate_background_music(settings, request.api_keys)
         if request.mode == "single" and request.source != "local":
             raise RuntimeError("Single stock search does not assemble a video. Switch to script mode, or turn off auto video.")
         if request.yt_upload and not request.publish_confirmed:
@@ -1018,7 +1060,33 @@ def require_media_files(files, label):
 MIXKIT_MUSIC_CACHE_TTL = 6 * 3600  # seconds
 MIXKIT_MUSIC_TRACKS_PER_MOOD = 6
 MIXKIT_MUSIC_DOWNLOAD_DIR = DOWNLOAD_DIR / "_mixkit_music"
+COVERR_MUSIC_DOWNLOAD_DIR = DOWNLOAD_DIR / "_coverr_music"
+PIXABAY_MUSIC_DOWNLOAD_DIR = DOWNLOAD_DIR / "_pixabay_music"
+SONILO_MUSIC_DOWNLOAD_DIR = DOWNLOAD_DIR / "_sonilo_music"
+CUSTOM_MUSIC_DIR = DOWNLOAD_DIR / "_custom_music"
 _mixkit_music_cache = {"tracks": [], "fetched_at": 0.0}
+
+
+def list_local_music_files():
+    music_dir = BASE_DIR / "static" / "music"
+    if not music_dir.exists():
+        return []
+    return sorted(
+        p.name for p in music_dir.iterdir()
+        if p.suffix.lower() in ALLOWED_MUSIC_SUFFIXES and p.stat().st_size > 0
+    )
+
+
+def music_source_kind(settings):
+    music = (settings.music or "none").strip()
+    lower = music.lower()
+    if not lower or lower == "none":
+        return "none"
+    if lower in MUSIC_SOURCES:
+        return lower
+    if music.startswith("mixkit-"):
+        return "mixkit-track"
+    return "file"
 
 
 def mixkit_music_catalog(force=False):
@@ -1058,19 +1126,183 @@ def resolve_mixkit_music_file(track_id):
     return str(cache_path)
 
 
-def resolve_background_music(settings):
-    music = (settings.music or "none").strip()
-    if not music or music.lower() == "none":
-        return None
-    if music.startswith("mixkit-"):
-        return resolve_mixkit_music_file(music)
-    if Path(music).name != music:
+def resolve_local_music_file(filename):
+    if Path(filename).name != filename:
         raise RuntimeError("Background music filename is invalid. Choose a track from the dropdown.")
-
-    music_path = BASE_DIR / "static" / "music" / music
+    music_path = BASE_DIR / "static" / "music" / filename
     if not music_path.exists() or music_path.stat().st_size <= 0:
-        raise RuntimeError(f"Background music file is missing or empty: static/music/{music}. Choose “No music” or add the file.")
+        raise RuntimeError(f"Background music file is missing or empty: static/music/{filename}. Choose “No music” or add the file.")
     return str(music_path)
+
+
+def resolve_custom_music_file(value):
+    raw = (value or "").strip().strip('"')
+    if not raw:
+        raise RuntimeError("Custom background music needs an uploaded file or a local path.")
+    suffix = Path(raw).suffix.lower()
+    if suffix not in ALLOWED_MUSIC_SUFFIXES:
+        raise RuntimeError("Custom background music must be MP3, M4A, AAC, WAV, FLAC, or OGG.")
+    name = Path(raw).name
+    candidates = [CUSTOM_MUSIC_DIR / name, BASE_DIR / "static" / "music" / name, Path(raw)]
+    for candidate in candidates:
+        try:
+            resolved = Path(os.path.realpath(str(candidate)))
+        except OSError:
+            continue
+        if resolved.is_file() and resolved.stat().st_size > 0 and resolved.suffix.lower() in ALLOWED_MUSIC_SUFFIXES:
+            return str(resolved)
+    raise RuntimeError("Custom background music file is missing or empty. Upload a track or enter a valid path.")
+
+
+def download_matched_track(tracks, cache_dir, prefix, label):
+    if not tracks:
+        raise RuntimeError(f"No {label} tracks matched this video. Try another style or source.")
+    shuffled = list(tracks)
+    random.shuffle(shuffled)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    for track in shuffled[:8]:
+        url = track.get("url") or ""
+        if not url:
+            continue
+        tid = re.sub(r"[^\w\-]", "_", str(track.get("id") or "track"))[:48] or "track"
+        ext = Path(url.split("?", 1)[0]).suffix.lower()
+        if ext not in ALLOWED_MUSIC_SUFFIXES:
+            ext = ".mp3"
+        dest = cache_dir / f"{prefix}_{tid}{ext}"
+        if dest.exists() and dest.stat().st_size > 0:
+            return str(dest)
+        ok = download_http(url, dest, 60, 8000, True)
+        if ok and dest.exists() and dest.stat().st_size > 0:
+            return str(dest)
+    raise RuntimeError(f"Could not download {label} music. Try another style or source.")
+
+
+def resolve_sonilo_music(settings, api_keys, duration_seconds):
+    import requests as req
+    key = ((api_keys.sonilo_key if api_keys else "") or "").strip()
+    if not key:
+        raise RuntimeError("Sonilo AI needs an API key. Add it in API settings.")
+    duration = max(15, min(120, int(duration_seconds or 45)))
+    query = music_match_query(
+        vibe=getattr(settings, "vibe", "") or "",
+        style=getattr(settings, "music_style", "") or "",
+        topic=getattr(settings, "music_query", "") or "",
+    )
+    prompt = (
+        f"{duration} seconds of instrumental background music, no vocals. "
+        f"Style: {query}. Licensed bed for a short video."
+    )
+    digest = hashlib_sha1(f"{prompt}|{duration}")
+    dest = SONILO_MUSIC_DOWNLOAD_DIR / f"sonilo_{digest}.m4a"
+    if dest.exists() and dest.stat().st_size > 0:
+        return str(dest)
+    SONILO_MUSIC_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    headers = {"Authorization": f"Bearer {key}"}
+    files = {"prompt": (None, prompt), "duration": (None, str(duration))}
+    response = req.post(
+        "https://api.sonilo.com/v1/text-to-music",
+        headers=headers,
+        files=files,
+        stream=True,
+        timeout=300,
+    )
+    if response.status_code in (401, 403):
+        raise RuntimeError("Sonilo rejected this API key.")
+    if response.status_code == 402:
+        raise RuntimeError("Sonilo: add credits before generating music.")
+    if response.status_code != 200:
+        detail = (response.text or "")[:180]
+        raise RuntimeError(f"Sonilo music failed: HTTP {response.status_code} {detail}".strip())
+    chunks = []
+    complete = False
+    for line in response.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+        event = json.loads(line)
+        kind = event.get("type")
+        if kind == "audio_chunk":
+            chunks.append(base64.b64decode(event.get("data") or ""))
+        elif kind == "complete":
+            complete = True
+            break
+        elif kind == "error":
+            raise RuntimeError(event.get("message") or "Sonilo generation failed.")
+    if not complete or not chunks:
+        raise RuntimeError("Sonilo returned no audio. Try again or pick another music source.")
+    dest.write_bytes(b"".join(chunks))
+    return str(dest)
+
+
+def hashlib_sha1(text):
+    import hashlib
+    return hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:16]
+
+
+def validate_background_music(settings, api_keys=None):
+    kind = music_source_kind(settings)
+    keys = api_keys or ApiKeys()
+    if kind == "none":
+        return
+    if kind == "random":
+        if not list_local_music_files():
+            raise RuntimeError("Random background music needs at least one file in static/music.")
+        return
+    if kind == "custom":
+        resolve_custom_music_file(getattr(settings, "custom_music", "") or "")
+        return
+    if kind == "pixabay" and not (keys.pixabay_key or "").strip():
+        raise RuntimeError("Pixabay music needs a Pixabay API key. Add it in API settings.")
+    if kind == "sonilo" and not (keys.sonilo_key or "").strip():
+        raise RuntimeError("Sonilo AI needs an API key. Add it in API settings.")
+    if kind == "file":
+        resolve_local_music_file((settings.music or "").strip())
+        return
+    if kind == "mixkit-track":
+        return
+    if kind not in MUSIC_SOURCES:
+        raise RuntimeError("Invalid background music source.")
+
+
+def resolve_background_music(settings, api_keys=None, vibe="", duration_seconds=45):
+    kind = music_source_kind(settings)
+    keys = api_keys or ApiKeys()
+    if vibe:
+        settings.vibe = vibe
+    if kind == "none":
+        return None
+    if kind == "random":
+        files = list_local_music_files()
+        if not files:
+            raise RuntimeError("Random background music needs at least one file in static/music.")
+        return str(BASE_DIR / "static" / "music" / random.choice(files))
+    if kind == "custom":
+        return resolve_custom_music_file(getattr(settings, "custom_music", "") or "")
+    if kind == "mixkit-track":
+        return resolve_mixkit_music_file((settings.music or "").strip())
+    if kind == "file":
+        return resolve_local_music_file((settings.music or "").strip())
+    query = music_match_query(
+        vibe=vibe or getattr(settings, "vibe", "") or "",
+        style=getattr(settings, "music_style", "") or "",
+        topic=getattr(settings, "music_query", "") or "",
+    )
+    if kind == "mixkit":
+        style = (getattr(settings, "music_style", "") or "").strip()
+        mood = VIBE_TO_MUSIC_MOOD.get((vibe or getattr(settings, "vibe", "") or "").strip(), "cinematic")
+        tracks = mixkit_music_search(style or mood, limit=8)
+        return download_matched_track(tracks, MIXKIT_MUSIC_DOWNLOAD_DIR, "mk", "Mixkit")
+    if kind == "coverr":
+        tracks = coverr_music_tracks(query, api_key=(keys.coverr_key or "").strip(), limit=8)
+        return download_matched_track(tracks, COVERR_MUSIC_DOWNLOAD_DIR, "cv", "Coverr")
+    if kind == "pixabay":
+        if not (keys.pixabay_key or "").strip():
+            raise RuntimeError("Pixabay music needs a Pixabay API key. Add it in API settings.")
+        tracks = pixabay_music_tracks(query, keys.pixabay_key, limit=8)
+        return download_matched_track(tracks, PIXABAY_MUSIC_DOWNLOAD_DIR, "px", "Pixabay")
+    if kind == "sonilo":
+        return resolve_sonilo_music(settings, keys, duration_seconds)
+    raise RuntimeError("Invalid background music source.")
+
 
 async def try_search(scraper, keyword, media_type, count, aspect="9:16"):
     if not scraper:
@@ -1834,7 +2066,8 @@ async def run_video_assembly(
     validate_tts_files(engine, len(keyword_data))
 
     settings.vibe = vibe
-    bg_music = resolve_background_music(settings)
+    duration_seconds = max(20, min(120, int(settings.clip_duration or 5) * max(1, len(keyword_data))))
+    bg_music = resolve_background_music(settings, api_keys=api_keys, vibe=vibe, duration_seconds=duration_seconds)
     candidate_count = max(1, min(5, int(settings.video_count or 1)))
     candidates = []
     video_path = None
@@ -1924,6 +2157,8 @@ async def run_scrape(request: ScrapeRequest):
         source, media_type, count = request.source, request.media_type, request.count
         api_keys = request.api_keys or ApiKeys()
         settings = request.video_settings or VideoSettings()
+        if not (settings.music_query or "").strip():
+            settings.music_query = (request.query or "").strip()
         local_files = resolved_local_files(request) if source == "local" else []
         print(
             f"🎛️ Settings: {count} asset(s)/scene | "

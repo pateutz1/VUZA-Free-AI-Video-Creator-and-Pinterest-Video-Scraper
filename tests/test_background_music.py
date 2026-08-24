@@ -32,6 +32,7 @@ from app import (
     resolve_background_music,
     sanitize_upload_filename,
     start_scrape,
+    validate_background_music,
     validate_request_api_dependencies,
     validate_scrape_request_options,
     validate_script_keyword_key,
@@ -203,6 +204,44 @@ class BackgroundMusicResolutionTests(unittest.TestCase):
             resolve_background_music(settings)
 
 
+    def test_random_picks_local_file(self):
+        settings = VideoSettings(music="random")
+        with patch("app.list_local_music_files", return_value=["cinematic.mp3"]):
+            path = resolve_background_music(settings)
+        self.assertTrue(path.endswith("cinematic.mp3"))
+
+    def test_pixabay_source_requires_key(self):
+        settings = VideoSettings(music="pixabay")
+        with self.assertRaisesRegex(RuntimeError, "Pixabay API key"):
+            validate_background_music(settings, ApiKeys())
+
+    def test_sonilo_source_requires_key(self):
+        settings = VideoSettings(music="sonilo")
+        with self.assertRaisesRegex(RuntimeError, "Sonilo AI needs an API key"):
+            validate_background_music(settings, ApiKeys())
+
+    def test_custom_music_resolves_uploaded_file(self):
+        from app import CUSTOM_MUSIC_DIR
+        CUSTOM_MUSIC_DIR.mkdir(parents=True, exist_ok=True)
+        dest = CUSTOM_MUSIC_DIR / "clip.mp3"
+        dest.write_bytes(b"x" * 4000)
+        self.addCleanup(lambda: dest.unlink(missing_ok=True))
+        settings = VideoSettings(music="custom", custom_music="clip.mp3")
+        path = resolve_background_music(settings)
+        self.assertTrue(path.endswith("clip.mp3"))
+
+    def test_auto_mixkit_downloads_matched_track(self):
+        track = {"id": "mixkit-55", "title": "Match", "url": "https://assets.mixkit.co/music/55/55.mp3"}
+        with patch("app.mixkit_music_search", return_value=[track]), patch("app.download_http", return_value=True):
+            from app import MIXKIT_MUSIC_DOWNLOAD_DIR
+            cache_path = MIXKIT_MUSIC_DOWNLOAD_DIR / "mk_mixkit-55.mp3"
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(b"x" * 9000)
+            self.addCleanup(lambda: cache_path.unlink(missing_ok=True))
+            path = resolve_background_music(VideoSettings(music="mixkit", music_style="cinematic"))
+        self.assertTrue(path.endswith("mk_mixkit-55.mp3"))
+
+
 class MixkitMusicTests(unittest.TestCase):
     def setUp(self):
         app_module._mixkit_music_cache["tracks"] = []
@@ -265,16 +304,34 @@ class MixkitMusicTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Could not download Mixkit music track"):
                 resolve_background_music(VideoSettings(music="mixkit-777"))
 
-    def test_api_music_includes_mixkit_tracks(self):
-        track = {
-            "id": "mixkit-42", "title": "Chill", "artist": "A",
-            "genre": "Lo-fi", "duration": 90.0, "url": "https://assets.mixkit.co/music/42/42.mp3",
-        }
-        with patch("app.mixkit_music_catalog", return_value=[track]):
-            status, data = asyncio.run(get_json("/api/music"))
+    def test_api_music_lists_sources(self):
+        status, data = asyncio.run(get_json("/api/music"))
         self.assertEqual(status, 200)
-        self.assertIn("mixkit-42", data["files"])
-        self.assertEqual(data["mixkit_tracks"], [track])
+        self.assertIn("none", data["files"])
+        self.assertIn("mixkit", data["sources"])
+        self.assertIn("coverr", data["sources"])
+        self.assertIn("sonilo", data["sources"])
+
+    def test_mixkit_parses_nested_itemlist_recordings(self):
+        from aesthetic_scraper import mixkit_music_recordings, mixkit_music_tracks
+        html = """
+        <script type="application/ld+json">
+        {"@graph":[{"@type":"ItemList","itemListElement":[{
+            "@type":"MusicRecording","name":"Valley Sunset","genre":"Ambient",
+            "url":"https://assets.mixkit.co/music/127/127.mp3","duration":"PT2M14S"
+        }]}]}
+        </script>
+        """
+        rows = mixkit_music_recordings(html)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["name"], "Valley Sunset")
+        with patch("aesthetic_scraper.requests.get") as fake_get:
+            fake_get.return_value.status_code = 200
+            fake_get.return_value.text = html
+            fake_get.return_value.raise_for_status = lambda: None
+            tracks = mixkit_music_tracks("ambient", limit=4)
+        self.assertEqual(tracks[0]["id"], "mixkit-127")
+        self.assertEqual(tracks[0]["url"], "https://assets.mixkit.co/music/127/127.mp3")
 
 
 class SourceContractTests(unittest.TestCase):

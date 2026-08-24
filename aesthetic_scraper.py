@@ -1275,17 +1275,65 @@ class MixkitScraper:
 
 
 _MIXKIT_MUSIC_ID_RE = re.compile(r'/music/(\d+)/')
+_MIXKIT_MP3_RE = re.compile(r'https://assets\.mixkit\.co/music/(\d+)/\1\.mp3')
 MIXKIT_MUSIC_MOODS = ("cinematic", "ambient", "upbeat", "corporate", "inspirational", "lo-fi")
+VIBE_TO_MUSIC_MOOD = {
+    "general": "cinematic",
+    "aesthetic": "ambient",
+    "lofi": "lo-fi",
+    "futuristic": "electronic",
+    "black_and_white": "cinematic",
+    "suspense_cn": "mysterious",
+}
+_AUDIO_FILE_RE = re.compile(r'https?://[^"\'\s<>]+?\.(?:mp3|m4a|wav)(?:\?[^"\'\s<>]*)?', re.I)
+_NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
+_PAID_MUSIC_HOST_RE = re.compile(r"premiumbeat|shutterstock|storyblocks", re.I)
 
 
-def mixkit_music_tracks(mood, limit=6):
-    """Scrape one Mixkit free-stock-music mood page (schema.org MusicRecording
-    JSON-LD, same @graph convention as the video pages) for direct mp3 URLs."""
-    url = f"https://mixkit.co/free-stock-music/{mood}/"
+def music_match_query(vibe="", style="", topic=""):
+    style = (style or "").strip()
+    if style:
+        return style[:80]
+    mood = VIBE_TO_MUSIC_MOOD.get((vibe or "").strip(), "cinematic")
+    topic = re.sub(r"\s+", " ", (topic or "").strip())[:40]
+    if topic:
+        return f"{mood} {topic}".strip()
+    return mood
+
+
+def mixkit_music_recordings(html):
+    """Mixkit now nests MusicRecording rows inside ItemList.itemListElement
+    across multiple JSON-LD scripts, not as top-level @graph entries."""
+    found, seen = [], set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("@type") == "MusicRecording" and node.get("url"):
+                url = node.get("url")
+                if url not in seen:
+                    seen.add(url)
+                    found.append(node)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    for match in _MIXKIT_LD_JSON_RE.finditer(html or ""):
+        try:
+            walk(json.loads(match.group(1)))
+        except (ValueError, TypeError):
+            continue
+    return found
+
+
+def mixkit_music_tracks(mood, limit=6, page_url=None):
+    """Scrape one Mixkit free-stock-music page for direct mp3 URLs."""
+    url = page_url or f"https://mixkit.co/free-stock-music/{mood}/"
     try:
         resp = requests.get(
             url, timeout=(30, 60),
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VUZA/1.0"},
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"},
         )
         resp.raise_for_status()
         html = resp.text
@@ -1294,14 +1342,16 @@ def mixkit_music_tracks(mood, limit=6):
         return []
 
     tracks = []
-    for item in mixkit_ld_json_graph(html):
-        if not isinstance(item, dict) or item.get("@type") != "MusicRecording":
-            continue
+    seen_ids = set()
+    for item in mixkit_music_recordings(html):
         track_url = item.get("url") or ""
         if not track_url:
             continue
-        id_match = _MIXKIT_MUSIC_ID_RE.search(track_url)
+        id_match = _MIXKIT_MUSIC_ID_RE.search(track_url) or _MIXKIT_MP3_RE.search(track_url)
         track_id = id_match.group(1) if id_match else track_url
+        if track_id in seen_ids:
+            continue
+        seen_ids.add(track_id)
         tracks.append({
             "id": f"mixkit-{track_id}",
             "title": item.get("name") or f"Mixkit track {track_id}",
@@ -1309,6 +1359,191 @@ def mixkit_music_tracks(mood, limit=6):
             "genre": item.get("genre") or mood,
             "duration": mixkit_iso8601_duration_seconds(item.get("duration")),
             "url": track_url,
+        })
+        if len(tracks) >= limit:
+            return tracks
+    for match in _MIXKIT_MP3_RE.finditer(html or ""):
+        track_id = match.group(1)
+        if track_id in seen_ids:
+            continue
+        seen_ids.add(track_id)
+        tracks.append({
+            "id": f"mixkit-{track_id}",
+            "title": f"Mixkit track {track_id}",
+            "artist": "",
+            "genre": mood,
+            "duration": 0.0,
+            "url": match.group(0),
+        })
+        if len(tracks) >= limit:
+            break
+    return tracks
+
+
+def mixkit_music_search(query, limit=8):
+    raw = re.sub(r"[^a-z0-9]+", "-", (query or "").lower()).strip("-")
+    if raw == "lofi":
+        raw = "lo-fi"
+    candidates = []
+    if raw and raw.count("-") <= 2 and len(raw) <= 24:
+        candidates.append(raw)
+    vibe_mood = VIBE_TO_MUSIC_MOOD.get(raw, "")
+    if vibe_mood:
+        candidates.append(vibe_mood)
+    candidates.extend(MIXKIT_MUSIC_MOODS)
+    seen = set()
+    for slug in candidates:
+        if not slug or slug in seen:
+            continue
+        seen.add(slug)
+        tracks = mixkit_music_tracks(slug, limit=limit)
+        if tracks:
+            return tracks
+        tracks = mixkit_music_tracks(slug, limit=limit, page_url=f"https://mixkit.co/free-stock-music/tag/{slug}/")
+        if tracks:
+            return tracks
+    return mixkit_music_tracks("home", limit=limit, page_url="https://mixkit.co/free-stock-music/")
+
+
+def _coverr_audio_url(item):
+    if not isinstance(item, dict):
+        return ""
+    urls = item.get("urls") or {}
+    if isinstance(urls, str) and _AUDIO_FILE_RE.match(urls) and not _PAID_MUSIC_HOST_RE.search(urls):
+        return urls
+    if isinstance(urls, dict):
+        for key in ("mp3_download", "mp3", "m4a", "wav", "audio", "download"):
+            value = urls.get(key) or ""
+            if value and not _PAID_MUSIC_HOST_RE.search(value):
+                return value
+    for key in ("mp3", "audio_url", "download_url", "url"):
+        value = item.get(key) or ""
+        if isinstance(value, str) and value.startswith("http") and not _PAID_MUSIC_HOST_RE.search(value):
+            if ".mp3" in value or ".m4a" in value or ".wav" in value or key != "url":
+                return value
+    return ""
+
+
+def _walk_audio_urls(node, found, limit=12):
+    if len(found) >= limit:
+        return
+    if isinstance(node, dict):
+        url = _coverr_audio_url(node)
+        if url:
+            found.append({
+                "id": str(node.get("id") or node.get("slug") or len(found) + 1),
+                "title": node.get("title") or node.get("name") or "Coverr track",
+                "url": url,
+            })
+        for value in node.values():
+            _walk_audio_urls(value, found, limit)
+    elif isinstance(node, list):
+        for value in node:
+            _walk_audio_urls(value, found, limit)
+
+
+def coverr_music_tracks(query, api_key="", limit=8):
+    tracks = []
+    if api_key:
+        for path in ("audios", "music"):
+            try:
+                response = requests.get(
+                    f"https://api.coverr.co/{path}",
+                    params={"query": query or "cinematic", "page_size": 20, "urls": "true"},
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    timeout=(20, 40),
+                    verify=True,
+                )
+                if response.status_code != 200:
+                    continue
+                hits = CoverrScraper._hits_from_payload(response.json())
+                for item in hits:
+                    url = _coverr_audio_url(item)
+                    if not url:
+                        continue
+                    tracks.append({
+                        "id": str(item.get("id") or item.get("slug") or len(tracks) + 1),
+                        "title": item.get("title") or item.get("name") or "Coverr track",
+                        "url": url,
+                    })
+                    if len(tracks) >= limit:
+                        return tracks
+            except Exception as exc:
+                print(f"⚠️ Coverr music API ({path}) failed: {exc}")
+    slug = re.sub(r"[^a-z0-9]+", "-", (query or "cinematic").lower()).strip("-") or "cinematic"
+    pages = [
+        f"https://coverr.co/s/music?q={quote(query or 'cinematic')}",
+        f"https://coverr.co/free-stock-music/moods/{slug}",
+        "https://coverr.co/free-stock-music",
+    ]
+    for page in pages:
+        if len(tracks) >= limit:
+            break
+        try:
+            html = requests.get(
+                page, timeout=(20, 40),
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VUZA/1.0"},
+            ).text
+        except Exception as exc:
+            print(f"⚠️ Coverr music scrape failed: {exc}")
+            continue
+        match = _NEXT_DATA_RE.search(html or "")
+        if match:
+            try:
+                _walk_audio_urls(json.loads(match.group(1)), tracks, limit)
+            except (ValueError, TypeError):
+                pass
+        seen = {item["url"] for item in tracks}
+        for url in _AUDIO_FILE_RE.findall(html or ""):
+            if _PAID_MUSIC_HOST_RE.search(url) or url in seen:
+                continue
+            seen.add(url)
+            tracks.append({"id": str(len(tracks) + 1), "title": "Coverr track", "url": url})
+            if len(tracks) >= limit:
+                break
+    return tracks[:limit]
+
+
+def pixabay_music_tracks(query, api_key, limit=8):
+    if not api_key:
+        return []
+    try:
+        response = requests.get(
+            "https://pixabay.com/api/audio/",
+            params={
+                "key": api_key,
+                "q": query or "background music",
+                "audio_type": "music",
+                "per_page": min(20, max(int(limit or 8), 3)),
+            },
+            timeout=(20, 40),
+            verify=True,
+        )
+        response.raise_for_status()
+        hits = response.json().get("hits") or []
+    except Exception as exc:
+        print(f"⚠️ Pixabay music search failed: {exc}")
+        return []
+    tracks = []
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+        nested = hit.get("audio") if isinstance(hit.get("audio"), dict) else {}
+        medias = hit.get("medias") if isinstance(hit.get("medias"), dict) else {}
+        url = (
+            hit.get("downloadURL")
+            or hit.get("previewURL")
+            or nested.get("url")
+            or (medias.get("large") or {}).get("url")
+            or (medias.get("medium") or {}).get("url")
+            or ""
+        )
+        if not url:
+            continue
+        tracks.append({
+            "id": str(hit.get("id") or len(tracks) + 1),
+            "title": (hit.get("tags") or "Pixabay track").split(",")[0].strip(),
+            "url": url,
         })
         if len(tracks) >= limit:
             break

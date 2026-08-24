@@ -166,6 +166,21 @@
                     </div>
 
                     <div class="settings-row">
+                        <h4><i class="fas fa-music"></i> Sonilo AI music (optional)</h4>
+                        <p class="settings-note">Used for Automatic video-matched music (Sonilo AI). <a href="https://platform.sonilo.com/dashboard/api-keys" target="_blank" class="get-key">Get API key →</a></p>
+                        <div class="key-grid">
+                            <div class="key-field">
+                                <label>Sonilo API key</label>
+                                <input type="password" id="sonilo-key" placeholder="sk_..." autocomplete="off">
+                            </div>
+                        </div>
+                        <div class="stock-test-row">
+                            <button type="button" class="secondary-btn" id="test-sonilo-btn">Test API</button>
+                            <p class="settings-note prov-status" id="sonilo-test-status"></p>
+                        </div>
+                    </div>
+
+                    <div class="settings-row">
                         <h4><i class="fab fa-youtube"></i> YouTube upload (optional, never automatic)</h4>
                         <p class="settings-note">📺 Off by default. Requires an explicit confirmation checkbox before each upload.</p>
                         <div class="key-grid">
@@ -398,11 +413,37 @@
                             </select>
                         </div>
                         <div class="setting-card">
-                            <div class="setting-label">Background music</div>
-                            <select id="music-select" class="custom-select">
-                                <option value="none" selected>🔇 No music</option>
-                                <option value="cinematic.mp3">🎬 Cinematic</option>
-                            </select>
+                            <div class="setting-label">Background music source</div>
+                            <div class="source-dropdown" id="music-dropdown">
+                                <select id="music-select" class="source-select-native" tabindex="-1" aria-hidden="true">
+                                    <option value="none" selected>No background music</option>
+                                    <option value="random">Random background music</option>
+                                    <option value="custom">Custom background music</option>
+                                    <option value="coverr">Automatic video-matched music (Coverr)</option>
+                                    <option value="mixkit">Automatic video-matched music (Mixkit)</option>
+                                    <option value="pixabay">Automatic video-matched music (Pixabay)</option>
+                                    <option value="sonilo">Automatic video-matched music (Sonilo AI)</option>
+                                </select>
+                                <button type="button" class="source-dropdown-toggle" aria-expanded="false" aria-haspopup="listbox">
+                                    <span class="themed-dropdown-label">No background music</span>
+                                    <i class="fas fa-chevron-down source-dropdown-caret"></i>
+                                </button>
+                                <ul class="source-dropdown-menu" role="listbox" hidden></ul>
+                            </div>
+                            <p class="settings-note" id="music-source-note">No background music is mixed into the video.</p>
+                        </div>
+                        <div class="setting-card hidden" id="music-custom-card">
+                            <div class="setting-label">Upload background music</div>
+                            <input type="file" id="music-upload" accept=".mp3,.m4a,.aac,.wav,.flac,.ogg,audio/*">
+                            <p class="settings-note">30MB per file · MP3, M4A, AAC, WAV, FLAC, OGG</p>
+                            <p class="settings-note" id="music-upload-status"></p>
+                            <div class="setting-label">Or enter a custom music path</div>
+                            <input type="text" id="music-custom-path" class="custom-select" placeholder="C:\path\to\song.mp3" autocomplete="off">
+                        </div>
+                        <div class="setting-card hidden" id="music-style-card">
+                            <div class="setting-label">Music style (optional)</div>
+                            <input type="text" id="music-style" class="custom-select" placeholder="cinematic, lo-fi, upbeat..." autocomplete="off">
+                            <p class="settings-note">Leave blank to match the selected vibe and topic.</p>
                         </div>
                         <div class="setting-card">
                             <div class="setting-label">BGM volume: <span id="bgm-vol-val" class="highlight">20</span>%</div>
@@ -716,7 +757,7 @@
     </div>
 
     <div id="toast" class="toast hidden"></div>
-    <script src="/static/script.js?v=7.8"></script>
+    <script src="/static/script.js?v=7.9"></script>
 </body>
 
 </html>

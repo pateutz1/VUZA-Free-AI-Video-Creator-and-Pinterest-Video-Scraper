@@ -479,14 +479,8 @@ class GenerateKeywordsRequest(BaseModel):
 
 
 def terms_amount_for_script(script, match_script_order=False, count=3, clip_duration=5):
-    """One MPT term per scene. Scene count = ceil(speech / (assets × clip duration))."""
-    count = max(1, min(15, int(count or 3)))
-    clip_duration = max(2, min(12, int(clip_duration or 5)))
-    budget = max(2.0, float(count) * float(clip_duration))
-    speech = estimated_speech_seconds(script)
-    if speech <= 0:
-        return 8 if match_script_order else 5
-    return max(1, min(15, int((speech + budget - 1e-9) / budget)))
+    """MPT term count: 8 when matching script order, otherwise 5."""
+    return 8 if match_script_order else 5
 
 
 

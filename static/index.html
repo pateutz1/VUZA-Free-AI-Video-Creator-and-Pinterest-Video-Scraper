@@ -304,7 +304,7 @@
                     </div>
                     <div class="topic-generator">
                         <label for="keywords-input"><i class="fas fa-key"></i> Video keywords (English, optional)</label>
-                        <p class="settings-note">Comma-separated 1–3 word English stock terms. Count = ceil(narration seconds / (Assets per scene × Clip duration)), max 15. Each term gets that many clips. Check Match visuals for chronological place/beat terms.</p>
+                        <p class="settings-note">Comma-separated 1–3 word English stock terms. 5 terms by default, 8 if Match visuals is on (same as MoneyPrinterTurbo). Assets per scene is how many clips each term gets.</p>
                         <div class="input-with-button">
                             <textarea id="keywords-input" placeholder="gym workout, barbell squat, athlete sweat, gym floor, victory pose" class="input topic-textarea"></textarea>
                             <button type="button" id="regenerate-keywords-btn" class="secondary-btn">
@@ -313,7 +313,7 @@
                         </div>
                     </div>
                     <label class="toggle-row" for="match-script-order">
-                        <input type="checkbox" id="match-script-order">
+                        <input type="checkbox" id="match-script-order" checked>
                         <span>Match visuals to script order (8 chronological terms, sequential search)</span>
                     </label>
                     <div class="template-selector">

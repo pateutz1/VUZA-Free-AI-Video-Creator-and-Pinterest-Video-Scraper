@@ -161,7 +161,7 @@ def _terms_prompt(video_subject, video_script, amount, match_script_order):
 
 ## Constrains:
 1. the search terms are to be returned as a json-array of strings.
-2. each search term should consist of 1-3 words, always add the main subject of the video.
+2. each search term should consist of 1-3 concrete visual nouns from the script (place, landmark, or action). Do not prefix terms with generic subject words such as best, places, world, or earth.
 3. you must only return the json-array of strings. you must not return anything else. you must not return the script.
 4. the search terms must be related to the subject of the video.
 5. reply with english search terms only.

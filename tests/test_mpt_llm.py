@@ -38,6 +38,11 @@ class MptLlmTests(unittest.TestCase):
         self.assertIn("chronological", llm.prompts[0])
         self.assertIn("earlier visual moments", llm.prompts[0])
 
+    def test_terms_prompt_forbids_generic_subject_prefix(self):
+        prompt = mpt_llm._terms_prompt("best places on terra in this world", "See Norway.", 5, False)
+        self.assertIn("Do not prefix", prompt)
+        self.assertNotIn("always add the main subject of the video", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

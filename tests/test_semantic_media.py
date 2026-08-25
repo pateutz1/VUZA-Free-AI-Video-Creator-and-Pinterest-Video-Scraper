@@ -15,6 +15,7 @@ from semantic_media import (
     ground_query,
     interleave_candidates_by_query,
     keyword_length_plan,
+    normalize_stock_query,
     parse_sentence_queries,
     query_broaden_chain,
     query_relevance,
@@ -94,6 +95,13 @@ class QueryParseTests(unittest.TestCase):
         self.assertNotIn(
             "best",
             query_broaden_chain("Maldives places", "best places on terra in this world"),
+        )
+        self.assertEqual(normalize_stock_query("best places Norway"), "Norway")
+        self.assertEqual(normalize_stock_query("best places Tokyo"), "Tokyo")
+        self.assertEqual(normalize_stock_query("Great Barrier Reef"), "Great Barrier Reef")
+        self.assertEqual(
+            query_broaden_chain("best places Patagonia", "best places on terra in this world"),
+            ["Patagonia"],
         )
         real = MediaCandidate(query="gym deadlift", title="athlete barbell deadlift gym")
         fake = MediaCandidate(query="gym deadlift", title="3d anatomical deadlift tutorial")

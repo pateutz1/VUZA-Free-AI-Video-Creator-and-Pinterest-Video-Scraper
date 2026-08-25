@@ -932,11 +932,13 @@ class KeywordParseHookTests(unittest.TestCase):
         self.assertIn("Patagonia", chunks[0])
         self.assertIn("Reef", chunks[-1])
 
-    def test_terms_amount_uses_assets_times_clip_duration(self):
+    def test_terms_amount_matches_mpt_five_or_eight(self):
         short = "One two three four five six seven eight nine ten."
-        self.assertEqual(terms_amount_for_script(short, count=3, clip_duration=5), 1)
+        self.assertEqual(terms_amount_for_script(short, match_script_order=False), 5)
+        self.assertEqual(terms_amount_for_script(short, match_script_order=True), 8)
         long = " ".join(["word"] * 400)
-        self.assertEqual(terms_amount_for_script(long, count=3, clip_duration=5), 11)
+        self.assertEqual(terms_amount_for_script(long, count=3, clip_duration=5), 5)
+        self.assertEqual(terms_amount_for_script(long, match_script_order=True, count=3, clip_duration=5), 8)
 
 
 if __name__ == "__main__":

@@ -959,14 +959,49 @@ def clip_matches_panel_aspect(width, height, aspect="9:16", is_vertical=None):
     return True
 
 
-def short_query_fallbacks(query):
+def short_query_fallbacks(query, topic=""):
+    """Generate progressively broader fallback queries, staying on topic."""
     text = (query or "").strip()
     words = text.split()
     ordered = []
-    for item in (text, " ".join(words[:2]) if len(words) > 2 else "", words[0] if len(words) > 1 else ""):
-        item = (item or "").strip()
-        if item and item not in ordered:
-            ordered.append(item)
+    
+    # Try original query first
+    if text:
+        ordered.append(text)
+    
+    # Try removing last word (e.g., "Pillars of Creation" → "Pillars of")
+    if len(words) > 2:
+        ordered.append(" ".join(words[:-1]))
+    
+    # Try first 2 words (e.g., "Pillars of Creation" → "Pillars of")
+    if len(words) > 2 and " ".join(words[:2]) not in ordered:
+        ordered.append(" ".join(words[:2]))
+    
+    # Try first word only
+    if len(words) > 1:
+        ordered.append(words[0])
+    
+    # Topic-aware fallback: extract meaningful words from query itself
+    # Extract nouns/keywords longer than 3 chars (avoid "the", "and", etc.)
+    query_keywords = [
+        w for w in text.lower().split() 
+        if len(w) > 3 and w not in {"with", "from", "that", "this", "scene", "scenes", "video", "videos"}
+    ]
+    
+    if query_keywords:
+        # Use first 2 keywords as fallback (e.g., "galaxy space" from "Pillars of Creation galaxy")
+        fallback = " ".join(query_keywords[:2])
+        if fallback not in ordered and fallback not in [text.lower()]:
+            ordered.append(fallback)
+    
+    # If topic provided, use it as last resort
+    if topic:
+        topic_words = [w for w in topic.lower().split() if len(w) > 3][:2]
+        if topic_words:
+            fallback = " ".join(topic_words)
+            if fallback not in ordered:
+                ordered.append(fallback)
+    
     return ordered
 
 
@@ -1174,10 +1209,12 @@ class MixkitScraper:
 
     SEARCH_URL = "https://mixkit.co/free-stock-video/{slug}/"
     HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VUZA/1.0"}
+    REQUEST_DELAY = 1.5
 
     def __init__(self, output_dir="downloads/mixkit", api_key=None):
         self.output_dir = Path(output_dir)
         self.seen_ids = set()
+        self.last_request_time = 0
 
     def _get_folder(self, query):
         folder = self.output_dir / re.sub(r'[^\w\-]', '_', query)[:25]
@@ -1185,6 +1222,10 @@ class MixkitScraper:
         return folder
 
     def _fetch(self, url):
+        elapsed = time.time() - self.last_request_time
+        if elapsed < self.REQUEST_DELAY:
+            time.sleep(self.REQUEST_DELAY - elapsed)
+        self.last_request_time = time.time()
         resp = requests.get(url, timeout=(30, 60), headers=self.HEADERS)
         resp.raise_for_status()
         return resp.text

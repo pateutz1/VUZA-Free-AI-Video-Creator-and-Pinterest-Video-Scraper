@@ -381,7 +381,26 @@ class VideoEngine:
             try:
                 communicate = Communicate(text, azure_name, rate=rate)
                 path = self.temp_dir / f"speech_{idx}.mp3"
-                await asyncio.wait_for(communicate.save(str(path)), timeout=timeout_seconds)
+                timing_path = self.temp_dir / f"speech_{idx}_timings.json"
+                
+                # Capture word boundaries
+                word_timings = []
+                async for chunk in communicate.stream():
+                    if chunk["type"] == "WordBoundary":
+                        word_timings.append({
+                            "word": chunk["text"],
+                            "offset": chunk["offset"] / 10_000_000.0,  # Convert to seconds
+                            "duration": chunk["duration"] / 10_000_000.0
+                        })
+                    elif chunk["type"] == "audio":
+                        with open(path, "ab") as f:
+                            f.write(chunk["data"])
+                
+                # Save word timings
+                import json
+                with open(timing_path, "w", encoding="utf-8") as f:
+                    json.dump(word_timings, f, ensure_ascii=False, indent=2)
+                
                 if float(voice_volume or 1.0) != 1.0 and path.exists():
                     from moviepy import AudioFileClip
                     clip = AudioFileClip(str(path)).with_volume_scaled(float(voice_volume))
@@ -761,9 +780,20 @@ class VideoEngine:
                 try:
                     from PIL import Image, ImageDraw, ImageFont
                     import numpy as np
+                    import json
 
                     # Subtitles follow spoken audio, not padded silence after the last word.
                     subtitle_duration = max(0.5, speech_duration)
+
+                    # Load word timings if available
+                    timing_path = Path(audio_path).parent / f"{Path(audio_path).stem}_timings.json"
+                    word_timings = []
+                    if timing_path.exists():
+                        try:
+                            with open(timing_path, "r", encoding="utf-8") as f:
+                                word_timings = json.load(f)
+                        except:
+                            pass
 
                     style = settings.subtitle_style if settings else "default"
 
@@ -847,14 +877,39 @@ class VideoEngine:
                             display_text = SubtitleHelper.insert_emojis(sentence)
 
                         chunks = chunk_subtitle_text(display_text)
-                        chunk_duration = subtitle_duration / len(chunks)
-
+                        
                         subs_clips = []
-                        for idx, chunk in enumerate(chunks):
-                            t_img = make_text_image(chunk, visual_clip.w, visual_clip.h, style)
-                            t_clip = ImageClip(t_img).with_duration(chunk_duration).with_start(idx * chunk_duration)
-                            t_clip = t_clip.with_opacity(0.98)
-                            subs_clips.append(t_clip)
+                        
+                        if word_timings:
+                            # Use word-level timings for accurate synchronization
+                            words_per_chunk = 3
+                            chunk_timings = []
+                            
+                            for chunk_idx, chunk in enumerate(chunks):
+                                start_word_idx = chunk_idx * words_per_chunk
+                                end_word_idx = min(start_word_idx + words_per_chunk, len(word_timings))
+                                
+                                if start_word_idx < len(word_timings):
+                                    chunk_start = word_timings[start_word_idx]["offset"]
+                                    if end_word_idx < len(word_timings):
+                                        chunk_end = word_timings[end_word_idx]["offset"]
+                                    else:
+                                        last_word = word_timings[-1]
+                                        chunk_end = last_word["offset"] + last_word["duration"]
+                                    
+                                    chunk_duration = chunk_end - chunk_start
+                                    t_img = make_text_image(chunk, visual_clip.w, visual_clip.h, style)
+                                    t_clip = ImageClip(t_img).with_duration(chunk_duration).with_start(chunk_start)
+                                    t_clip = t_clip.with_opacity(0.98)
+                                    subs_clips.append(t_clip)
+                        else:
+                            # Fallback to even division if no timings available
+                            chunk_duration = subtitle_duration / len(chunks)
+                            for idx, chunk in enumerate(chunks):
+                                t_img = make_text_image(chunk, visual_clip.w, visual_clip.h, style)
+                                t_clip = ImageClip(t_img).with_duration(chunk_duration).with_start(idx * chunk_duration)
+                                t_clip = t_clip.with_opacity(0.98)
+                                subs_clips.append(t_clip)
 
                         visual_clip = CompositeVideoClip([visual_clip] + subs_clips)
                     else:

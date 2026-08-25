@@ -82,7 +82,9 @@ def normalize_stock_query(keyword):
     words = [word for word in query.split() if word]
     if len(words) > 5:
         query = " ".join(words[:5])
-    return query
+    else:
+        query = " ".join(words)
+    return _strip_generic_query_words(query)
 
 
 QUERY_STOP = {
@@ -134,8 +136,20 @@ ABSTRACT_TOPIC_WORDS = {
 GENERIC_SEARCH_WORDS = {
     "best", "top", "places", "place", "world", "earth", "terra", "planet",
     "destination", "destinations", "video", "videos", "amazing", "beautiful",
-    "scenic", "unforgettable", "great", "ultimate", "guide", "on",
+    "scenic", "unforgettable", "ultimate", "guide",
 }
+
+
+def _strip_generic_query_words(query):
+    words = [word for word in (query or "").split() if word]
+    if not words:
+        return query
+    kept = list(words)
+    while kept and kept[0].lower() in GENERIC_SEARCH_WORDS:
+        kept.pop(0)
+    while len(kept) > 1 and kept[-1].lower() in GENERIC_SEARCH_WORDS:
+        kept.pop()
+    return " ".join(kept) if kept else query
 
 UNREALISTIC_PIN_RE = re.compile(
     r"\b(anatomy|anatomical|3d|cgi|animation|animated|infographic|tutorial|"

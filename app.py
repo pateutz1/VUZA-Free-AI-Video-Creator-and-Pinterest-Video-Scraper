@@ -28,6 +28,8 @@ for stream in (sys.stdout, sys.stderr):
 import base64
 from aesthetic_scraper import PinterestScraper, PexelsScraper, PixabayScraper, CoverrScraper, MixkitScraper, LLMProcessor, WebScraper, LLM_PROVIDER_PRESETS, pinterest_mp4_urls, pinterest_pin_page, download_pinterest_with_ytdlp, mixkit_music_tracks, mixkit_music_search, coverr_music_tracks, music_match_query, MIXKIT_MUSIC_MOODS, VIBE_TO_MUSIC_MOOD
 from media_quality import content_fingerprint, delete_rejected_file, download_http, last_download_error, redact_secret, reset_download_fail_logs, validate_downloaded_video, MIN_VIDEO_BYTES
+import mpt_llm
+
 from semantic_media import (
     CoverageError,
     MAX_ALT_QUERIES_PER_SCENE,
@@ -78,8 +80,6 @@ scraping_status = {
     "task_id": None, "candidates": [], "review": None,
 }
 
-# Holds phase-2 inputs (keyword_data, project paths, settings) while a job is
-# paused for review. Keyed by task_id; single-job app, so at most one entry.
 pending_assembly = {}
 
 # ── Models ──
@@ -145,6 +145,8 @@ class ScrapeRequest(BaseModel):
     api_keys: Optional[ApiKeys] = None
     keywords: Optional[List[str]] = None
     provider_fallback: bool = False
+    match_script_order: bool = False
+
 
 class AssembleRequest(BaseModel):
     task_id: str
@@ -459,6 +461,10 @@ class GenerateScriptRequest(BaseModel):
     language: str = "en-US"
     count: int = 3
     clip_duration: int = 5
+    paragraph_number: int = 1
+    video_script_prompt: str = ""
+    custom_system_prompt: str = ""
+    match_script_order: bool = False
     api_keys: Optional[ApiKeys] = None
 
 class GenerateKeywordsRequest(BaseModel):
@@ -468,7 +474,71 @@ class GenerateKeywordsRequest(BaseModel):
     language: str = "en-US"
     count: int = 3
     clip_duration: int = 5
+    match_script_order: bool = False
     api_keys: Optional[ApiKeys] = None
+
+
+def terms_amount_for_script(script, match_script_order=False, count=3, clip_duration=5):
+    """One MPT term per scene. Scene count = ceil(speech / (assets × clip duration))."""
+    count = max(1, min(15, int(count or 3)))
+    clip_duration = max(2, min(12, int(clip_duration or 5)))
+    budget = max(2.0, float(count) * float(clip_duration))
+    speech = estimated_speech_seconds(script)
+    if speech <= 0:
+        return 8 if match_script_order else 5
+    return max(1, min(15, int((speech + budget - 1e-9) / budget)))
+
+
+
+def split_script_to_n(script, n):
+    """Split narration into n chunks so each MPT term still has spoken text for TTS."""
+    n = max(1, int(n or 1))
+    text = (script or "").strip()
+    if not text:
+        return [""] * n
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+    if len(paragraphs) == n:
+        return paragraphs
+    sentences = split_script_sentences(script)
+    if len(sentences) >= n:
+        size = len(sentences) / n
+        chunks = []
+        for index in range(n):
+            start = round(index * size)
+            end = round((index + 1) * size) if index < n - 1 else len(sentences)
+            chunks.append(" ".join(sentences[start:end]).strip())
+        return [item or sentences[-1] for item in chunks]
+    words = text.split()
+    if len(words) <= n:
+        padded = list(words) + [words[-1]] * (n - len(words)) if words else [""] * n
+        return padded[:n]
+    size = len(words) / n
+    chunks = []
+    for index in range(n):
+        start = round(index * size)
+        end = round((index + 1) * size) if index < n - 1 else len(words)
+        chunks.append(" ".join(words[start:end]).strip())
+    return chunks
+
+
+def terms_to_scene_rows(terms, script=""):
+    """One ordered scene per MPT search term, with narration chunked to match."""
+    cleaned = []
+    seen = set()
+    for raw in terms or []:
+        term = normalize_stock_query(raw)
+        key = term.lower()
+        if not term or key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(term)
+    if not cleaned:
+        return []
+    chunks = split_script_to_n(script, len(cleaned)) if (script or "").strip() else [
+        f"Visual beat {idx + 1}" for idx in range(len(cleaned))
+    ]
+    return [{"sentence": chunks[idx], "keyword": cleaned[idx]} for idx in range(len(cleaned))]
+
 
 def apply_user_keywords(grouped, keywords, topic=""):
     cleaned = []
@@ -540,21 +610,27 @@ async def generate_script(request: GenerateScriptRequest):
     api_keys = request.api_keys or ApiKeys()
     require_llm_key(api_keys, "Script generation")
     llm = LLMProcessor(api_key=api_keys.llm_key, api_url=api_keys.llm_url, model=api_keys.llm_model)
-    count = max(1, min(15, int(request.count or 3)))
-    clip_duration = max(2, min(12, int(request.clip_duration or 5)))
-    script = llm.generate_full_script(
-        request.topic,
-        vibe=request.vibe,
+    script = mpt_llm.generate_script(
+        llm,
+        video_subject=request.topic,
         language=request.language,
-        assets_per_scene=count,
-        clip_duration=clip_duration,
+        paragraph_number=request.paragraph_number,
+        video_script_prompt=request.video_script_prompt,
+        custom_system_prompt=request.custom_system_prompt,
     )
 
     if not script:
         raise HTTPException(status_code=500, detail=llm.last_error or "Script generation failed. Check your AI API key.")
-    keywords = keywords_from_topic_and_script(
-        llm, request.topic, script, request.vibe, request.language, count, clip_duration
+    count = max(1, min(15, int(request.count or 3)))
+    clip_duration = max(2, min(12, int(request.clip_duration or 5)))
+    terms_amount = terms_amount_for_script(
+        script, match_script_order=request.match_script_order, count=count, clip_duration=clip_duration
     )
+    keywords = mpt_llm.generate_terms(
+        llm, request.topic, script, amount=terms_amount, match_script_order=request.match_script_order
+    ) or [
+        fallback_stock_query(script, request.topic)
+    ]
     return {"script": script, "keywords": keywords}
 
 
@@ -572,12 +648,16 @@ async def generate_keywords(request: GenerateKeywordsRequest):
     llm = LLMProcessor(api_key=api_keys.llm_key, api_url=api_keys.llm_url, model=api_keys.llm_model)
     count = max(1, min(15, int(request.count or 3)))
     clip_duration = max(2, min(12, int(request.clip_duration or 5)))
-    keywords = keywords_from_topic_and_script(
-        llm, topic, script, request.vibe, request.language, count, clip_duration
+    amount = terms_amount_for_script(
+        script, match_script_order=request.match_script_order, count=count, clip_duration=clip_duration
+    )
+    keywords = mpt_llm.generate_terms(
+        llm, topic, script, amount=amount, match_script_order=request.match_script_order
     )
     if not keywords:
         raise HTTPException(status_code=500, detail=llm.last_error or "Keyword generation failed. Check your AI API key.")
     return {"keywords": keywords}
+
 
 class ScrapeUrlRequest(BaseModel):
     url: str
@@ -792,7 +872,7 @@ def local_script_segments(script):
     ]
 
 SPEECH_WORDS_PER_SEC = 2.5
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;；])\s+")
 
 
 def split_script_sentences(script):
@@ -1737,37 +1817,19 @@ async def collect_stock_videos(
         return True
 
     groups = []
-    if search_fn:
-        for idx, item in enumerate(keyword_data):
-            query = item.get("keyword") or ""
-            found, origin = await search_query(query, idx)
-            ranked = rank_scene_candidates(found, sentence=item.get("sentence") or "", keyword=query)
-            unique = [candidate for candidate in ranked if keep_candidate(candidate, idx)]
-            unique = dedupe_candidates(unique, seen_keys)
-            print(f"  provider={source} query={query!r} origin={origin} candidates={len(unique)}")
-            groups.append(unique)
-    else:
-        pool = []
-        origin = "live"
-        plan_queries = plan or stock_query_plan(keyword_data)
-        query_total = max(1, len(plan_queries))
-        for q_idx, query in enumerate(plan_queries):
-            set_status(progress=5 + 20 * (q_idx / query_total), message=f"Searching stock ({q_idx + 1}/{query_total}): {query}")
-            found, origin = await search_query(query, 0, broaden=False)
-            pool.extend(found)
-        pool = [candidate for candidate in pool if keep_candidate(candidate, 0)]
-        pool = dedupe_candidates(pool)
-        print(f"  provider={source} origin={origin} pool={len(pool)} queries={len(plan_queries)}")
-        for idx, item in enumerate(keyword_data):
-            ranked = rank_scene_candidates(
-                pool,
-                sentence=item.get("sentence") or "",
-                keyword=f"{item.get('keyword') or ''} {topic}",
-            )
-            mixed = interleave_candidates_by_query(ranked, plan_queries)
-            mixed = interleave_candidates_by_provider(mixed, list(scrapers.keys()))
-            print(f"  mix scene {idx + 1}: " + ", ".join(f"{query!r}" for query in plan_queries))
-            groups.append(mixed)
+    scene_total = max(1, len(keyword_data))
+    for idx, item in enumerate(keyword_data):
+        query = item.get("keyword") or ""
+        set_status(
+            progress=5 + 20 * (idx / scene_total),
+            message=f"Searching stock ({idx + 1}/{scene_total}): {query}",
+        )
+        found, origin = await search_query(query, idx)
+        ranked = rank_scene_candidates(found, sentence=item.get("sentence") or "", keyword=query)
+        unique = [candidate for candidate in ranked if keep_candidate(candidate, idx)]
+        unique = dedupe_candidates(unique, seen_keys)
+        print(f"  provider={source} query={query!r} origin={origin} candidates={len(unique)}")
+        groups.append(unique)
 
     selected, taken_keys = seed_selected_from_keyword_data(keyword_data, clip_duration)
     pointers = [0] * len(keyword_data)
@@ -2048,6 +2110,7 @@ async def run_video_assembly(
     publish_confirmed=False,
     progress_label="",
 ):
+
     """Voiceover + create_video + thumbnail + optional YouTube upload for one project.
     Shared by the single-pass flow and the post-review /api/assemble phase."""
     label = f" {progress_label}" if progress_label else ""
@@ -2077,7 +2140,11 @@ async def run_video_assembly(
     validate_tts_files(engine, len(keyword_data))
 
     settings.vibe = vibe
-    duration_seconds = max(20, min(120, int(settings.clip_duration or 5) * max(1, len(keyword_data))))
+    try:
+        assets = max(1, int(getattr(settings, "assets_per_scene", 1) or 1))
+    except (TypeError, ValueError):
+        assets = 1
+    duration_seconds = max(20, min(180, int(settings.clip_duration or 5) * assets * max(1, len(keyword_data))))
     bg_music = resolve_background_music(settings, api_keys=api_keys, vibe=vibe, duration_seconds=duration_seconds)
     candidate_count = max(1, min(5, int(settings.video_count or 1)))
     candidates = []
@@ -2117,35 +2184,9 @@ async def run_video_assembly(
             scraping_status["message"] += f" (upload failed: {e})"
 
 
-async def run_assemble_phase(
-    task_id,
-    keyword_data,
-    project_path,
-    project_name,
-    media_type,
-    settings,
-    api_keys,
-    vibe,
-    yt_upload,
-    publish_confirmed,
-):
-    """Background task for POST /api/assemble: resumes a paused (awaiting_review) job."""
-    try:
-        await run_video_assembly(
-            keyword_data, project_path, project_name, media_type, settings, api_keys, vibe,
-            yt_upload=yt_upload, publish_confirmed=publish_confirmed,
-        )
-        set_status("success", progress=100)
-    except Exception as e:
-        set_status("error", message=f"Error: {str(e)}", progress=100, error=str(e))
-        import traceback
-        traceback.print_exc()
-    finally:
-        scraping_status["is_running"] = False
-
-
 # ── Main Scraping ──
 async def run_scrape(request: ScrapeRequest):
+
     global scraping_status
     task_id = scraping_status.get("task_id") or uuid.uuid4().hex[:12]
     set_status(
@@ -2160,8 +2201,6 @@ async def run_scrape(request: ScrapeRequest):
         mode=request.mode,
         task_id=task_id,
     )
-    pending_assembly.pop(task_id, None)
-
     try:
         validate_scrape_request_options(request)
         validate_request_api_dependencies(request)
@@ -2187,7 +2226,6 @@ async def run_scrape(request: ScrapeRequest):
                 project_path.mkdir(parents=True, exist_ok=True)
 
                 scraping_status["message"] = f"Analyzing script {script_idx+1}/{len(scripts)}..."
-                already_grouped = False
                 if source == "local":
                     keyword_data = local_script_segments(script)
                     llm = None
@@ -2195,48 +2233,46 @@ async def run_scrape(request: ScrapeRequest):
                     llm = LLMProcessor(api_key=api_keys.llm_key, api_url=api_keys.llm_url, model=api_keys.llm_model)
                     use_stock_pipeline = media_type == "video" and source in STOCK_VIDEO_SOURCES
                     topic = (request.query or "").strip() or script[:160]
-                    sentence_rows = [{"sentence": part, "keyword": "scene"} for part in split_script_sentences(script)]
-                    grouped = group_scenes_to_clip_budget(
-                        sentence_rows, count, settings.clip_duration
-                    )
-                    mapped = apply_user_keywords(grouped, request.keywords, topic)
-                    already_grouped = bool(mapped) or use_stock_pipeline
-                    if mapped:
-                        keyword_data = mapped
+                    if request.keywords:
+                        keyword_data = terms_to_scene_rows(request.keywords, script)
                     elif use_stock_pipeline:
-                        keyword_data = llm.extract_keywords(
+                        amount = terms_amount_for_script(
                             script,
-                            vibe=request.vibe,
-                            language=settings.language,
-                            topic=topic,
-                            scenes=[item["sentence"] for item in grouped],
+                            match_script_order=request.match_script_order,
+                            count=count,
+                            clip_duration=settings.clip_duration,
+                        )
+                        keyword_data = terms_to_scene_rows(
+                            mpt_llm.generate_terms(
+                                llm, topic, script,
+                                amount=amount,
+                                match_script_order=request.match_script_order,
+                            ),
+                            script,
                         )
                     else:
-                        keyword_data = llm.extract_keywords(
-                            script,
-                            vibe=request.vibe,
-                            language=settings.language,
-                            topic=topic,
-                        )
+                        sentence_rows = [{"sentence": part, "keyword": "scene"} for part in split_script_sentences(script)]
+                        grouped = group_scenes_to_clip_budget(sentence_rows, count, settings.clip_duration)
+                        scenes = [item["sentence"] for item in grouped]
+                        padded = list(scenes)
+                        while len(padded) < 4:
+                            padded.append(script)
+                        lengths = keyword_length_plan(4)
+                        filled = llm.extract_keywords(script, vibe=request.vibe, language=settings.language, topic=topic, scenes=padded, word_counts=lengths)
+                        keyword_data = [
+                            {"sentence": item["sentence"], "keyword": item.get("keyword") or fallback_stock_query(item["sentence"], topic)}
+                            for item in filled
+                        ] if filled else []
 
                 if not keyword_data:
                     raise RuntimeError((llm.last_error if llm else "") or "No usable scenes were generated. Check that the script is not empty.")
 
-                raw_scenes = len(split_script_sentences(script)) if script else len(keyword_data)
                 use_stock_pipeline = media_type == "video" and source in STOCK_VIDEO_SOURCES
-                if not already_grouped:
-                    keyword_data = group_scenes_to_clip_budget(
-                        keyword_data, count, settings.clip_duration
-                    )
-                    print(
-                        f"🎞️ Scenes: {raw_scenes} sentences → {len(keyword_data)} "
-                        f"({count}×{settings.clip_duration}s per scene)"
-                    )
-                elif source != "local":
-                    print(
-                        f"🎞️ Scenes: {raw_scenes} sentences → {len(keyword_data)} "
-                        f"({count}×{settings.clip_duration}s per scene)"
-                    )
+                raw_scenes = len(split_script_sentences(script)) if script else len(keyword_data)
+                print(
+                    f"🎞️ Scenes: {raw_scenes} sentences → {len(keyword_data)} "
+                    f"({count}×{settings.clip_duration}s per scene)"
+                )
 
                 total = len(keyword_data)
                 seen_hashes = set()
@@ -2255,30 +2291,6 @@ async def run_scrape(request: ScrapeRequest):
                         enable_fallback=bool(request.provider_fallback),
                     )
                     result_rows = keyword_data_result_rows(keyword_data)
-                    review_eligible = request.auto_video and use_stock_pipeline and len(scripts) == 1
-                    if review_eligible:
-                        validate_scene_images(keyword_data, project_path)
-                        pending_assembly[task_id] = {
-                            "keyword_data": keyword_data,
-                            "project_path": project_path,
-                            "project_name": project_name,
-                            "media_type": media_type,
-                            "settings": settings,
-                            "api_keys": api_keys,
-                            "vibe": request.vibe,
-                            "yt_upload": request.yt_upload,
-                            "publish_confirmed": request.publish_confirmed,
-                            "scene_pools": build_scene_pools(keyword_data),
-                            "count": count,
-                        }
-                        set_status(
-                            "awaiting_review",
-                            message=f"Scraping finished. Review {len(keyword_data)} scene(s) before voiceover, or continue with the default selection.",
-                            progress=100,
-                            results=result_rows,
-                            review=build_scene_review(keyword_data, count),
-                        )
-                        return
                     scraping_status["results"] = result_rows
                     set_status(progress=((script_idx + 0.8) / len(scripts)) * 100)
                 else:
@@ -2317,6 +2329,10 @@ async def run_scrape(request: ScrapeRequest):
                         set_status(progress=((script_idx) / len(scripts)) * 100 + ((idx + 1) / total) * (100 / len(scripts)) * 0.8)
 
                 if request.auto_video:
+                    try:
+                        settings.assets_per_scene = count
+                    except Exception:
+                        object.__setattr__(settings, "assets_per_scene", count)
                     await run_video_assembly(
                         keyword_data, project_path, project_name, media_type, settings, api_keys,
                         request.vibe, yt_upload=request.yt_upload, publish_confirmed=request.publish_confirmed,
@@ -2355,10 +2371,7 @@ async def run_scrape(request: ScrapeRequest):
         import traceback
         traceback.print_exc()
     finally:
-        # awaiting_review is a deliberate pause, not completion — leave is_running
-        # true so /api/scrape keeps rejecting new jobs until /api/assemble resumes it.
-        if scraping_status.get("status") != "awaiting_review":
-            scraping_status["is_running"] = False
+        scraping_status["is_running"] = False
 
 @app.post("/api/scrape")
 async def start_scrape(request: ScrapeRequest, background_tasks: BackgroundTasks):
@@ -2386,55 +2399,6 @@ async def start_scrape(request: ScrapeRequest, background_tasks: BackgroundTasks
     background_tasks.add_task(run_scrape, request)
     return {"message": "Started", "task_id": task_id}
 
-@app.post("/api/assemble")
-async def start_assemble(request: AssembleRequest, background_tasks: BackgroundTasks):
-    pending = pending_assembly.get(request.task_id)
-    if not pending:
-        raise HTTPException(
-            status_code=404,
-            detail="No pending review for this task. It may have already been assembled or expired.",
-        )
-
-    keyword_data = pending["keyword_data"]
-    if request.selections:
-        if len(request.selections) != len(keyword_data):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Expected {len(keyword_data)} scene selection(s), got {len(request.selections)}.",
-            )
-        pools = pending["scene_pools"]
-        cap = pending["count"]
-        for idx, paths in enumerate(request.selections):
-            pool = pools.get(idx, set())
-            cleaned = [p for p in (paths or []) if p in pool][:cap]
-            if not cleaned:
-                raise HTTPException(status_code=400, detail=f"Scene {idx + 1} has no valid selection.")
-            keyword_data[idx]["_files"] = cleaned
-
-    pending_assembly.pop(request.task_id, None)
-    result_rows = keyword_data_result_rows(keyword_data)
-    set_status(
-        "running",
-        message="Resuming after review...",
-        task_id=request.task_id,
-        error=None,
-        review=None,
-        results=result_rows,
-    )
-    background_tasks.add_task(
-        run_assemble_phase,
-        request.task_id,
-        keyword_data,
-        pending["project_path"],
-        pending["project_name"],
-        pending["media_type"],
-        pending["settings"],
-        pending["api_keys"],
-        pending["vibe"],
-        pending["yt_upload"],
-        pending["publish_confirmed"],
-    )
-    return {"message": "Assembling", "task_id": request.task_id, "results": result_rows}
-
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+

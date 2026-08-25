@@ -87,6 +87,14 @@ class QueryParseTests(unittest.TestCase):
             ),
             ["gym", "gym squat", "gym motivation", "gym lifting heavy barbell"],
         )
+        self.assertEqual(
+            query_broaden_chain("Himalayan places", "best places on terra in this world"),
+            ["Himalayan"],
+        )
+        self.assertNotIn(
+            "best",
+            query_broaden_chain("Maldives places", "best places on terra in this world"),
+        )
         real = MediaCandidate(query="gym deadlift", title="athlete barbell deadlift gym")
         fake = MediaCandidate(query="gym deadlift", title="3d anatomical deadlift tutorial")
         self.assertGreater(

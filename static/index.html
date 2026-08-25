@@ -277,20 +277,45 @@
                         <div class="input-with-button">
                             <textarea id="topic-input" placeholder="Short topic: a midnight text from a dead roommate. Or paste a long story and VUZA will rewrite it into narration." class="input topic-textarea"></textarea>
                             <button type="button" id="generate-script-btn" class="secondary-btn">
-                                <i class="fas fa-magic"></i> Generate script
+                                <i class="fas fa-magic"></i> Generate script &amp; keywords
                             </button>
+                        </div>
+                    </div>
+                    <div class="settings-grid">
+                        <div class="setting-card">
+                            <label for="paragraph-number">Paragraphs</label>
+                            <select id="paragraph-number" class="custom-select">
+                                <option value="1" selected>1</option>
+                                <option value="2">2</option>
+                                <option value="3">3</option>
+                                <option value="4">4</option>
+                                <option value="5">5</option>
+                                <option value="6">6</option>
+                                <option value="7">7</option>
+                                <option value="8">8</option>
+                                <option value="9">9</option>
+                                <option value="10">10</option>
+                            </select>
                         </div>
                     </div>
                     <div class="topic-generator">
-                        <label for="keywords-input"><i class="fas fa-key"></i> Stock search keywords</label>
-                        <p class="settings-note">Always 4 lines, longest first: 4-word, 3-word, 2-word, then 1-word. Search follows that order and drops words if too few clips match.</p>
+                        <label for="script-extra-prompt"><i class="fas fa-sliders-h"></i> Extra script requirements (optional)</label>
+                        <textarea id="script-extra-prompt" placeholder="Tone, facts to include, length notes..." class="input topic-textarea"></textarea>
+                    </div>
+                    <div class="topic-generator">
+                        <label for="keywords-input"><i class="fas fa-key"></i> Video keywords (English, optional)</label>
+                        <p class="settings-note">Comma-separated 1–3 word English stock terms. Count = ceil(narration seconds / (Assets per scene × Clip duration)), max 15. Each term gets that many clips. Check Match visuals for chronological place/beat terms.</p>
                         <div class="input-with-button">
-                            <textarea id="keywords-input" placeholder="gym lifting heavy barbell&#10;gym athlete squat&#10;gym squat&#10;gym" class="input topic-textarea"></textarea>
+                            <textarea id="keywords-input" placeholder="gym workout, barbell squat, athlete sweat, gym floor, victory pose" class="input topic-textarea"></textarea>
                             <button type="button" id="regenerate-keywords-btn" class="secondary-btn">
-                                <i class="fas fa-sync-alt"></i> Regenerate keywords
+                                <i class="fas fa-sync-alt"></i> Generate keywords
                             </button>
                         </div>
                     </div>
+                    <label class="toggle-row" for="match-script-order">
+                        <input type="checkbox" id="match-script-order">
+                        <span>Match visuals to script order (8 chronological terms, sequential search)</span>
+                    </label>
                     <div class="template-selector">
                         <label for="template-select">Quick templates</label>
                         <select id="template-select" class="custom-select">
@@ -733,31 +758,8 @@
         </div>
     </div> <!-- end page-layout -->
 
-    <!-- ═══ REVIEW / SWAP MODAL ═══ -->
-    <div id="review-overlay" class="review-overlay hidden">
-        <div class="review-modal">
-            <div id="review-intro">
-                <h3><i class="fas fa-clapperboard"></i> Review scraped media?</h3>
-                <p id="review-intro-text">Scraping is done. Review and swap clips before VUZA generates voiceover and assembles the video, or continue with the default pick.</p>
-                <div class="review-modal-actions">
-                    <button type="button" id="review-use-default-btn" class="action-btn"><i class="fas fa-forward"></i> Use default selection</button>
-                    <button type="button" id="review-open-btn" class="secondary-btn"><i class="fas fa-sliders-h"></i> Review &amp; swap clips</button>
-                </div>
-            </div>
-            <div id="review-swap" class="hidden">
-                <h3><i class="fas fa-clapperboard"></i> Review &amp; swap clips</h3>
-                <p>Tap a clip to select or deselect it. Each scene keeps up to its "Assets per scene" limit.</p>
-                <div id="review-scenes"></div>
-                <div class="review-footer">
-                    <button type="button" id="review-back-btn" class="secondary-btn"><i class="fas fa-arrow-left"></i> Back</button>
-                    <button type="button" id="review-continue-btn" class="action-btn"><i class="fas fa-play"></i> Continue to voiceover &amp; assembly</button>
-                </div>
-            </div>
-        </div>
-    </div>
-
     <div id="toast" class="toast hidden"></div>
-    <script src="/static/script.js?v=8.3"></script>
+    <script src="/static/script.js?v=9.2"></script>
 </body>
 
 </html>

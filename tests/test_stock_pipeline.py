@@ -22,8 +22,10 @@ from app import (
     collect_stock_videos,
     group_scenes_to_clip_budget,
     keep_visually_clean_media,
-    keywords_from_topic_and_script,
     split_script_sentences,
+    split_script_to_n,
+    terms_amount_for_script,
+    terms_to_scene_rows,
 )
 from semantic_media import (
     CoverageError,
@@ -910,29 +912,31 @@ class KeywordParseHookTests(unittest.TestCase):
         self.assertEqual(mapped[0]["keyword"], "gym weights lifting")
         self.assertEqual(mapped[1]["keyword"], "gym sweat dropping")
 
-    def test_keywords_from_topic_always_four_longest_first(self):
-        class FakeLLM:
-            def extract_keywords(self, script, vibe="", language="", topic="", scenes=None, word_counts=None):
-                return [
-                    {"sentence": (scenes or [""])[0], "keyword": "gym athlete pushing barbell"},
-                    {"sentence": (scenes or ["", ""])[1] if scenes and len(scenes) > 1 else "", "keyword": "gym athlete training"},
-                    {"sentence": (scenes or ["", "", ""])[2] if scenes and len(scenes) > 2 else "", "keyword": "gym squat"},
-                    {"sentence": (scenes or ["", "", "", ""])[3] if scenes and len(scenes) > 3 else "", "keyword": "gym"},
-                ]
-
-        keywords = keywords_from_topic_and_script(
-            FakeLLM(),
-            "gym, fitness, motivation, inspiration",
-            "Stop scrolling—your future self is waiting for the next rep! "
-            "Every drop of sweat is a tiny victory. Consistency beats intensity.",
-            "aesthetic",
-            "en-US",
-            3,
-            5,
+    def test_terms_to_scene_rows_chunks_script_in_term_order(self):
+        rows = terms_to_scene_rows(
+            ["gym workout", "barbell squat", "victory pose"],
+            "Hook the viewer. Then squat heavy. Finish proud.",
         )
-        self.assertEqual(len(keywords), 4)
-        self.assertEqual([len(item.split()) for item in keywords], [4, 3, 2, 1])
-        self.assertTrue(all(item.split()[0] == "gym" for item in keywords))
+        self.assertEqual([item["keyword"] for item in rows], ["gym workout", "barbell squat", "victory pose"])
+        self.assertTrue(all(item["sentence"] for item in rows))
+        self.assertEqual(split_script_to_n("A. B. C.", 3), ["A.", "B.", "C."])
+
+    def test_split_script_to_n_does_not_repeat_one_paragraph(self):
+        script = (
+            "From Patagonia cliffs to Maldives atolls; wander Machu Picchu; "
+            "explore Iceland beach; and the Great Barrier Reef."
+        )
+        chunks = split_script_to_n(script, 5)
+        self.assertEqual(len(chunks), 5)
+        self.assertEqual(len(set(c.lower() for c in chunks)), 5)
+        self.assertIn("Patagonia", chunks[0])
+        self.assertIn("Reef", chunks[-1])
+
+    def test_terms_amount_uses_assets_times_clip_duration(self):
+        short = "One two three four five six seven eight nine ten."
+        self.assertEqual(terms_amount_for_script(short, count=3, clip_duration=5), 1)
+        long = " ".join(["word"] * 400)
+        self.assertEqual(terms_amount_for_script(long, count=3, clip_duration=5), 11)
 
 
 if __name__ == "__main__":

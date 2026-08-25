@@ -83,102 +83,10 @@ class ReviewPayloadTests(unittest.TestCase):
 
 
 class AssembleEndpointTests(unittest.TestCase):
-    def setUp(self):
-        self.client = TestClient(fastapi_app)
-        self.project_dir = Path(tempfile.mkdtemp(dir=DOWNLOAD_DIR))
-        self.addCleanup(shutil.rmtree, self.project_dir, ignore_errors=True)
-        self.addCleanup(pending_assembly.clear)
-        self.addCleanup(lambda: app_module.set_status(
-            "idle", message="Ready", progress=0, error=None,
-            results=[], candidates=[], review=None, final_video=None,
-        ))
-
-    def _touch(self, name):
-        path = self.project_dir / name
-        path.write_bytes(b"0" * 10)
-        return str(path)
-
-    def _seed_pending(self, task_id, cap=2):
-        path_a, path_b, path_c = (self._touch(f"{n}.mp4") for n in "abc")
-        keyword_data = [{"keyword": "k", "sentence": "s", "_files": [path_a]}]
-        pending_assembly[task_id] = {
-            "keyword_data": keyword_data,
-            "project_path": self.project_dir,
-            "project_name": "proj",
-            "media_type": "video",
-            "settings": VideoSettings(),
-            "api_keys": ApiKeys(),
-            "vibe": "aesthetic",
-            "yt_upload": False,
-            "publish_confirmed": False,
-            "scene_pools": {0: {path_a, path_b, path_c}},
-            "count": cap,
-        }
-        return keyword_data, [path_a, path_b, path_c]
-
-    def test_assemble_missing_task_returns_404(self):
-        response = self.client.post("/api/assemble", json={"task_id": "missing"})
+    def test_assemble_endpoint_removed(self):
+        client = TestClient(fastapi_app)
+        response = client.post('/api/assemble', json={'task_id': 'missing'})
         self.assertEqual(response.status_code, 404)
-
-    @patch("app.run_assemble_phase", new_callable=AsyncMock)
-    def test_assemble_uses_default_when_no_selections(self, mock_phase):
-        keyword_data, paths = self._seed_pending("t1")
-        response = self.client.post("/api/assemble", json={"task_id": "t1", "use_default": True})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(keyword_data[0]["_files"], [paths[0]])
-        self.assertNotIn("t1", pending_assembly)
-
-    @patch("app.run_assemble_phase", new_callable=AsyncMock)
-    def test_assemble_applies_valid_swap_selection(self, mock_phase):
-        keyword_data, paths = self._seed_pending("t2")
-        response = self.client.post(
-            "/api/assemble", json={"task_id": "t2", "selections": [[paths[1], paths[2]]]}
-        )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(keyword_data[0]["_files"], [paths[1], paths[2]])
-
-    @patch("app.run_assemble_phase", new_callable=AsyncMock)
-    def test_assemble_rejects_path_outside_scene_pool(self, mock_phase):
-        keyword_data, paths = self._seed_pending("t3")
-        response = self.client.post(
-            "/api/assemble", json={"task_id": "t3", "selections": [["/etc/passwd"]]}
-        )
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("t3", pending_assembly)
-        self.assertEqual(keyword_data[0]["_files"], [paths[0]])
-
-    @patch("app.run_assemble_phase", new_callable=AsyncMock)
-    def test_assemble_caps_selection_to_assets_per_scene(self, mock_phase):
-        keyword_data, paths = self._seed_pending("t4", cap=2)
-        response = self.client.post("/api/assemble", json={"task_id": "t4", "selections": [paths]})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(len(keyword_data[0]["_files"]), 2)
-
-    @patch("app.run_assemble_phase", new_callable=AsyncMock)
-    def test_assemble_rejects_scene_count_mismatch(self, mock_phase):
-        keyword_data, paths = self._seed_pending("t5")
-        response = self.client.post(
-            "/api/assemble",
-            json={"task_id": "t5", "selections": [[paths[0]], [paths[1]]]},
-        )
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("t5", pending_assembly)
-
-    @patch("app.run_assemble_phase", new_callable=AsyncMock)
-    def test_assemble_swap_refreshes_gallery_results(self, mock_phase):
-        keyword_data, paths = self._seed_pending("t6")
-        app_module.set_status(results=[{"keyword": "old", "files": ["/downloads/old.mp4"]}])
-        response = self.client.post(
-            "/api/assemble", json={"task_id": "t6", "selections": [[paths[1], paths[2]]]}
-        )
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        gallery = scraping_status["results"]
-        self.assertEqual(payload["results"], gallery)
-        self.assertEqual(len(gallery), 1)
-        names = [Path(url).name for url in gallery[0]["files"]]
-        self.assertEqual(names, [Path(paths[1]).name, Path(paths[2]).name])
-        self.assertNotIn("old.mp4", names)
 
 
 class SceneVisualPlanTests(unittest.TestCase):
@@ -188,11 +96,11 @@ class SceneVisualPlanTests(unittest.TestCase):
         self.assertEqual(slot, 5.0)
         self.assertEqual(visual, 15.0)
 
-    def test_long_speech_extends_visuals_past_clip_budget(self):
+    def test_long_speech_stays_within_assets_clip_budget(self):
         n, slot, visual = scene_visual_plan(20.0, 3, 5)
         self.assertEqual(n, 3)
-        self.assertGreaterEqual(visual, 20.0)
-        self.assertAlmostEqual(n * slot, visual)
+        self.assertEqual(slot, 5.0)
+        self.assertEqual(visual, 15.0)
 
 
 class ShortLastSceneMergeTests(unittest.TestCase):

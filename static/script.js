@@ -417,7 +417,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (!el.id || PANEL_SKIP_IDS.has(el.id)) return;
             fields[el.id] = el.type === 'checkbox' ? el.checked : el.value;
         });
-        ['music-style', 'music-custom-path'].forEach((id) => {
+        ['music-style', 'music-custom-path', 'script-extra-prompt'].forEach((id) => {
             const el = document.getElementById(id);
             if (el) fields[id] = el.value;
         });
@@ -893,11 +893,11 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function setKeywords(list) {
-        if (keywordsInput) keywordsInput.value = (list || []).join('\n');
+        if (keywordsInput) keywordsInput.value = (list || []).join(', ');
     }
 
     function readKeywords() {
-        return (keywordsInput?.value || '').split('\n').map((line) => line.trim()).filter(Boolean);
+        return (keywordsInput?.value || '').split(/[,，\n]+/).map((line) => line.trim()).filter(Boolean);
     }
 
     function llmKeyPayload() {
@@ -935,6 +935,9 @@ document.addEventListener('DOMContentLoaded', () => {
                         topic: topic,
                         vibe: vibe,
                         language: document.getElementById('language-select').value,
+                        paragraph_number: parseInt(document.getElementById('paragraph-number')?.value || '1', 10) || 1,
+                        video_script_prompt: document.getElementById('script-extra-prompt')?.value || '',
+                        match_script_order: document.getElementById('match-script-order')?.checked === true,
                         count: parseInt(countInput?.value || '3', 10) || 3,
                         clip_duration: numVal('clip-duration', 5),
                         api_keys: llmKeyPayload()
@@ -958,7 +961,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 showToast('Network error', 'error');
             } finally {
                 generateScriptBtn.disabled = false;
-                generateScriptBtn.innerHTML = '<i class="fas fa-magic"></i> Generate script';
+                generateScriptBtn.innerHTML = '<i class="fas fa-magic"></i> Generate script & keywords';
             }
         });
     }
@@ -977,7 +980,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             persistKeys(keys);
             regenerateKeywordsBtn.disabled = true;
-            regenerateKeywordsBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Regenerating...';
+            regenerateKeywordsBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Generating...';
             try {
                 const response = await fetch('/api/generate_keywords', {
                     method: 'POST',
@@ -987,6 +990,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         script,
                         vibe: document.querySelector('input[name="vibe"]:checked')?.value || 'aesthetic',
                         language: document.getElementById('language-select')?.value || 'en-US',
+                        match_script_order: document.getElementById('match-script-order')?.checked === true,
                         count: parseInt(countInput?.value || '3', 10) || 3,
                         clip_duration: numVal('clip-duration', 5),
                         api_keys: llmKeyPayload()
@@ -1003,22 +1007,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 showToast('Network error', 'error');
             } finally {
                 regenerateKeywordsBtn.disabled = false;
-                regenerateKeywordsBtn.innerHTML = '<i class="fas fa-sync-alt"></i> Regenerate keywords';
+                regenerateKeywordsBtn.innerHTML = '<i class="fas fa-sync-alt"></i> Generate keywords';
             }
         });
     }
-
-    function currentNarrationScript() {
-        return ((scriptsContainer?.querySelector('.script-input') || scriptInput)?.value || '').trim();
-    }
-
-    function warnScriptVsAssets(label) {
-        if (!currentNarrationScript()) return;
-        showToast(`${label} changed. Generate script again so narration matches the scene length.`, 'error');
-    }
-
-    countInput?.addEventListener('change', () => warnScriptVsAssets('Assets per scene'));
-    document.getElementById('clip-duration')?.addEventListener('change', () => warnScriptVsAssets('Clip duration'));
 
     if (analyzeBtn) {
         analyzeBtn.addEventListener('click', async () => {
@@ -1227,6 +1219,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 body: JSON.stringify({
                     query,
                     keywords: readKeywords(),
+                    match_script_order: document.getElementById('match-script-order')?.checked === true,
                     script: scripts[0],
                     scripts: scripts,
                     source,

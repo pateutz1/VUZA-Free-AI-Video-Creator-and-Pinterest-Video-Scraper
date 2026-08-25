@@ -131,6 +131,12 @@ ABSTRACT_TOPIC_WORDS = {
     "success", "confidence", "hustle", "dopamine", "regret", "legend",
 }
 
+GENERIC_SEARCH_WORDS = {
+    "best", "top", "places", "place", "world", "earth", "terra", "planet",
+    "destination", "destinations", "video", "videos", "amazing", "beautiful",
+    "scenic", "unforgettable", "great", "ultimate", "guide", "on",
+}
+
 UNREALISTIC_PIN_RE = re.compile(
     r"\b(anatomy|anatomical|3d|cgi|animation|animated|infographic|tutorial|"
     r"how to|form check|diagram|kinesiology|split screen|comparison|"
@@ -144,7 +150,7 @@ def topic_anchor_words(topic):
     words = [
         word.lower()
         for word in re.findall(r"[A-Za-z]{3,}", topic or "")
-        if word.lower() not in QUERY_STOP
+        if word.lower() not in QUERY_STOP and word.lower() not in GENERIC_SEARCH_WORDS
     ]
     visual = [word for word in words if word not in ABSTRACT_TOPIC_WORDS]
     return (visual or words)[:3]
@@ -162,24 +168,36 @@ def ensure_topic_anchor(keyword, topic=""):
     return normalize_stock_query(f"{anchors[0]} {kw}")
 
 
+def _usable_stock_query(text):
+    words = [word.lower() for word in (text or "").split() if word]
+    if not words:
+        return False
+    return any(
+        word not in QUERY_STOP and word not in GENERIC_SEARCH_WORDS
+        for word in words
+    )
+
+
 def query_broaden_chain(query, topic=""):
-    """Longest query first, then drop trailing words down to a 1-word topic noun."""
+    """Longest query first, then drop trailing words. Never search generic topic filler."""
     words = [word for word in normalize_stock_query(query).split() if word]
+    while len(words) > 1 and words[-1].lower() in GENERIC_SEARCH_WORDS:
+        words = words[:-1]
     chain = []
     seen = set()
     while words:
         item = " ".join(words)
         key = item.lower()
-        if key not in seen:
+        if key not in seen and _usable_stock_query(item):
             seen.add(key)
             chain.append(item)
         words = words[:-1]
     for anchor in topic_anchor_words(topic):
-        if anchor not in seen:
+        if anchor not in seen and _usable_stock_query(anchor):
             seen.add(anchor)
             chain.append(anchor)
             break
-    return chain
+    return chain or [normalize_stock_query(query)]
 
 
 PINTEREST_MIN_QUERY_WORDS = 2

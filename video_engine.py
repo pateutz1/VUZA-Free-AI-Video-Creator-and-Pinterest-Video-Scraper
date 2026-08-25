@@ -100,12 +100,25 @@ def contains_cjk(text):
 
 
 def scene_visual_plan(speech_seconds, clip_count, clip_duration):
-    """Every selected clip is shown. Visuals last at least assets×clip_duration."""
+    """Show exactly assets-per-scene clips. Visual length = assets × clip_duration."""
     n = max(1, int(clip_count or 1))
     slot = max(2.0, min(12.0, float(clip_duration or 5)))
-    speech = max(0.8, float(speech_seconds or 0))
-    visual = max(speech, n * slot)
-    return n, visual / n, visual
+    visual = n * slot
+    return n, slot, visual
+
+
+def trim_audio_to(audio_clip, target_seconds):
+    current = float(audio_clip.duration or 0)
+    target = max(0.8, float(target_seconds or 0))
+    if target >= current - 0.05:
+        return audio_clip
+    try:
+        return audio_clip.subclipped(0, target)
+    except Exception:
+        try:
+            return audio_clip.with_duration(target)
+        except Exception:
+            return audio_clip
 
 
 def pad_audio_to(audio_clip, target_seconds):
@@ -567,7 +580,15 @@ class VideoEngine:
             video_files = [f for f in files if Path(f).suffix.lower() in video_exts]
             image_files = [f for f in files if Path(f).suffix.lower() in image_exts]
             preferred_files = video_files if media_type == "video" and video_files else (image_files or files)
-            segment_seconds = getattr(settings, "clip_duration", None) or (4 if preferred_files == video_files else 3)
+            use_video_slots = bool(media_type == "video" and video_files)
+            raw_cap = getattr(settings, "assets_per_scene", None) if settings else None
+            try:
+                assets_cap = int(raw_cap) if raw_cap else 0
+            except (TypeError, ValueError):
+                assets_cap = 0
+            if assets_cap > 0:
+                preferred_files = preferred_files[:max(1, assets_cap)]
+            segment_seconds = getattr(settings, "clip_duration", None) or (4 if use_video_slots else 3)
             segment_seconds = max(2, min(12, float(segment_seconds)))
 
             ratio = settings.ratio if settings else "9:16"
@@ -663,23 +684,14 @@ class VideoEngine:
                 raise RuntimeError(f"No usable (non-black) clip for scene {i + 1}: {keyword}")
             if video_mode:
                 covered = sum(float(part.duration or 0) for part in parts)
-                if covered + 0.05 < speech_duration and used:
-                    gap = speech_duration - covered
+                if covered + 0.05 < visual_target and used:
                     print(
-                        f"  ⚠️ Scene {i + 1} unique footage {covered:.2f}s < narration {speech_duration:.2f}s; "
-                        f"looping last clip +{gap:.2f}s"
+                        f"  ⚠️ Scene {i + 1} unique footage {covered:.2f}s < assets budget {visual_target:.2f}s"
                     )
-                    rebuilt = build_visual_clip(
-                        used[-1],
-                        float(parts[-1].duration or 0) + gap,
-                        allow_loop=True,
-                    )
-                    if rebuilt is not None:
-                        parts[-1] = rebuilt
-                    covered = sum(float(part.duration or 0) for part in parts)
-                if covered + 0.05 < speech_duration:
-                    raise RuntimeError(
-                        f"Scene {i + 1} unique footage {covered:.2f}s cannot cover narration {speech_duration:.2f}s"
+                if speech_duration + 0.05 > covered:
+                    print(
+                        f"  ✂️ Scene {i + 1} narration {speech_duration:.2f}s > visuals {covered:.2f}s; "
+                        f"trim speech to assets × clip duration"
                     )
             if (not video_mode) and len(parts) == 1 and num_segments > 1:
                 rebuilt = build_visual_clip(used[0], duration, allow_loop=True)
@@ -694,7 +706,11 @@ class VideoEngine:
                     key = source_key(file_path)
                     used_source_keys.append(key)
                     used_source_set.add(key)
-                audio_clip = pad_audio_to(audio_clip, scene_duration)
+                if speech_duration > scene_duration + 0.05:
+                    audio_clip = trim_audio_to(audio_clip, scene_duration)
+                    speech_duration = scene_duration
+                else:
+                    audio_clip = pad_audio_to(audio_clip, scene_duration)
                 duration = scene_duration
 
             try:

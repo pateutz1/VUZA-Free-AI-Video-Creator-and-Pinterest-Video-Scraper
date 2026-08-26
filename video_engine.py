@@ -1,5 +1,6 @@
 import asyncio
 import html
+import json
 import os
 import re
 import sys
@@ -186,6 +187,93 @@ def chunk_subtitle_text(text, words_per_chunk=3, cjk_chars_per_chunk=8):
 
     words = text.split()
     return [" ".join(words[i:i + words_per_chunk]) for i in range(0, len(words), words_per_chunk)] or [text]
+
+
+EDGE_TTS_TICKS = 10_000_000.0
+
+
+def _normalize_word_timing(item):
+    word = (item.get("word") or item.get("text") or "").strip()
+    if not word or item.get("type") in ("SentenceBoundary", "audio"):
+        return None
+    offset = float(item.get("offset") or 0)
+    duration = float(item.get("duration") or 0)
+    if offset > 1000 or duration > 1000:
+        offset /= EDGE_TTS_TICKS
+        duration /= EDGE_TTS_TICKS
+    return {"word": word, "offset": offset, "duration": duration}
+
+
+def parse_word_timings(path):
+    path = Path(path)
+    if not path.exists():
+        return []
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return []
+    items = []
+    if raw.startswith("["):
+        try:
+            loaded = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        items = loaded if isinstance(loaded, list) else []
+    else:
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    out = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") and item.get("type") != "WordBoundary":
+            continue
+        row = _normalize_word_timing(item)
+        if row:
+            out.append(row)
+    return out
+
+
+def caption_chunk_windows(chunks, word_timings, speech_duration):
+    """Hold each caption until the next spoken chunk starts."""
+    total = max(0.5, float(speech_duration or 0.5))
+    if not chunks:
+        return []
+    if not word_timings:
+        even = total / len(chunks)
+        return [(chunk, i * even, even) for i, chunk in enumerate(chunks)]
+
+    starts = []
+    word_idx = 0
+    for chunk in chunks:
+        n_words = max(1, len(re.findall(r"[A-Za-z0-9']+", chunk)))
+        if word_idx < len(word_timings):
+            starts.append(float(word_timings[word_idx]["offset"]))
+        else:
+            starts.append(None)
+        word_idx += n_words
+
+    windows = []
+    for i, chunk in enumerate(chunks):
+        start = starts[i]
+        if start is None:
+            prev_end = (windows[-1][1] + windows[-1][2]) if windows else 0.0
+            leftover = len(chunks) - i
+            dur = max(0.45, (total - prev_end) / leftover)
+            windows.append((chunk, prev_end, dur))
+            continue
+        if i + 1 < len(starts) and starts[i + 1] is not None:
+            end = starts[i + 1]
+        else:
+            end = total
+        dur = max(0.45, end - start)
+        windows.append((chunk, max(0.0, start), dur))
+    return windows
 
 def apply_ken_burns(clip, duration):
     """Applies a slow zoom-in effect (Ken Burns)."""
@@ -379,27 +467,13 @@ class VideoEngine:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                communicate = Communicate(text, azure_name, rate=rate)
+                communicate = Communicate(text, azure_name, rate=rate, boundary="WordBoundary")
                 path = self.temp_dir / f"speech_{idx}.mp3"
                 timing_path = self.temp_dir / f"speech_{idx}_timings.json"
-                
-                # Capture word boundaries
-                word_timings = []
-                async for chunk in communicate.stream():
-                    if chunk["type"] == "WordBoundary":
-                        word_timings.append({
-                            "word": chunk["text"],
-                            "offset": chunk["offset"] / 10_000_000.0,  # Convert to seconds
-                            "duration": chunk["duration"] / 10_000_000.0
-                        })
-                    elif chunk["type"] == "audio":
-                        with open(path, "ab") as f:
-                            f.write(chunk["data"])
-                
-                # Save word timings
-                import json
-                with open(timing_path, "w", encoding="utf-8") as f:
-                    json.dump(word_timings, f, ensure_ascii=False, indent=2)
+                await asyncio.wait_for(
+                    communicate.save(str(path), metadata_fname=str(timing_path)),
+                    timeout=timeout_seconds,
+                )
                 
                 if float(voice_volume or 1.0) != 1.0 and path.exists():
                     from moviepy import AudioFileClip
@@ -780,20 +854,11 @@ class VideoEngine:
                 try:
                     from PIL import Image, ImageDraw, ImageFont
                     import numpy as np
-                    import json
 
                     # Subtitles follow spoken audio, not padded silence after the last word.
                     subtitle_duration = max(0.5, speech_duration)
-
-                    # Load word timings if available
                     timing_path = Path(audio_path).parent / f"{Path(audio_path).stem}_timings.json"
-                    word_timings = []
-                    if timing_path.exists():
-                        try:
-                            with open(timing_path, "r", encoding="utf-8") as f:
-                                word_timings = json.load(f)
-                        except:
-                            pass
+                    word_timings = parse_word_timings(timing_path)
 
                     style = settings.subtitle_style if settings else "default"
 
@@ -871,45 +936,19 @@ class VideoEngine:
                         return np.array(img)
 
                     if style == "high_retention":
-                        # Break sentence into 3-word chunks for punchy effect
                         display_text = sentence
                         if getattr(settings, 'emoji_subtitles', False):
                             display_text = SubtitleHelper.insert_emojis(sentence)
 
                         chunks = chunk_subtitle_text(display_text)
-                        
                         subs_clips = []
-                        
-                        if word_timings:
-                            # Use word-level timings for accurate synchronization
-                            words_per_chunk = 3
-                            chunk_timings = []
-                            
-                            for chunk_idx, chunk in enumerate(chunks):
-                                start_word_idx = chunk_idx * words_per_chunk
-                                end_word_idx = min(start_word_idx + words_per_chunk, len(word_timings))
-                                
-                                if start_word_idx < len(word_timings):
-                                    chunk_start = word_timings[start_word_idx]["offset"]
-                                    if end_word_idx < len(word_timings):
-                                        chunk_end = word_timings[end_word_idx]["offset"]
-                                    else:
-                                        last_word = word_timings[-1]
-                                        chunk_end = last_word["offset"] + last_word["duration"]
-                                    
-                                    chunk_duration = chunk_end - chunk_start
-                                    t_img = make_text_image(chunk, visual_clip.w, visual_clip.h, style)
-                                    t_clip = ImageClip(t_img).with_duration(chunk_duration).with_start(chunk_start)
-                                    t_clip = t_clip.with_opacity(0.98)
-                                    subs_clips.append(t_clip)
-                        else:
-                            # Fallback to even division if no timings available
-                            chunk_duration = subtitle_duration / len(chunks)
-                            for idx, chunk in enumerate(chunks):
-                                t_img = make_text_image(chunk, visual_clip.w, visual_clip.h, style)
-                                t_clip = ImageClip(t_img).with_duration(chunk_duration).with_start(idx * chunk_duration)
-                                t_clip = t_clip.with_opacity(0.98)
-                                subs_clips.append(t_clip)
+                        for chunk, chunk_start, chunk_duration in caption_chunk_windows(
+                            chunks, word_timings, subtitle_duration
+                        ):
+                            t_img = make_text_image(chunk, visual_clip.w, visual_clip.h, style)
+                            t_clip = ImageClip(t_img).with_duration(chunk_duration).with_start(chunk_start)
+                            t_clip = t_clip.with_opacity(0.98)
+                            subs_clips.append(t_clip)
 
                         visual_clip = CompositeVideoClip([visual_clip] + subs_clips)
                     else:

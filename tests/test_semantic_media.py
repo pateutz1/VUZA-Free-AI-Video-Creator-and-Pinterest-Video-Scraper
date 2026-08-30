@@ -9,6 +9,8 @@ from semantic_media import (
     MediaCandidate,
     SearchCache,
     cache_key,
+    candidate_matches_intent,
+    candidate_matches_topic,
     coverage_failures,
     ensure_topic_anchor,
     fit_keyword_length,
@@ -103,11 +105,104 @@ class QueryParseTests(unittest.TestCase):
             query_broaden_chain("best places Patagonia", "best places on terra in this world"),
             ["Patagonia"],
         )
+        self.assertEqual(
+            query_broaden_chain(
+                "ollie trick",
+                "snowboarding, best snowboard tricks, snowboard on snow",
+            ),
+            [
+                "snowboarding ollie trick",
+                "snowboarding ollie",
+                "snowboarding",
+                "snowboard",
+            ],
+        )
         real = MediaCandidate(query="gym deadlift", title="athlete barbell deadlift gym")
         fake = MediaCandidate(query="gym deadlift", title="3d anatomical deadlift tutorial")
         self.assertGreater(
             query_relevance(real, "crush the next rep", "gym barbell squat"),
             query_relevance(fake, "crush the next rep", "gym barbell squat"),
+        )
+
+    def test_candidate_topic_gate_rejects_skateboard_for_snowboarding(self):
+        topic = "snowboarding, best snowboard tricks, snowboard on snow"
+        skateboard = MediaCandidate(
+            query="snowboarding ollie trick",
+            source_page="https://www.pexels.com/video/man-doing-an-ollie-trick-in-skateboarding-2791955/",
+        )
+        snowboard = MediaCandidate(
+            query="snowboarding ollie trick",
+            source_page="https://www.pexels.com/video/snowboarder-performing-ollie-on-snow-123/",
+        )
+        opaque = MediaCandidate(
+            query="snowboarding ollie trick",
+            source_page="https://coverr.co/videos/clip-123",
+        )
+        self.assertFalse(candidate_matches_topic(skateboard, topic))
+        self.assertTrue(candidate_matches_topic(snowboard, topic))
+        self.assertTrue(candidate_matches_topic(opaque, topic))
+
+    def test_dynamic_intent_gate_rejects_generic_and_accepts_requested_detail(self):
+        topic = "snowboarding, best snowboard tricks, snowboard on snow"
+        generic = MediaCandidate(
+            asset_id="360",
+            title="Snowboarder gliding down a snowy mountain slope",
+            source_page="https://www.pexels.com/video/snowboarder-gliding-360/",
+        )
+        rotation = MediaCandidate(title="Snowboarder performs a clean 360 rotation")
+        backflip = MediaCandidate(title="Athlete landing a snowboard backflip")
+        self.assertFalse(candidate_matches_intent(generic, "snowboard 360", topic))
+        self.assertTrue(candidate_matches_intent(rotation, "snowboard 360", topic))
+        self.assertTrue(candidate_matches_intent(backflip, "snowboard backflip", topic))
+
+    def test_dynamic_intent_gate_works_for_unrelated_topics_and_inflections(self):
+        candidate = MediaCandidate(title="Spiral galaxy rotating around a luminous core")
+        self.assertTrue(
+            candidate_matches_intent(
+                candidate,
+                "galaxy spiral rotation",
+                "galaxy planets stars",
+            )
+        )
+
+    def test_dynamic_intent_gate_allows_truly_opaque_provider_metadata(self):
+        opaque = MediaCandidate(
+            asset_id="clip-123",
+            source_page="https://coverr.co/videos/clip-123",
+        )
+        self.assertTrue(
+            candidate_matches_intent(
+                opaque,
+                "galaxy spiral rotation",
+                "galaxy planets stars",
+            )
+        )
+
+    def test_dynamic_intent_gate_allows_only_complete_query_as_weak_evidence(self):
+        exact = MediaCandidate(
+            query="snowboard 180",
+            title="Snowboarder gliding down a snowy mountain slope",
+        )
+        broadened = MediaCandidate(
+            query="snowboard",
+            title="Snowboarder gliding down a snowy mountain slope",
+        )
+        topic = "snowboarding, best snowboard tricks, snowboard on snow"
+        self.assertTrue(
+            candidate_matches_intent(
+                exact,
+                "snowboard 180",
+                topic,
+                allow_exact_query=True,
+            )
+        )
+        self.assertFalse(
+            candidate_matches_intent(
+                broadened,
+                "snowboard 180",
+                topic,
+                allow_exact_query=True,
+            )
         )
 
 

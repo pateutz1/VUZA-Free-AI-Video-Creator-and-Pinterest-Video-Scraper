@@ -32,6 +32,7 @@ from semantic_media import (
     MediaCandidate,
     dedupe_candidates,
     pinterest_query_variants,
+    rank_scene_candidates,
     round_robin_order,
     interleave_candidates_by_provider,
     stock_query_plan,
@@ -83,6 +84,35 @@ class ProviderFilterTests(unittest.TestCase):
         self.assertEqual(ids, ["3"])
         self.assertEqual(items[0]["url"], "https://example.com/target.mp4")
         self.assertEqual(items[0]["rendition"]["width"], 1080)
+        self.assertEqual(items[0]["rendition"]["discovery"], "search")
+
+    def test_pexels_uses_topic_filtered_popular_fallback_when_search_empty(self):
+        scraper = PexelsScraper(output_dir=tempfile.mkdtemp(), api_key="px-test")
+        calls = []
+
+        class FakeResponse:
+            def __init__(self, videos):
+                self._videos = videos
+            def json(self):
+                return {"videos": self._videos}
+
+        matching = _video(21, 8, 1080, 1920)
+        matching["url"] = "https://www.pexels.com/video/spiral-galaxy-stars-21/"
+        unrelated = _video(22, 8, 1080, 1920)
+        unrelated["url"] = "https://www.pexels.com/video/ocean-waves-22/"
+
+        def fake_get(url, **kwargs):
+            calls.append(url)
+            if "/videos/search?" in url:
+                return FakeResponse([])
+            return FakeResponse([unrelated, matching])
+
+        with patch("aesthetic_scraper.requests.get", side_effect=fake_get):
+            items = scraper.find_videos("galaxy spiral stars", aspect="9:16", limit=4)
+        self.assertIn("/v1/videos/search?", calls[0])
+        self.assertTrue(any("/v1/videos/popular?" in url for url in calls))
+        self.assertEqual([item["asset_id"] for item in items], ["21"])
+        self.assertEqual(items[0]["rendition"]["discovery"], "popular_fallback")
 
     def test_pixabay_requires_orientation_and_video_type_all(self):
         scraper = PixabayScraper(output_dir=tempfile.mkdtemp(), api_key="pb-test")
@@ -128,8 +158,44 @@ class ProviderFilterTests(unittest.TestCase):
         self.assertIn("video_type=all", captured["url"])
         self.assertIn("per_page=50", captured["url"])
         self.assertIn("orientation=vertical", captured["url"])
+        self.assertIn("order=popular", captured["url"])
         self.assertEqual([item["asset_id"] for item in items], ["10"])
         self.assertEqual(items[0]["rendition"]["id"], "large")
+
+    def test_pixabay_falls_back_to_latest_when_popular_is_empty(self):
+        scraper = PixabayScraper(output_dir=tempfile.mkdtemp(), api_key="pb-test")
+        calls = []
+
+        class FakeResponse:
+            def __init__(self, hits):
+                self._hits = hits
+            def json(self):
+                return {"hits": self._hits}
+
+        latest_hit = {
+            "id": 31,
+            "duration": 8,
+            "pageURL": "https://pixabay.com/videos/galaxy-stars-31/",
+            "tags": "galaxy, spiral, stars",
+            "videos": {
+                "large": {
+                    "url": "https://example.com/galaxy.mp4",
+                    "width": 1080,
+                    "height": 1920,
+                }
+            },
+        }
+
+        def fake_get(url, **kwargs):
+            calls.append(url)
+            return FakeResponse([latest_hit] if "order=latest" in url else [])
+
+        with patch("aesthetic_scraper.requests.get", side_effect=fake_get):
+            items = scraper.find_videos("galaxy spiral stars", aspect="9:16", limit=4)
+        self.assertIn("order=popular", calls[0])
+        self.assertIn("order=latest", calls[1])
+        self.assertEqual(items[0]["title"], "galaxy, spiral, stars")
+        self.assertEqual(items[0]["rendition"]["order"], "latest")
 
     def test_mixkit_retries_shorter_slug_and_keeps_original_query(self):
         scraper = MixkitScraper(output_dir=tempfile.mkdtemp())
@@ -240,6 +306,65 @@ class ProviderFilterTests(unittest.TestCase):
             items = scraper.find_videos("gym transformation", aspect="9:16", min_duration=5)
         self.assertGreaterEqual(len(calls), 2)
         self.assertEqual([item["asset_id"] for item in items], ["gym1"])
+
+    def test_coverr_falls_back_to_date_and_preserves_semantic_metadata(self):
+        scraper = CoverrScraper(output_dir=tempfile.mkdtemp(), api_key="cv-test")
+        calls = []
+
+        class FakeResponse:
+            status_code = 200
+            text = ""
+            def __init__(self, hits):
+                self._hits = hits
+            def json(self):
+                return {"hits": self._hits}
+
+        hit = {
+            "id": "galaxy1",
+            "title": "Spiral galaxy",
+            "description": "Stars rotating around a bright galactic core",
+            "tags": ["space", "stars"],
+            "duration": 8,
+            "urls": {"mp4_download": "https://cdn.coverr.co/galaxy.mp4"},
+            "is_vertical": True,
+        }
+
+        def fake_get(url, **kwargs):
+            calls.append(url)
+            return FakeResponse([hit] if "sort=date" in url else [])
+
+        with patch("aesthetic_scraper.requests.get", side_effect=fake_get):
+            items = scraper.find_videos("galaxy spiral stars", aspect="9:16", limit=4)
+        self.assertIn("sort=popular", calls[0])
+        self.assertIn("sort=date", calls[1])
+        self.assertIn("spiral galaxy", items[0]["title"].lower())
+        self.assertIn("stars", items[0]["title"].lower())
+        self.assertEqual(items[0]["rendition"]["sort"], "date")
+
+    def test_dynamic_detail_matching_prefers_any_topic_specific_action(self):
+        candidates = [
+            MediaCandidate(
+                provider="pexels",
+                asset_id="generic",
+                query="galaxy",
+                source_page="https://www.pexels.com/video/deep-galaxy-stars/",
+                duration=20,
+            ),
+            MediaCandidate(
+                provider="coverr",
+                asset_id="specific",
+                query="galaxy spiral rotation",
+                title="Spiral galaxy rotating around bright stars",
+                duration=8,
+            ),
+        ]
+        ranked = rank_scene_candidates(
+            candidates,
+            sentence="A spiral galaxy rotates around its luminous core.",
+            keyword="galaxy spiral rotation",
+            topic="galaxy planets stars",
+        )
+        self.assertEqual(ranked[0].asset_id, "specific")
 
     def test_pexels_rendition_prefers_target(self):
         best = pick_pexels_rendition(
@@ -916,8 +1041,12 @@ class KeywordParseHookTests(unittest.TestCase):
         rows = terms_to_scene_rows(
             ["gym workout", "barbell squat", "victory pose"],
             "Hook the viewer. Then squat heavy. Finish proud.",
+            "gym fitness",
         )
-        self.assertEqual([item["keyword"] for item in rows], ["gym workout", "barbell squat", "victory pose"])
+        self.assertEqual(
+            [item["keyword"] for item in rows],
+            ["gym workout", "gym barbell squat", "gym victory pose"],
+        )
         self.assertTrue(all(item["sentence"] for item in rows))
         self.assertEqual(split_script_to_n("A. B. C.", 3), ["A.", "B.", "C."])
 

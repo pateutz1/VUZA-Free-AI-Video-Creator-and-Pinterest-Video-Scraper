@@ -30,7 +30,21 @@ class MptLlmTests(unittest.TestCase):
     def test_generate_terms_parses_fenced_json(self):
         llm = FakeLLM(['```json\n["gym workout", "barbell squat"]\n```'])
         terms = mpt_llm.generate_terms(llm, "gym", "Train hard.", amount=2)
-        self.assertEqual(terms, ["gym workout", "barbell squat"])
+        self.assertEqual(terms, ["gym workout", "gym barbell squat"])
+
+    def test_generate_terms_anchors_ambiguous_snowboard_tricks(self):
+        llm = FakeLLM(['["ollie trick", "kickflip trick", "method grab"]'])
+        terms = mpt_llm.generate_terms(
+            llm,
+            "snowboarding, best snowboard tricks, snowboard on snow",
+            "Learn snowboard tricks on the mountain.",
+            amount=3,
+        )
+        self.assertEqual(terms, [
+            "snowboarding ollie trick",
+            "snowboarding kickflip trick",
+            "snowboarding method grab",
+        ])
 
     def test_match_order_prompt_asks_for_chronological_terms(self):
         llm = FakeLLM(['["opening gym", "final pose"]'])
@@ -38,10 +52,10 @@ class MptLlmTests(unittest.TestCase):
         self.assertIn("chronological", llm.prompts[0])
         self.assertIn("earlier visual moments", llm.prompts[0])
 
-    def test_terms_prompt_forbids_generic_subject_prefix(self):
+    def test_terms_prompt_requires_visible_subject_without_generic_filler(self):
         prompt = mpt_llm._terms_prompt("best places on terra in this world", "See Norway.", 5, False)
-        self.assertIn("Do not prefix", prompt)
-        self.assertNotIn("always add the main subject of the video", prompt)
+        self.assertIn("must include the video's main visible subject", prompt)
+        self.assertIn("Do not use generic subject words", prompt)
 
 
 if __name__ == "__main__":

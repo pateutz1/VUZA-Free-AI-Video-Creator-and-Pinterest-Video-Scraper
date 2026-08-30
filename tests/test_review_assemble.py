@@ -96,11 +96,17 @@ class SceneVisualPlanTests(unittest.TestCase):
         self.assertEqual(slot, 5.0)
         self.assertEqual(visual, 15.0)
 
-    def test_long_speech_stays_within_assets_clip_budget(self):
+    def test_long_speech_cycles_selected_assets_to_cover_narration(self):
         n, slot, visual = scene_visual_plan(20.0, 3, 5)
-        self.assertEqual(n, 3)
+        self.assertEqual(n, 4)
         self.assertEqual(slot, 5.0)
-        self.assertEqual(visual, 15.0)
+        self.assertEqual(visual, 20.0)
+
+    def test_partial_last_slot_matches_exact_narration_duration(self):
+        n, slot, visual = scene_visual_plan(15.54, 2, 3)
+        self.assertEqual(n, 6)
+        self.assertEqual(slot, 3.0)
+        self.assertAlmostEqual(visual, 15.54)
 
 
 class ShortLastSceneMergeTests(unittest.TestCase):

@@ -13,7 +13,7 @@ from pathlib import Path
 from media_quality import canonical_url, public_url, redact_secret, url_safe_to_cache
 
 CACHE_TTL_SECONDS = 24 * 60 * 60
-CACHE_FORMAT_VERSION = 1
+CACHE_FORMAT_VERSION = 2
 MAX_ALT_QUERIES_PER_SCENE = 1
 VIBE_SUFFIXES = (" aesthetic", " lofi art", " futuristic", " black and white")
 CAMERA_PREFIXES = (
@@ -161,11 +161,15 @@ UNREALISTIC_PIN_RE = re.compile(
 
 
 def topic_anchor_words(topic):
-    words = [
-        word.lower()
-        for word in re.findall(r"[A-Za-z]{3,}", topic or "")
-        if word.lower() not in QUERY_STOP and word.lower() not in GENERIC_SEARCH_WORDS
-    ]
+    words = []
+    for word in re.findall(r"[A-Za-z]{3,}", topic or ""):
+        lowered = word.lower()
+        if (
+            lowered not in QUERY_STOP
+            and lowered not in GENERIC_SEARCH_WORDS
+            and lowered not in words
+        ):
+            words.append(lowered)
     visual = [word for word in words if word not in ABSTRACT_TOPIC_WORDS]
     return (visual or words)[:3]
 
@@ -182,6 +186,141 @@ def ensure_topic_anchor(keyword, topic=""):
     return normalize_stock_query(f"{anchors[0]} {kw}")
 
 
+def primary_topic_anchors(topic):
+    """Return the main subject and close lexical variants from a short topic."""
+    if len(re.findall(r"[A-Za-z]{3,}", topic or "")) > 12:
+        return []
+    anchors = topic_anchor_words(topic)
+    if not anchors:
+        return []
+    primary = anchors[0]
+    prefix_length = min(6, len(primary))
+    return [
+        anchor
+        for anchor in anchors
+        if anchor == primary or anchor[:prefix_length] == primary[:prefix_length]
+    ]
+
+
+def candidate_matches_topic(candidate, topic=""):
+    """Reject descriptive provider results that omit the topic's main subject.
+
+    Opaque provider metadata is allowed because it cannot prove a mismatch. The
+    search query itself is intentionally excluded: it is assigned by VUZA and
+    therefore cannot validate what the provider result actually contains.
+    """
+    anchors = primary_topic_anchors(topic)
+    if not anchors:
+        return True
+    metadata = " ".join(
+        [
+            str(getattr(candidate, "title", "") or ""),
+            str(getattr(candidate, "source_page", "") or ""),
+        ]
+    ).lower().replace("_", "-")
+    descriptive_words = [
+        word
+        for word in re.findall(r"[a-z]{3,}", metadata)
+        if word not in {
+            "www", "http", "https", "com", "video", "videos", "stock",
+            "pexels", "pixabay", "coverr", "mixkit", "pinterest", "free",
+        }
+    ]
+    if len(descriptive_words) < 2:
+        return True
+    descriptive = " ".join(descriptive_words)
+    return any(anchor in descriptive for anchor in anchors)
+
+
+def candidate_metadata_text(candidate):
+    return " ".join(
+        [
+            str(getattr(candidate, "title", "") or ""),
+            str(getattr(candidate, "source_page", "") or ""),
+        ]
+    ).lower().replace("_", " ").replace("-", " ")
+
+
+def query_detail_words(keyword, topic=""):
+    anchors = set(topic_anchor_words(topic))
+    return {
+        word.lower()
+        for word in re.findall(r"[A-Za-z0-9]{3,}", keyword or "")
+        if (
+            word.lower() not in anchors
+            and word.lower() not in QUERY_STOP
+            and word.lower() not in GENERIC_SEARCH_WORDS
+            and word.lower() not in ABSTRACT_TOPIC_WORDS
+        )
+    }
+
+
+def _intent_tokens(candidate):
+    """Metadata tokens that can prove a requested detail is present.
+
+    Provider asset IDs are excluded so a numeric ID such as ``360`` cannot be
+    mistaken for a requested rotation.
+    """
+    asset_id = str(getattr(candidate, "asset_id", "") or "").lower()
+    asset_tokens = set(re.findall(r"[A-Za-z0-9]{3,}", asset_id))
+    boilerplate = {
+        "www", "http", "https", "com", "video", "videos", "stock", "free",
+        "clip", "clips", "pexels", "pixabay", "coverr", "mixkit", "pinterest",
+    }
+    return {
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9]{3,}", candidate_metadata_text(candidate))
+        if token.lower() != asset_id
+        and token.lower() not in asset_tokens
+        and token.lower() not in boilerplate
+    }
+
+
+def _detail_token_matches(detail, token):
+    if detail == token:
+        return True
+    if detail.isdigit() or token.isdigit():
+        return False
+    # Covers ordinary inflections such as rotate/rotating and rotation/rotating
+    # without using a subject-specific vocabulary.
+    common = 0
+    for left, right in zip(detail, token):
+        if left != right:
+            break
+        common += 1
+    return common >= 5 and common >= min(len(detail), len(token)) - 3
+
+
+def candidate_matches_intent(candidate, keyword="", topic="", allow_exact_query=False):
+    """Check intent evidence without admitting broadened generic results.
+
+    Provider titles often omit rotations, named actions, and product details even
+    when the result came from the complete search phrase. Callers may allow that
+    exact-query provenance as weaker evidence; shortened searches never qualify.
+    """
+    details = query_detail_words(keyword, topic)
+    if not details:
+        return True
+    tokens = _intent_tokens(candidate)
+    # Some providers and test adapters return only an opaque asset ID/URL. That
+    # metadata cannot prove either a match or mismatch, so defer the decision to
+    # the existing downloaded-file quality checks. Descriptive generic results
+    # still have tokens and remain rejected below.
+    if not tokens:
+        return True
+    if any(
+        _detail_token_matches(detail, token)
+        for detail in details
+        for token in tokens
+    ):
+        return True
+    if allow_exact_query:
+        requested = normalize_stock_query(keyword).lower()
+        searched = normalize_stock_query(getattr(candidate, "query", "") or "").lower()
+        return bool(requested and searched == requested)
+    return False
+
+
 def _usable_stock_query(text):
     words = [word.lower() for word in (text or "").split() if word]
     if not words:
@@ -194,7 +333,8 @@ def _usable_stock_query(text):
 
 def query_broaden_chain(query, topic=""):
     """Longest query first, then drop trailing words. Never search generic topic filler."""
-    words = [word for word in normalize_stock_query(query).split() if word]
+    anchored_query = ensure_topic_anchor(query, topic)
+    words = [word for word in normalize_stock_query(anchored_query).split() if word]
     while len(words) > 1 and words[-1].lower() in GENERIC_SEARCH_WORDS:
         words = words[:-1]
     chain = []
@@ -340,7 +480,7 @@ def parse_sentence_queries(text):
     return rows
 
 
-def query_relevance(candidate, sentence="", keyword=""):
+def query_relevance(candidate, sentence="", keyword="", topic=""):
     stop = {"the", "and", "for", "you", "your", "are", "this", "that", "with", "from", "have", "will", "just"}
     words = {
         word.lower()
@@ -367,6 +507,14 @@ def query_relevance(candidate, sentence="", keyword=""):
         score += min(duration / 8.0, 2.0)
     if candidate.width and candidate.height:
         score += min((candidate.width * candidate.height) / 2_000_000, 2.0)
+    details = query_detail_words(keyword, topic)
+    metadata = candidate_metadata_text(candidate)
+    detail_overlap = sum(1 for word in details if word in metadata)
+    score += detail_overlap * 12.0
+    original_words = set(normalize_stock_query(keyword).lower().split())
+    searched_words = set(normalize_stock_query(candidate.query).lower().split())
+    if original_words:
+        score += 3.0 * len(original_words & searched_words) / len(original_words)
     return score
 
 
@@ -396,12 +544,24 @@ def usable_duration(source_duration, clip_duration):
     return min(clip, source)
 
 
-def rank_scene_candidates(candidates, sentence="", keyword=""):
+def rank_scene_candidates(candidates, sentence="", keyword="", topic=""):
     ranked = []
+    details = query_detail_words(keyword, topic)
     for index, candidate in enumerate(candidates or []):
         candidate.provider_order = index
-        candidate.relevance = query_relevance(candidate, sentence=sentence, keyword=keyword)
+        candidate.relevance = query_relevance(
+            candidate,
+            sentence=sentence,
+            keyword=keyword,
+            topic=topic,
+        )
         ranked.append(candidate)
+    if details:
+        overlaps = [1 if candidate_matches_intent(candidate, keyword, topic) else 0 for candidate in ranked]
+        if any(overlaps):
+            for candidate, overlap in zip(ranked, overlaps):
+                if overlap == 0:
+                    candidate.relevance -= 18.0
     ranked.sort(key=lambda item: (-item.relevance, item.provider_order))
     return ranked
 

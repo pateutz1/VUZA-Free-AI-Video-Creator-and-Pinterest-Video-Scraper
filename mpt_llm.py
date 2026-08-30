@@ -3,6 +3,8 @@
 import json
 import re
 
+from semantic_media import ensure_topic_anchor
+
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
 MAX_SCRIPT_PARAGRAPH_NUMBER = 10
 MAX_SCRIPT_PROMPT_LENGTH = 2000
@@ -161,7 +163,7 @@ def _terms_prompt(video_subject, video_script, amount, match_script_order):
 
 ## Constrains:
 1. the search terms are to be returned as a json-array of strings.
-2. each search term should consist of 1-3 concrete visual nouns from the script (place, landmark, or action). Do not prefix terms with generic subject words such as best, places, world, or earth.
+2. each search term should consist of 1-4 concrete visual words from the script (place, landmark, or action) and must include the video's main visible subject or an unambiguous form of it. Do not use generic subject words such as best, places, world, or earth as the anchor.
 3. you must only return the json-array of strings. you must not return anything else. you must not return the script.
 4. the search terms must be related to the subject of the video.
 5. reply with english search terms only.
@@ -215,7 +217,15 @@ def generate_terms(llm, video_subject, video_script, amount=5, match_script_orde
                 except Exception:
                     pass
             print(f"⚠️ terms parse failed: {exc}")
-    return [term.strip() for term in search_terms if str(term).strip()]
+    anchored = []
+    seen = set()
+    for term in search_terms:
+        query = ensure_topic_anchor(str(term).strip(), video_subject)
+        key = query.lower()
+        if query and key not in seen:
+            seen.add(key)
+            anchored.append(query)
+    return anchored
 
 
 

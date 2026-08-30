@@ -35,6 +35,8 @@ from semantic_media import (
     MAX_ALT_QUERIES_PER_SCENE,
     MediaCandidate,
     SearchCache,
+    candidate_matches_intent,
+    candidate_matches_topic,
     coverage_failures,
     dedupe_candidates,
     ensure_topic_anchor,
@@ -515,12 +517,12 @@ def split_script_to_n(script, n):
     return chunks
 
 
-def terms_to_scene_rows(terms, script=""):
+def terms_to_scene_rows(terms, script="", topic=""):
     """One ordered scene per MPT search term, with narration chunked to match."""
     cleaned = []
     seen = set()
     for raw in terms or []:
-        term = normalize_stock_query(raw)
+        term = ensure_topic_anchor(normalize_stock_query(raw), topic)
         key = term.lower()
         if not term or key in seen:
             continue
@@ -1790,13 +1792,31 @@ async def collect_stock_videos(
                     merged.extend(items)
         return merged, origin
 
-    def keep_candidate(candidate, scene_index):
+    def keep_candidate(candidate, scene_index, intent_keyword=None):
         if not candidate.url or not candidate.asset_id:
             rejection_log[scene_index].append({"asset_id": candidate.asset_id, "reason": "missing url or id"})
             return False
         if candidate.provider == "pinterest" and UNREALISTIC_PIN_RE.search(f"{candidate.title} {candidate.query}"):
             rejection_log[scene_index].append({"asset_id": candidate.asset_id, "reason": "unrealistic pin"})
             return False
+        if not candidate_matches_topic(candidate, topic):
+            rejection_log[scene_index].append({"asset_id": candidate.asset_id, "reason": "topic mismatch"})
+            return False
+        scene_keyword = intent_keyword or ""
+        if not scene_keyword and 0 <= scene_index < len(keyword_data):
+            scene_keyword = keyword_data[scene_index].get("keyword") or ""
+        strong_intent_match = candidate_matches_intent(candidate, scene_keyword, topic)
+        if not candidate_matches_intent(
+            candidate,
+            scene_keyword,
+            topic,
+            allow_exact_query=True,
+        ):
+            rejection_log[scene_index].append({"asset_id": candidate.asset_id, "reason": "intent mismatch"})
+            return False
+        if not strong_intent_match:
+            candidate.rendition = dict(candidate.rendition or {})
+            candidate.rendition["intent_match"] = "exact_query_fallback"
         if candidate.provider != "pinterest" and candidate.duration and candidate.duration < clip_duration:
             rejection_log[scene_index].append({"asset_id": candidate.asset_id, "reason": "too short"})
             return False
@@ -1819,7 +1839,12 @@ async def collect_stock_videos(
             message=f"Searching stock ({idx + 1}/{scene_total}): {query}",
         )
         found, origin = await search_query(query, idx)
-        ranked = rank_scene_candidates(found, sentence=item.get("sentence") or "", keyword=query)
+        ranked = rank_scene_candidates(
+            found,
+            sentence=item.get("sentence") or "",
+            keyword=query,
+            topic=topic,
+        )
         unique = [candidate for candidate in ranked if keep_candidate(candidate, idx)]
         unique = dedupe_candidates(unique, seen_keys)
         print(f"  provider={source} query={query!r} origin={origin} candidates={len(unique)}")
@@ -1926,8 +1951,18 @@ async def collect_stock_videos(
             alt_queries[scene_index].append(alt)
             print(f"  🆕 alt query scene {scene_index + 1}: {alt}")
             found, _origin = await search_query(alt, scene_index)
-            ranked = rank_scene_candidates(found, sentence=item.get("sentence") or "", keyword=alt)
-            extra = dedupe_candidates(ranked, seen_keys)
+            ranked = rank_scene_candidates(
+                found,
+                sentence=item.get("sentence") or "",
+                keyword=alt,
+                topic=topic,
+            )
+            extra = [
+                candidate
+                for candidate in ranked
+                if keep_candidate(candidate, scene_index, intent_keyword=alt)
+            ]
+            extra = dedupe_candidates(extra, seen_keys)
             groups[scene_index].extend(extra)
             while len(selected[scene_index]) < needed:
                 chosen = await take_next(scene_index)
@@ -2228,7 +2263,7 @@ async def run_scrape(request: ScrapeRequest):
                     use_stock_pipeline = media_type == "video" and source in STOCK_VIDEO_SOURCES
                     topic = (request.query or "").strip() or script[:160]
                     if request.keywords:
-                        keyword_data = terms_to_scene_rows(request.keywords, script)
+                        keyword_data = terms_to_scene_rows(request.keywords, script, topic)
                     elif use_stock_pipeline:
                         amount = terms_amount_for_script(
                             script,
@@ -2243,6 +2278,7 @@ async def run_scrape(request: ScrapeRequest):
                                 match_script_order=request.match_script_order,
                             ),
                             script,
+                            topic,
                         )
                     else:
                         sentence_rows = [{"sentence": part, "keyword": "scene"} for part in split_script_sentences(script)]

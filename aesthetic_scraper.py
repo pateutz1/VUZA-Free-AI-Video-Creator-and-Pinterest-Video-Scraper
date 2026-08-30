@@ -652,43 +652,76 @@ class PexelsScraper:
             return []
         print(f"🎬 Searching Pexels: {query}")
         try:
+            cap = max(1, int(limit or 20))
+            candidates = []
+
+            def add_videos(videos, discovery):
+                for video in videos or []:
+                    if len(candidates) >= cap:
+                        break
+                    vid_id = video.get("id")
+                    if not vid_id or vid_id in self.seen_ids:
+                        continue
+                    duration = float(video.get("duration") or 0)
+                    if duration < float(min_duration or 0):
+                        continue
+                    best = pick_pexels_rendition(video.get("video_files") or [], aspect)
+                    if not best or not best.get("link"):
+                        continue
+                    width, height = int(best.get("width") or 0), int(best.get("height") or 0)
+                    if aspect != "1:1" and not matches_orientation(width, height, aspect):
+                        continue
+                    source_page = video.get("url") or ""
+                    if discovery == "popular_fallback":
+                        subject = (query or "").strip().split()[0]
+                        subject_root = subject.lower()[:min(5, len(subject))]
+                        if subject_root not in unquote(source_page).lower():
+                            continue
+                    self.seen_ids.add(vid_id)
+                    user = video.get("user") or {}
+                    slug_title = unquote(urlparse(source_page).path).replace("-", " ")
+                    candidates.append({
+                        "provider": "pexels",
+                        "asset_id": str(vid_id),
+                        "url": best["link"],
+                        "source_page": source_page,
+                        "creator": user.get("name") or "",
+                        "title": slug_title,
+                        "duration": duration,
+                        "width": width,
+                        "height": height,
+                        "query": query,
+                        "rendition": {
+                            "id": str(best.get("id") or ""),
+                            "width": width,
+                            "height": height,
+                            "discovery": discovery,
+                        },
+                    })
+
             params = {
                 "query": query,
-                "per_page": 20,
+                "per_page": min(80, max(20, cap * 4)),
                 "orientation": pexels_orientation(aspect),
             }
-            url = f"https://api.pexels.com/videos/search?{urlencode(params)}"
-            data = requests.get(url, headers=self.headers, timeout=(30, 60), verify=True).json()
-            candidates = []
-            for video in data.get("videos") or []:
-                vid_id = video.get("id")
-                if not vid_id or vid_id in self.seen_ids:
-                    continue
-                duration = float(video.get("duration") or 0)
-                if duration < float(min_duration or 0):
-                    continue
-                best = pick_pexels_rendition(video.get("video_files") or [], aspect)
-                if not best or not best.get("link"):
-                    continue
-                width, height = int(best.get("width") or 0), int(best.get("height") or 0)
-                if aspect != "1:1" and not matches_orientation(width, height, aspect):
-                    continue
-                self.seen_ids.add(vid_id)
-                user = video.get("user") or {}
-                candidates.append({
-                    "provider": "pexels",
-                    "asset_id": str(vid_id),
-                    "url": best["link"],
-                    "source_page": video.get("url") or "",
-                    "creator": user.get("name") or "",
-                    "duration": duration,
-                    "width": width,
-                    "height": height,
-                    "query": query,
-                    "rendition": {"id": str(best.get("id") or ""), "width": width, "height": height},
-                })
-                if len(candidates) >= max(1, int(limit or 20)):
-                    break
+            url = f"https://api.pexels.com/v1/videos/search?{urlencode(params)}"
+            response = requests.get(url, headers=self.headers, timeout=(30, 60), verify=True)
+            add_videos(response.json().get("videos") or [], "search")
+
+            if not candidates:
+                popular_params = {
+                    "per_page": min(80, max(20, (cap - len(candidates)) * 8)),
+                    "min_duration": max(0, int(float(min_duration or 0))),
+                }
+                popular_url = f"https://api.pexels.com/v1/videos/popular?{urlencode(popular_params)}"
+                popular = requests.get(
+                    popular_url,
+                    headers=self.headers,
+                    timeout=(30, 60),
+                    verify=True,
+                )
+                add_videos(popular.json().get("videos") or [], "popular_fallback")
+
             print(f"  Pexels candidates: {len(candidates)}")
             return candidates
         except Exception as exc:
@@ -757,45 +790,57 @@ class PixabayScraper:
         try:
             candidates = []
             for variant in short_query_fallbacks(original) or [original]:
-                params = {
-                    "q": variant,
-                    "video_type": "all",
-                    "per_page": 50,
-                    "key": self.api_key,
-                    "orientation": pixabay_orientation(aspect),
-                }
-                url = f"https://pixabay.com/api/videos/?{urlencode(params)}"
-                data = requests.get(url, timeout=(30, 60), verify=True).json()
-                before = len(candidates)
-                for hit in data.get("hits") or []:
-                    vid_id = hit.get("id")
-                    if not vid_id or vid_id in self.seen_ids:
-                        continue
-                    duration = float(hit.get("duration") or 0)
-                    if duration and duration < min_seconds:
-                        continue
-                    rendition, rendition_id = pick_pixabay_rendition(hit.get("videos") or {}, aspect)
-                    if not rendition:
-                        continue
-                    width, height = int(rendition.get("width") or 0), int(rendition.get("height") or 0)
-                    if aspect != "1:1" and width and height and not matches_orientation(width, height, aspect):
-                        continue
-                    self.seen_ids.add(vid_id)
-                    candidates.append({
-                        "provider": "pixabay",
-                        "asset_id": str(vid_id),
-                        "url": rendition.get("url") or "",
-                        "source_page": hit.get("pageURL") or "",
-                        "creator": hit.get("user") or "",
-                        "duration": duration,
-                        "width": width,
-                        "height": height,
-                        "query": original or variant,
-                        "rendition": {"id": rendition_id, "width": width, "height": height},
-                    })
+                before_variant = len(candidates)
+                for order in ("popular", "latest"):
+                    params = {
+                        "q": variant,
+                        "video_type": "all",
+                        "per_page": 50,
+                        "key": self.api_key,
+                        "orientation": pixabay_orientation(aspect),
+                        "order": order,
+                    }
+                    url = f"https://pixabay.com/api/videos/?{urlencode(params)}"
+                    data = requests.get(url, timeout=(30, 60), verify=True).json()
+                    for hit in data.get("hits") or []:
+                        vid_id = hit.get("id")
+                        if not vid_id or vid_id in self.seen_ids:
+                            continue
+                        duration = float(hit.get("duration") or 0)
+                        if duration and duration < min_seconds:
+                            continue
+                        rendition, rendition_id = pick_pixabay_rendition(hit.get("videos") or {}, aspect)
+                        if not rendition:
+                            continue
+                        width, height = int(rendition.get("width") or 0), int(rendition.get("height") or 0)
+                        if aspect != "1:1" and width and height and not matches_orientation(width, height, aspect):
+                            continue
+                        self.seen_ids.add(vid_id)
+                        candidates.append({
+                            "provider": "pixabay",
+                            "asset_id": str(vid_id),
+                            "url": rendition.get("url") or "",
+                            "source_page": hit.get("pageURL") or "",
+                            "creator": hit.get("user") or "",
+                            "title": hit.get("tags") or "",
+                            "duration": duration,
+                            "width": width,
+                            "height": height,
+                            "query": original or variant,
+                            "rendition": {
+                                "id": rendition_id,
+                                "width": width,
+                                "height": height,
+                                "order": order,
+                            },
+                        })
+                        if len(candidates) >= cap:
+                            break
                     if len(candidates) >= cap:
                         break
-                if len(candidates) > before:
+                    if len(candidates) > before_variant:
+                        break
+                if len(candidates) > before_variant or len(candidates) >= cap:
                     break
             print(f"  Pixabay candidates: {len(candidates)}")
             return candidates
@@ -1043,12 +1088,12 @@ class CoverrScraper:
                     return urls[key]
         return item.get("mp4") or item.get("mp4_url") or item.get("download_url") or ""
 
-    def _fetch_hits(self, query):
+    def _fetch_hits(self, query, sort="popular"):
         params = {
             "query": query,
             "page_size": 20,
             "urls": "true",
-            "sort": "popular",
+            "sort": sort,
         }
         response = requests.get(
             f"https://api.coverr.co/videos?{urlencode(params)}",
@@ -1069,7 +1114,7 @@ class CoverrScraper:
             print(f"⚠️ Coverr returned non-JSON for {query!r}")
             return []
         hits = self._hits_from_payload(payload)
-        print(f"  Coverr API {query!r}: {len(hits)} raw")
+        print(f"  Coverr API {query!r} sort={sort}: {len(hits)} raw")
         return hits
 
     def find_videos(self, query, aspect="9:16", min_duration=2, limit=20):
@@ -1077,15 +1122,9 @@ class CoverrScraper:
             print("⚠️ Coverr API key not set")
             return []
         try:
-            hits = []
-            used_query = query
-            for variant in short_query_fallbacks(query):
-                hits = self._fetch_hits(variant)
-                if hits:
-                    used_query = variant
-                    break
             candidates = []
             min_seconds = float(min_duration or 0)
+            cap = max(1, int(limit or 20))
 
             def vertical_rank(item):
                 flag = item.get("is_vertical")
@@ -1098,39 +1137,62 @@ class CoverrScraper:
                 except (TypeError, ValueError):
                     return 1
 
-            for item in sorted(hits, key=vertical_rank):
-                vid_id = item.get("id") or item.get("_id") or item.get("objectID")
-                if not vid_id or vid_id in self.seen_ids:
-                    continue
-                try:
-                    duration = float(item.get("duration") or item.get("length") or item.get("video_length") or 0)
-                except (TypeError, ValueError):
-                    continue
-                if duration and duration < min_seconds:
-                    continue
-                link = self._clip_url(item)
-                if not link:
-                    continue
-                width = item.get("max_width") or item.get("width") or 0
-                height = item.get("max_height") or item.get("height") or 0
-                if not clip_matches_panel_aspect(width, height, aspect, item.get("is_vertical")):
-                    continue
-                self.seen_ids.add(vid_id)
-                creator = item.get("creator") or item.get("author") or {}
-                creator_name = creator.get("name") if isinstance(creator, dict) else (creator or "")
-                candidates.append({
-                    "provider": "coverr",
-                    "asset_id": str(vid_id),
-                    "url": link,
-                    "source_page": item.get("canonical_url") or item.get("url") or "",
-                    "creator": creator_name or "",
-                    "duration": duration,
-                    "width": int(width or 0),
-                    "height": int(height or 0),
-                    "query": used_query,
-                    "rendition": {"id": "mp4_download", "width": width, "height": height},
-                })
-                if len(candidates) >= max(1, int(limit or 20)):
+            for variant in short_query_fallbacks(query):
+                before_variant = len(candidates)
+                for sort in ("popular", "date"):
+                    hits = self._fetch_hits(variant, sort=sort)
+                    for item in sorted(hits, key=vertical_rank):
+                        vid_id = item.get("id") or item.get("_id") or item.get("objectID")
+                        if not vid_id or vid_id in self.seen_ids:
+                            continue
+                        try:
+                            duration = float(item.get("duration") or item.get("length") or item.get("video_length") or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if duration and duration < min_seconds:
+                            continue
+                        link = self._clip_url(item)
+                        if not link:
+                            continue
+                        width = item.get("max_width") or item.get("width") or 0
+                        height = item.get("max_height") or item.get("height") or 0
+                        if not clip_matches_panel_aspect(width, height, aspect, item.get("is_vertical")):
+                            continue
+                        self.seen_ids.add(vid_id)
+                        creator = item.get("creator") or item.get("author") or {}
+                        creator_name = creator.get("name") if isinstance(creator, dict) else (creator or "")
+                        tags = item.get("tags") or []
+                        if isinstance(tags, list):
+                            tags = " ".join(str(tag) for tag in tags)
+                        candidates.append({
+                            "provider": "coverr",
+                            "asset_id": str(vid_id),
+                            "url": link,
+                            "source_page": item.get("canonical_url") or item.get("url") or "",
+                            "creator": creator_name or "",
+                            "title": " ".join(filter(None, [
+                                str(item.get("title") or ""),
+                                str(item.get("description") or ""),
+                                str(tags or ""),
+                            ])),
+                            "duration": duration,
+                            "width": int(width or 0),
+                            "height": int(height or 0),
+                            "query": variant,
+                            "rendition": {
+                                "id": "mp4_download",
+                                "width": width,
+                                "height": height,
+                                "sort": sort,
+                            },
+                        })
+                        if len(candidates) >= cap:
+                            break
+                    if len(candidates) >= cap:
+                        break
+                    if len(candidates) > before_variant:
+                        break
+                if len(candidates) > before_variant or len(candidates) >= cap:
                     break
             print(f"  Coverr candidates: {len(candidates)}")
             return candidates

@@ -1,6 +1,7 @@
 import asyncio
 import html
 import json
+import math
 import os
 import re
 import sys
@@ -78,7 +79,9 @@ def subtitle_top(frame_h, text_h, position="bottom", custom_pct=70.0):
         except (TypeError, ValueError):
             pct = 70.0
     else:
-        pct = 80.0
+        # Anchor the caption's center low enough that its top remains inside the
+        # lower third for ordinary one- and two-line subtitle blocks.
+        pct = 86.0
     pct = max(0.0, min(100.0, pct))
     y = frame_h * (pct / 100.0) - text_h / 2.0
     margin = 24
@@ -101,11 +104,13 @@ def contains_cjk(text):
 
 
 def scene_visual_plan(speech_seconds, clip_count, clip_duration):
-    """Show exactly assets-per-scene clips. Visual length = assets × clip_duration."""
-    n = max(1, int(clip_count or 1))
+    """Cover narration while showing every selected asset at least once."""
+    selected = max(1, int(clip_count or 1))
     slot = max(2.0, min(12.0, float(clip_duration or 5)))
-    visual = n * slot
-    return n, slot, visual
+    speech = max(0.8, float(speech_seconds or 0.8))
+    visual = max(speech, selected * slot)
+    segments = max(selected, int(math.ceil((visual - 0.001) / slot)))
+    return segments, slot, visual
 
 
 def trim_audio_to(audio_clip, target_seconds):
@@ -697,7 +702,7 @@ class VideoEngine:
                 except OSError:
                     return str(file_path)
 
-            def build_visual_clip(file_path, clip_duration, allow_loop=False):
+            def build_visual_clip(file_path, clip_duration, allow_loop=False, start_offset=0.0):
                 suffix = Path(file_path).suffix.lower()
                 try:
                     if suffix in video_exts:
@@ -707,7 +712,9 @@ class VideoEngine:
                             clip.close()
                             return None
                         if clip.duration >= clip_duration:
-                            clip = clip.subclipped(0, clip_duration)
+                            latest_start = max(0.0, float(clip.duration) - float(clip_duration))
+                            start = min(max(0.0, float(start_offset or 0)), latest_start)
+                            clip = clip.subclipped(start, start + clip_duration)
                         elif allow_loop and clip.duration >= 1.5:
                             clip = clip.with_effects([vfx.Loop(duration=clip_duration)])
                         elif clip.duration >= 1.5:
@@ -757,22 +764,45 @@ class VideoEngine:
             else:
                 segment_duration = duration
                 visual_target = duration
-            if video_mode and len(preferred_pool) < num_segments:
-                raise RuntimeError(
-                    f"Scene {i + 1} needs {num_segments} unique clips for {visual_target:.2f}s "
-                    f"(clip_duration={segment_seconds}s) but only {len(preferred_pool)} unique sources remain"
-                )
             parts = []
             used = []
-            for file_path in preferred_pool:
-                needed = duration if (not video_mode and num_segments == 1) else segment_duration
-                part = build_visual_clip(file_path, needed, allow_loop=not video_mode)
-                if part is None:
-                    continue
-                parts.append(part)
-                used.append(file_path)
-                if len(parts) >= num_segments:
-                    break
+            if video_mode:
+                source_offsets = {source_key(path): 0.0 for path in preferred_pool}
+                covered = 0.0
+                for segment_index in range(num_segments):
+                    needed = min(segment_duration, max(0.0, visual_target - covered))
+                    if needed <= 0.01:
+                        break
+                    part = None
+                    file_path = ""
+                    key = ""
+                    for attempt in range(len(preferred_pool)):
+                        file_path = preferred_pool[(segment_index + attempt) % len(preferred_pool)]
+                        key = source_key(file_path)
+                        part = build_visual_clip(
+                            file_path,
+                            needed,
+                            allow_loop=True,
+                            start_offset=source_offsets[key],
+                        )
+                        if part is not None:
+                            break
+                    if part is None:
+                        continue
+                    parts.append(part)
+                    used.append(file_path)
+                    source_offsets[key] += needed
+                    covered += float(part.duration or 0)
+            else:
+                for file_path in preferred_pool:
+                    needed = duration if num_segments == 1 else segment_duration
+                    part = build_visual_clip(file_path, needed, allow_loop=True)
+                    if part is None:
+                        continue
+                    parts.append(part)
+                    used.append(file_path)
+                    if len(parts) >= num_segments:
+                        break
             if not parts:
                 raise RuntimeError(f"No usable (non-black) clip for scene {i + 1}: {keyword}")
             if video_mode:
@@ -800,10 +830,11 @@ class VideoEngine:
                     used_source_keys.append(key)
                     used_source_set.add(key)
                 if speech_duration > scene_duration + 0.05:
-                    audio_clip = trim_audio_to(audio_clip, scene_duration)
-                    speech_duration = scene_duration
-                else:
-                    audio_clip = pad_audio_to(audio_clip, scene_duration)
+                    raise RuntimeError(
+                        f"Scene {i + 1} visual coverage {scene_duration:.2f}s is shorter than "
+                        f"narration {speech_duration:.2f}s"
+                    )
+                audio_clip = pad_audio_to(audio_clip, scene_duration)
                 duration = scene_duration
 
             try:
@@ -950,7 +981,7 @@ class VideoEngine:
                             t_clip = t_clip.with_opacity(0.98)
                             subs_clips.append(t_clip)
 
-                        visual_clip = CompositeVideoClip([visual_clip] + subs_clips)
+                        visual_clip = CompositeVideoClip([visual_clip] + subs_clips).with_duration(duration)
                     else:
                         display_text = sentence
                         if getattr(settings, 'emoji_subtitles', False):
@@ -958,7 +989,7 @@ class VideoEngine:
 
                         txt_img = make_text_image(display_text, visual_clip.w, visual_clip.h, style)
                         txt_clip = ImageClip(txt_img).with_duration(subtitle_duration)
-                        visual_clip = CompositeVideoClip([visual_clip, txt_clip])
+                        visual_clip = CompositeVideoClip([visual_clip, txt_clip]).with_duration(duration)
 
                 except Exception as e:
                     print(f"⚠️ Subtitle Error (PIL): {e}")

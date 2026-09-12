@@ -149,6 +149,7 @@ class ScrapeRequest(BaseModel):
     leftover_files: Optional[List[str]] = None
     local_category: Optional[str] = None
     target_duration: Optional[int] = None
+    local_video_count: Optional[int] = 1
     api_keys: Optional[ApiKeys] = None
     keywords: Optional[List[str]] = None
     provider_fallback: bool = False
@@ -1028,6 +1029,20 @@ def pack_local_files_priority(primary_paths, fill_paths, target):
     extra, extra_total = pack_local_files_for_target(fill_paths, remaining)
     return picked + extra, total + extra_total
 
+def take_local_video_batch(primary_paths, fill_paths, target):
+    primary = list(primary_paths or [])
+    fill = list(fill_paths or [])
+    if target:
+        packed, total = (
+            pack_local_files_priority(primary, fill, target)
+            if fill else pack_local_files_for_target(primary, target)
+        )
+    else:
+        packed = primary + fill
+        total = 0.0
+    used = set(packed)
+    return packed, total, [path for path in primary if path not in used], [path for path in fill if path not in used]
+
 def make_scraper(src, output_dir, api_keys=None):
     keys = api_keys or ApiKeys()
     if src == "pinterest": return PinterestScraper(output_dir=output_dir)
@@ -1094,6 +1109,14 @@ def validate_scrape_request_options(request):
             if target < LOCAL_TARGET_MIN or target > LOCAL_TARGET_MAX:
                 raise RuntimeError(f"Video length must be between {LOCAL_TARGET_MIN} and {LOCAL_TARGET_MAX} seconds.")
             request.target_duration = target
+        count = getattr(request, "local_video_count", 1) or 1
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            raise RuntimeError("Videos to generate must be between 1 and 10.")
+        if count < 1 or count > 10:
+            raise RuntimeError("Videos to generate must be between 1 and 10.")
+        request.local_video_count = count
     elif request.mode != "script" and not (request.query or "").strip():
         raise RuntimeError("Single search requires a topic query.")
     if request.mode == "script":
@@ -2424,6 +2447,7 @@ async def run_video_assembly(
     yt_upload=False,
     publish_confirmed=False,
     progress_label="",
+    output_name=None,
 ):
 
     """Voiceover + create_video + thumbnail + optional YouTube upload for one project.
@@ -2466,16 +2490,19 @@ async def run_video_assembly(
         assets = 1
     duration_seconds = max(20, min(180, int(settings.clip_duration or 5) * assets * max(1, len(keyword_data))))
     bg_music = resolve_background_music(settings, api_keys=api_keys, vibe=vibe, duration_seconds=duration_seconds)
-    candidate_count = max(1, min(5, int(settings.video_count or 1)))
+    candidate_count = 1 if output_name else max(1, min(5, int(settings.video_count or 1)))
     candidates = []
     video_path = None
     video_file = None
     for candidate_idx in range(candidate_count):
         scraping_status["message"] = f"Assembling video{label} candidate {candidate_idx+1}/{candidate_count}..."
+        name = output_name or (
+            f"final_aesthetic_video_{candidate_idx+1}.mp4" if candidate_count > 1 else "final_aesthetic_video.mp4"
+        )
         video_file = await asyncio.to_thread(
             engine.create_video, keyword_data, project_path, media_type,
             bg_music=bg_music, settings=settings,
-            output_name=f"final_aesthetic_video_{candidate_idx+1}.mp4" if candidate_count > 1 else "final_aesthetic_video.mp4",
+            output_name=name,
         )
         video_path = validate_final_video(video_file)
         video_rel = relative_download_path(video_path)
@@ -2690,45 +2717,61 @@ async def run_scrape(request: ScrapeRequest):
             scraping_status["results"] = [{"keyword": query or "local", "files": rel_paths}]
             scraping_status["message"] = "Done"
             if request.auto_video:
-                file_paths = [str(path) for path in valid_paths]
-                fill_paths = [str(path) for path in resolved_leftover_files(request)]
-                if request.target_duration:
-                    if fill_paths:
-                        file_paths, packed_total = pack_local_files_priority(
-                            file_paths, fill_paths, request.target_duration
-                        )
-                    else:
-                        file_paths, packed_total = pack_local_files_for_target(file_paths, request.target_duration)
-                    if not file_paths:
-                        raise RuntimeError(
-                            f"No checked clip is {request.target_duration}s or shorter. "
-                            "Pick a longer target, or shorter clips."
-                        )
-                    print(
-                        f"  Local pack: {len(file_paths)} clip(s), {packed_total:.1f}s / {request.target_duration}s"
-                    )
-                    print("  Packed files: " + ", ".join(Path(path).name for path in file_paths))
-                elif fill_paths:
-                    file_paths = file_paths + fill_paths
-                file_paths = move_local_clips_to_project(file_paths, project_name)
-                if not file_paths:
-                    raise RuntimeError("Could not move the selected clips into the project video folder.")
-                keyword_data = [{
-                    "sentence": (query or "").strip() or "Local clips",
-                    "keyword": query or "local",
-                    "_files": file_paths,
-                }]
-                assets = max(count, len(file_paths))
+                primary_pool = [str(path) for path in valid_paths]
+                fill_pool = [str(path) for path in resolved_leftover_files(request)]
+                video_total = max(1, min(10, int(getattr(request, "local_video_count", 1) or 1)))
                 try:
-                    settings.assets_per_scene = assets
+                    settings.video_count = 1
                     settings.keep_source_duration = True
                 except Exception:
-                    object.__setattr__(settings, "assets_per_scene", assets)
+                    object.__setattr__(settings, "video_count", 1)
                     object.__setattr__(settings, "keep_source_duration", True)
-                await run_video_assembly(
-                    keyword_data, project_path, project_name, media_type, settings, api_keys,
-                    request.vibe, yt_upload=request.yt_upload, publish_confirmed=request.publish_confirmed,
-                )
+                made = 0
+                batch_candidates = []
+                for index in range(video_total):
+                    packed, packed_total, primary_pool, fill_pool = take_local_video_batch(
+                        primary_pool, fill_pool, request.target_duration
+                    )
+                    if not packed:
+                        if made == 0:
+                            raise RuntimeError(
+                                f"No checked clip is {request.target_duration}s or shorter. "
+                                "Pick a longer target, or shorter clips."
+                            )
+                        break
+                    print(
+                        f"  Local pack {index + 1}/{video_total}: {len(packed)} clip(s), "
+                        f"{packed_total:.1f}s / {request.target_duration or 'full'}s"
+                    )
+                    print("  Packed files: " + ", ".join(Path(path).name for path in packed))
+                    packed = move_local_clips_to_project(packed, project_name)
+                    if not packed:
+                        raise RuntimeError("Could not move the selected clips into the project video folder.")
+                    keyword_data = [{
+                        "sentence": (query or "").strip() or "Local clips",
+                        "keyword": query or "local",
+                        "_files": packed,
+                    }]
+                    try:
+                        settings.assets_per_scene = max(count, len(packed))
+                    except Exception:
+                        object.__setattr__(settings, "assets_per_scene", max(count, len(packed)))
+                    output_name = (
+                        "final_aesthetic_video.mp4" if index == 0 else f"final_aesthetic_video_{index + 1}.mp4"
+                    )
+                    await run_video_assembly(
+                        keyword_data, project_path, project_name, media_type, settings, api_keys,
+                        request.vibe, yt_upload=request.yt_upload and index == 0,
+                        publish_confirmed=request.publish_confirmed,
+                        output_name=output_name,
+                    )
+                    batch_candidates.extend(scraping_status.get("candidates") or [])
+                    made += 1
+                if batch_candidates:
+                    set_status(
+                        candidates=batch_candidates,
+                        final_video=batch_candidates[0],
+                    )
 
         set_status("success", progress=100)
     except Exception as e:

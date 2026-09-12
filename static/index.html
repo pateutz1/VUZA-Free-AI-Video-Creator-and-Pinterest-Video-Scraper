@@ -9,7 +9,7 @@
         content="VUZA free AI video creator: turn a topic or script into stock footage, voiceover, subtitles, and a 9:16 short.">
     <meta name="keywords"
         content="VUZA, free ai video creator, faceless video generator, money printer tool, pinterest video scraper, pinterest scraper, free pictory ai alternative, free invideo alternative, moneyprinter turbo, pexels video downloader, pixabay scraper, edge tts, ai voiceover, auto subtitles, open source video tool, python video creator, script to video, tiktok video maker, youtube shorts creator, instagram reels, ai automation, free video generation, content creation tool">
-    <link rel="stylesheet" href="/static/style.css?v=6.3">
+    <link rel="stylesheet" href="/static/style.css?v=6.4">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap"
         rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
@@ -275,10 +275,21 @@
                             <ul class="source-dropdown-menu" role="listbox" hidden></ul>
                         </div>
                         <p class="settings-note">Used clips move to downloads. Leftovers stay for the next video.</p>
-                        <label for="target-duration">Finished video length</label>
-                        <div class="input-wrapper">
-                            <i class="fas fa-clock input-icon"></i>
-                            <input type="number" id="target-duration" min="5" max="600" step="1" placeholder="60 seconds">
+                        <div class="local-length-row">
+                            <div>
+                                <label for="target-duration">Finished video length</label>
+                                <div class="input-wrapper">
+                                    <i class="fas fa-clock input-icon"></i>
+                                    <input type="number" id="target-duration" min="5" max="600" step="1" placeholder="60 seconds">
+                                </div>
+                            </div>
+                            <div>
+                                <label for="local-video-count">Videos to generate</label>
+                                <div class="input-wrapper">
+                                    <i class="fas fa-film input-icon"></i>
+                                    <input type="number" id="local-video-count" min="1" max="10" step="1" value="1">
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -790,6 +801,17 @@
             </div>
         </div>
     </div>
+    <div id="local-batch-overlay" class="review-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="local-batch-title">
+        <div class="leftover-player-modal local-fallback-modal">
+            <h3 id="local-batch-title">Not enough clips</h3>
+            <p id="local-batch-text"></p>
+            <div class="review-modal-actions">
+                <button type="button" id="local-batch-fewer" class="action-btn">Fewer videos</button>
+                <button type="button" id="local-batch-shorter" class="action-btn">Shorter videos</button>
+                <button type="button" id="local-batch-cancel" class="secondary-btn">Cancel</button>
+            </div>
+        </div>
+    </div>
     <div id="leftover-player-overlay" class="review-overlay leftover-player-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="leftover-player-title">
         <div class="leftover-player-modal">
             <div class="leftover-player-head">
@@ -801,7 +823,7 @@
             <video id="leftover-player-video" controls playsinline></video>
         </div>
     </div>
-    <script src="/static/script.js?v=9.17"></script>
+    <script src="/static/script.js?v=9.18"></script>
 </body>
 
 </html>

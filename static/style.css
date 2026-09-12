@@ -1847,6 +1847,12 @@ body {
     gap: 16px;
 }
 
+.local-length-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+}
+
 .local-dropzone {
     display: flex;
     flex-direction: column;
@@ -2030,4 +2036,14 @@ body {
     font-size: 0.9rem;
     line-height: 1.5;
     margin: 10px 0 20px;
+}
+
+#local-batch-overlay .review-modal-actions .action-btn,
+#local-batch-overlay .review-modal-actions .secondary-btn {
+    min-width: 110px;
+}
+
+#local-batch-overlay .action-btn:disabled {
+    opacity: 0.45;
+    pointer-events: none;
 }

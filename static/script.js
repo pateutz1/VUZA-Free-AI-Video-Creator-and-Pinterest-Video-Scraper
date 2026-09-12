@@ -904,6 +904,14 @@ document.addEventListener('DOMContentLoaded', () => {
         }, 0);
     }
 
+    const LOCAL_TARGET_MIN = 5;
+
+    function readLocalVideoCount() {
+        const raw = numVal('local-video-count', 1);
+        const count = Number.isFinite(raw) ? Math.round(raw) : 1;
+        return Math.max(1, Math.min(10, count || 1));
+    }
+
     function confirmLocalFallback(message) {
         return new Promise((resolve) => {
             const overlay = document.getElementById('local-fallback-overlay');
@@ -937,6 +945,79 @@ document.addEventListener('DOMContentLoaded', () => {
             overlay.addEventListener('click', onBackdrop);
             document.addEventListener('keydown', onEsc);
         });
+    }
+
+    function confirmLocalBatchChoice(message, fewerLabel, shorterLabel, allowFewer, allowShorter) {
+        return new Promise((resolve) => {
+            const overlay = document.getElementById('local-batch-overlay');
+            const text = document.getElementById('local-batch-text');
+            const fewer = document.getElementById('local-batch-fewer');
+            const shorter = document.getElementById('local-batch-shorter');
+            const cancel = document.getElementById('local-batch-cancel');
+            if (!overlay || !fewer || !shorter || !cancel) {
+                resolve(null);
+                return;
+            }
+            if (text) text.textContent = message;
+            fewer.textContent = fewerLabel;
+            shorter.textContent = shorterLabel;
+            fewer.disabled = !allowFewer;
+            shorter.disabled = !allowShorter;
+            overlay.classList.remove('hidden');
+            const finish = (choice) => {
+                overlay.classList.add('hidden');
+                overlay.removeEventListener('click', onBackdrop);
+                document.removeEventListener('keydown', onEsc);
+                fewer.removeEventListener('click', onFewer);
+                shorter.removeEventListener('click', onShorter);
+                cancel.removeEventListener('click', onCancel);
+                resolve(choice);
+            };
+            const onFewer = () => finish(allowFewer ? 'fewer' : null);
+            const onShorter = () => finish(allowShorter ? 'shorter' : null);
+            const onCancel = () => finish(null);
+            const onBackdrop = (event) => {
+                if (event.target.id === 'local-batch-overlay') finish(null);
+            };
+            const onEsc = (event) => {
+                if (event.key === 'Escape') finish(null);
+            };
+            fewer.addEventListener('click', onFewer);
+            shorter.addEventListener('click', onShorter);
+            cancel.addEventListener('click', onCancel);
+            overlay.addEventListener('click', onBackdrop);
+            document.addEventListener('keydown', onEsc);
+        });
+    }
+
+    async function maybeConfirmLocalBatch(job, target, videoCount) {
+        if (!target || videoCount <= 1) return { videoCount, target };
+        const paths = [...(job.localFiles || []), ...(job.leftoverFiles || [])];
+        const available = await durationForPaths(paths);
+        const needed = target * videoCount;
+        if (available + 1e-6 >= needed) return { videoCount, target };
+        const clipCount = paths.length;
+        const fewerCount = Math.max(0, Math.floor(available / target));
+        const shorterLen = Math.max(0, Math.floor(available / videoCount));
+        const allowFewer = fewerCount >= 1 && fewerCount < videoCount;
+        const allowShorter = shorterLen >= LOCAL_TARGET_MIN && shorterLen < target;
+        if (!allowFewer && !allowShorter) {
+            showToast(
+                `Only ${clipCount} clip(s) (~${Math.round(available)}s). Not enough for ${videoCount} videos of ${target}s.`,
+                'error',
+            );
+            return null;
+        }
+        const choice = await confirmLocalBatchChoice(
+            `We have only ${clipCount} clip(s) (~${Math.round(available)}s). That is not enough for ${videoCount} videos of ${target}s (need ${needed}s). Reduce the video count, or reduce the video length?`,
+            allowFewer ? `Fewer videos (${fewerCount} × ${target}s)` : 'Fewer videos',
+            allowShorter ? `Shorter videos (${videoCount} × ${shorterLen}s)` : 'Shorter videos',
+            allowFewer,
+            allowShorter,
+        );
+        if (!choice) return null;
+        if (choice === 'fewer') return { videoCount: fewerCount, target };
+        return { videoCount, target: shorterLen };
     }
 
     function packClipsToDuration(clips, limit) {
@@ -1556,6 +1637,8 @@ document.addEventListener('DOMContentLoaded', () => {
         let localFiles = [];
         let leftoverFiles = [];
         let outputCategory = '';
+        let localVideoCount = 1;
+        let localTarget = null;
         if (source === 'local') {
             let job = await collectLocalJobFiles();
             if (job.localFiles.length === 0 && job.leftoverFiles.length === 0) {
@@ -1565,8 +1648,21 @@ document.addEventListener('DOMContentLoaded', () => {
             const target = document.getElementById('target-duration')?.value
                 ? numVal('target-duration', null)
                 : null;
-            job = await maybeConfirmLocalFallback(job, target);
+            const videoCount = readLocalVideoCount();
+            if (videoCount > 1 && !target) {
+                showToast('Set a finished video length when generating more than 1 video.', 'error');
+                return;
+            }
+            job = await maybeConfirmLocalFallback(job, target ? target * videoCount : null);
             if (!job) return;
+            const batch = await maybeConfirmLocalBatch(job, target, videoCount);
+            if (!batch) return;
+            localVideoCount = batch.videoCount;
+            localTarget = batch.target;
+            const countInputEl = document.getElementById('local-video-count');
+            const targetInputEl = document.getElementById('target-duration');
+            if (countInputEl) countInputEl.value = String(localVideoCount);
+            if (localTarget != null && targetInputEl) targetInputEl.value = String(localTarget);
             localFiles = job.localFiles;
             leftoverFiles = job.leftoverFiles;
             outputCategory = job.outputCategory;
@@ -1605,9 +1701,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     mode: currentMode, vibe,
                     provider_fallback: providerFallback,
                     local_category: source === 'local' ? outputCategory : '',
-                    target_duration: source === 'local' && document.getElementById('target-duration')?.value
-                        ? numVal('target-duration', null)
-                        : null,
+                    target_duration: source === 'local' ? localTarget : null,
+                    local_video_count: source === 'local' ? localVideoCount : 1,
                     local_files: localFiles,
                     leftover_files: leftoverFiles,
                     video_settings: {

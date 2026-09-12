@@ -876,13 +876,89 @@ document.addEventListener('DOMContentLoaded', () => {
         if (overlay) overlay.classList.add('hidden');
     }
 
-    async function leftoverClipPaths(category) {
+    async function leftoverClips(category) {
         const name = category || document.getElementById('leftover-category')?.value || '';
         if (!name) return [];
         const response = await fetch(`/api/local/clips?category=${encodeURIComponent(name)}`);
         if (!response.ok) return [];
         const data = await response.json();
-        return (data.clips || []).map((clip) => clip.path);
+        return data.clips || [];
+    }
+
+    async function leftoverClipPaths(category) {
+        return (await leftoverClips(category)).map((clip) => clip.path);
+    }
+
+    async function durationForPaths(paths) {
+        const names = [...new Set((paths || []).map((path) => (
+            path.includes('/') ? path.split('/')[0] : getLocalCategory()
+        )).filter(Boolean))];
+        const clips = [];
+        for (const name of names) clips.push(...await leftoverClips(name));
+        const lookup = new Map(clips.map((clip) => [clip.path, Number(clip.duration) || 0]));
+        return (paths || []).reduce((sum, path) => {
+            if (lookup.has(path)) return sum + lookup.get(path);
+            const file = path.split('/').pop();
+            const hit = clips.find((clip) => clip.name === file || clip.path.endsWith(`/${file}`));
+            return sum + (hit ? Number(hit.duration) || 0 : 0);
+        }, 0);
+    }
+
+    function confirmLocalFallback(message) {
+        return new Promise((resolve) => {
+            const overlay = document.getElementById('local-fallback-overlay');
+            const text = document.getElementById('local-fallback-text');
+            const approve = document.getElementById('local-fallback-approve');
+            const cancel = document.getElementById('local-fallback-cancel');
+            if (!overlay || !approve || !cancel) {
+                resolve(false);
+                return;
+            }
+            if (text) text.textContent = message;
+            overlay.classList.remove('hidden');
+            const finish = (ok) => {
+                overlay.classList.add('hidden');
+                overlay.removeEventListener('click', onBackdrop);
+                document.removeEventListener('keydown', onEsc);
+                approve.removeEventListener('click', onOk);
+                cancel.removeEventListener('click', onNo);
+                resolve(ok);
+            };
+            const onOk = () => finish(true);
+            const onNo = () => finish(false);
+            const onBackdrop = (event) => {
+                if (event.target.id === 'local-fallback-overlay') finish(false);
+            };
+            const onEsc = (event) => {
+                if (event.key === 'Escape') finish(false);
+            };
+            approve.addEventListener('click', onOk);
+            cancel.addEventListener('click', onNo);
+            overlay.addEventListener('click', onBackdrop);
+            document.addEventListener('keydown', onEsc);
+        });
+    }
+
+    async function maybeConfirmLocalFallback(job, target) {
+        if (!target) return job;
+        const primary = await durationForPaths(job.localFiles);
+        const leftoverDur = await durationForPaths(job.leftoverFiles);
+        if (primary + leftoverDur + 1e-6 >= target) return job;
+        let fill = (job.leftoverFiles || []).slice();
+        if (!fill.length) {
+            const used = new Set(job.localFiles);
+            const current = job.outputCategory || getLocalCategory();
+            fill = (await leftoverClips('__all__'))
+                .filter((clip) => !used.has(clip.path) && (!current || !clip.path.startsWith(`${current}/`)))
+                .map((clip) => clip.path);
+        }
+        const available = Math.round(primary + (fill.length ? await durationForPaths(fill) : 0));
+        const message = fill.length
+            ? `This selection is about ${Math.round(primary)}s. Target is ${target}s. Approve to add leftover clips from other folders. If still short, generate about ${Math.max(available, Math.round(primary))}s.`
+            : `This selection is about ${Math.round(primary)}s. Target is ${target}s. No other leftover clips. Approve to generate a shorter video, or cancel.`;
+        const ok = await confirmLocalFallback(message);
+        if (!ok) return null;
+        return { ...job, leftoverFiles: fill };
     }
 
     let lastBatchFiles = [];
@@ -1456,6 +1532,25 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
+        let localFiles = [];
+        let leftoverFiles = [];
+        let outputCategory = '';
+        if (source === 'local') {
+            let job = await collectLocalJobFiles();
+            if (job.localFiles.length === 0 && job.leftoverFiles.length === 0) {
+                showToast('Upload clips or pick a leftover folder.', 'error');
+                return;
+            }
+            const target = document.getElementById('target-duration')?.value
+                ? numVal('target-duration', null)
+                : null;
+            job = await maybeConfirmLocalFallback(job, target);
+            if (!job) return;
+            localFiles = job.localFiles;
+            leftoverFiles = job.leftoverFiles;
+            outputCategory = job.outputCategory;
+        }
+
         setLoading(true);
         finalVideoUrl = '';
         candidateVideos = [];
@@ -1464,20 +1559,6 @@ document.addEventListener('DOMContentLoaded', () => {
         galleryContainer.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-spin"></i><p>VUZA is working...</p></div>';
 
         try {
-            let localFiles = [];
-            let leftoverFiles = [];
-            let outputCategory = '';
-            if (source === 'local') {
-                const job = await collectLocalJobFiles();
-                localFiles = job.localFiles;
-                leftoverFiles = job.leftoverFiles;
-                outputCategory = job.outputCategory;
-                if (localFiles.length === 0 && leftoverFiles.length === 0) {
-                    showToast('Upload clips or pick a leftover folder.', 'error');
-                    setLoading(false);
-                    return;
-                }
-            }
 
             persistKeys(keys);
             let customMusic = (document.getElementById('music-custom-path')?.value || '').trim();

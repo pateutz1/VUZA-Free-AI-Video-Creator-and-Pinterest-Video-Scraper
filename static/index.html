@@ -9,7 +9,7 @@
         content="VUZA free AI video creator: turn a topic or script into stock footage, voiceover, subtitles, and a 9:16 short.">
     <meta name="keywords"
         content="VUZA, free ai video creator, faceless video generator, money printer tool, pinterest video scraper, pinterest scraper, free pictory ai alternative, free invideo alternative, moneyprinter turbo, pexels video downloader, pixabay scraper, edge tts, ai voiceover, auto subtitles, open source video tool, python video creator, script to video, tiktok video maker, youtube shorts creator, instagram reels, ai automation, free video generation, content creation tool">
-    <link rel="stylesheet" href="/static/style.css?v=6.2">
+    <link rel="stylesheet" href="/static/style.css?v=6.3">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap"
         rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
@@ -780,6 +780,16 @@
     </div> <!-- end page-layout -->
 
     <div id="toast" class="toast hidden"></div>
+    <div id="local-fallback-overlay" class="review-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="local-fallback-title">
+        <div class="leftover-player-modal local-fallback-modal">
+            <h3 id="local-fallback-title">Not enough clips</h3>
+            <p id="local-fallback-text"></p>
+            <div class="review-modal-actions">
+                <button type="button" id="local-fallback-approve" class="action-btn">Approve</button>
+                <button type="button" id="local-fallback-cancel" class="secondary-btn">Cancel</button>
+            </div>
+        </div>
+    </div>
     <div id="leftover-player-overlay" class="review-overlay leftover-player-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="leftover-player-title">
         <div class="leftover-player-modal">
             <div class="leftover-player-head">
@@ -791,7 +801,7 @@
             <video id="leftover-player-video" controls playsinline></video>
         </div>
     </div>
-    <script src="/static/script.js?v=9.15"></script>
+    <script src="/static/script.js?v=9.16"></script>
 </body>
 
 </html>

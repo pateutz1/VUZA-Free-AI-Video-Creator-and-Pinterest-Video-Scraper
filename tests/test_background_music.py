@@ -10,9 +10,12 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import BackgroundTasks, HTTPException
 
+from datetime import datetime
+
 from app import (
     ALLOWED_UPLOAD_SUFFIXES,
     ApiKeys,
+    auto_local_category_name,
     MIXKIT_MUSIC_DOWNLOAD_DIR,
     MIXKIT_MUSIC_MOODS,
     ScrapeRequest,
@@ -25,7 +28,11 @@ from app import (
     local_script_segments,
     mixkit_music_catalog,
     normalized_script_inputs,
+    parse_viral_score,
+    pack_local_files_for_target,
     resolve_path_within_directory,
+    resolved_local_files,
+    select_clips_for_duration,
     set_status,
     run_scrape,
     scraping_status,
@@ -655,6 +662,17 @@ class ScrapeRequestValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Auto video requires a TTS voice"):
             validate_scrape_request_options(request)
 
+    def test_local_auto_video_allows_disabled_voice(self):
+        request = ScrapeRequest(
+            source="local",
+            mode="single",
+            auto_video=True,
+            local_files=["clip_0.mp4"],
+            video_settings=VideoSettings(voice="none"),
+        )
+        with patch("app.resolved_local_files", return_value=["clip_0.mp4"]):
+            validate_scrape_request_options(request)
+
     def test_asset_only_mode_allows_disabled_voice(self):
         request = ScrapeRequest(
             source="pexels",
@@ -949,6 +967,109 @@ class ScrapeRequestValidationTests(unittest.TestCase):
         self.assertIn("Coverr HTTP 500: quota exhausted", scraping_status["error"])
         self.assertFalse(scraping_status["is_running"])
 
+    def test_local_single_auto_video_assembles_all_uploaded_files(self):
+        files = [Path(f"uploads/clip_{i}.mp4") for i in range(12)]
+        request = ScrapeRequest(
+            source="local",
+            mode="single",
+            query="my clips",
+            media_type="video",
+            count=3,
+            auto_video=True,
+            local_files=["clip_0.mp4"],
+            video_settings=VideoSettings(),
+        )
+        scraping_status["is_running"] = False
+        scraping_status["error"] = None
+        assembled = {}
+
+        async def fake_assemble(keyword_data, project_path, project_name, media_type, settings, *args, **kwargs):
+            assembled["files"] = list(keyword_data[0]["_files"])
+            assembled["assets"] = settings.assets_per_scene
+            assembled["keep_full"] = bool(getattr(settings, "keep_source_duration", False))
+
+        with patch("app.resolved_local_files", return_value=["clip_0.mp4"]), \
+             patch("app.universal_search", new=AsyncMock(return_value=files)), \
+             patch("app.require_media_files", return_value=files), \
+             patch("app.run_video_assembly", new=AsyncMock(side_effect=fake_assemble)):
+            asyncio.run(run_scrape(request))
+
+        self.assertEqual(scraping_status["status"], "success")
+        self.assertIsNone(scraping_status["error"])
+        self.assertEqual(len(assembled["files"]), 12)
+        self.assertEqual(assembled["assets"], 12)
+        self.assertTrue(assembled["keep_full"])
+
+    def test_local_single_auto_video_packs_highest_scores_under_target(self):
+        scores = list(range(99, 87, -1))
+        files = [Path(f"uploads/{score}_{idx:03d}_Visual_highlight_{idx}.mp4") for idx, score in enumerate(scores)]
+        request = ScrapeRequest(
+            source="local",
+            mode="single",
+            query="my clips",
+            media_type="video",
+            count=3,
+            auto_video=True,
+            target_duration=60,
+            local_files=["clip_0.mp4"],
+            video_settings=VideoSettings(),
+        )
+        scraping_status["is_running"] = False
+        scraping_status["error"] = None
+        assembled = {}
+
+        async def fake_assemble(keyword_data, project_path, project_name, media_type, settings, *args, **kwargs):
+            assembled["files"] = list(keyword_data[0]["_files"])
+
+        with patch("app.resolved_local_files", return_value=["clip_0.mp4"]), \
+             patch("app.universal_search", new=AsyncMock(return_value=files)), \
+             patch("app.require_media_files", return_value=files), \
+             patch("app.probe_local_clip_duration", return_value=10), \
+             patch("app.run_video_assembly", new=AsyncMock(side_effect=fake_assemble)):
+            asyncio.run(run_scrape(request))
+
+        self.assertEqual(scraping_status["status"], "success")
+        self.assertEqual(len(assembled["files"]), 6)
+        self.assertTrue(all(Path(path).name.startswith(("99_", "98_", "97_", "96_", "95_", "94_")) for path in assembled["files"]))
+
+    def test_local_single_target_errors_when_all_clips_too_long(self):
+        files = [Path("uploads/99_000_Visual_highlight_1.mp4")]
+        request = ScrapeRequest(
+            source="local",
+            mode="single",
+            query="my clips",
+            media_type="video",
+            auto_video=True,
+            target_duration=60,
+            local_files=["clip_0.mp4"],
+            video_settings=VideoSettings(),
+        )
+        scraping_status["is_running"] = False
+        scraping_status["error"] = None
+
+        with patch("app.resolved_local_files", return_value=["clip_0.mp4"]), \
+             patch("app.universal_search", new=AsyncMock(return_value=files)), \
+             patch("app.require_media_files", return_value=files), \
+             patch("app.probe_local_clip_duration", return_value=90), \
+             patch("app.run_video_assembly", new=AsyncMock(side_effect=AssertionError("should not assemble"))):
+            with contextlib.redirect_stderr(io.StringIO()):
+                asyncio.run(run_scrape(request))
+
+        self.assertEqual(scraping_status["status"], "error")
+        self.assertIn("shorter", scraping_status["error"])
+
+    def test_local_target_duration_must_stay_in_range(self):
+        request = ScrapeRequest(
+            source="local",
+            mode="single",
+            auto_video=False,
+            local_files=["clip_0.mp4"],
+            target_duration=601,
+        )
+        with patch("app.resolved_local_files", return_value=["clip_0.mp4"]):
+            with self.assertRaisesRegex(RuntimeError, "5 and 600"):
+                validate_scrape_request_options(request)
+
     def test_asset_only_single_search_does_not_load_video_engine(self):
         request = ScrapeRequest(
             source="pexels",
@@ -967,6 +1088,96 @@ class ScrapeRequestValidationTests(unittest.TestCase):
         self.assertEqual(scraping_status["status"], "success")
         self.assertIsNone(scraping_status["error"])
         self.assertFalse(scraping_status["is_running"])
+
+
+class LocalClipSelectTests(unittest.TestCase):
+    def test_auto_category_uses_datetime_and_clip_token(self):
+        when = datetime(2026, 9, 12, 9, 55)
+        name = auto_local_category_name(["87_000_Visual_highlight_1.mp4"], when=when)
+        self.assertEqual(name, "120920260955_visual_highlight_1")
+
+    def test_auto_category_picks_from_one_of_the_clip_names(self):
+        when = datetime(2026, 9, 12, 10, 1)
+        name = auto_local_category_name(
+            ["81_001_Visual_highlight_2.mp4", "87_000_Visual_highlight_1.mp4"],
+            when=when,
+        )
+        self.assertTrue(name.startswith("120920261001_"))
+        self.assertTrue(name.endswith("visual_highlight_2") or name.endswith("visual_highlight_1"))
+
+    def test_parse_viral_score_from_highlight_name(self):
+        self.assertEqual(parse_viral_score("87_000_Visual_highlight_1.mp4"), 87)
+        self.assertEqual(parse_viral_score("b04ce74b52e44d09a36851c9b050c9cf_81_001_Visual_highlight_2.mp4"), 81)
+        self.assertEqual(parse_viral_score("plain.mp4"), 0)
+
+    def test_select_clips_prefers_higher_score_under_target(self):
+        clips = [{"path": f"c{score}", "score": score, "duration": 10} for score in range(99, 87, -1)]
+        selected, total = select_clips_for_duration(clips, 60)
+        self.assertEqual(len(selected), 6)
+        self.assertEqual(total, 60)
+        self.assertEqual([clip["score"] for clip in selected], [99, 98, 97, 96, 95, 94])
+
+    def test_select_skips_clip_that_would_exceed(self):
+        clips = [
+            {"path": "a", "score": 90, "duration": 40},
+            {"path": "b", "score": 80, "duration": 25},
+            {"path": "c", "score": 70, "duration": 20},
+        ]
+        selected, total = select_clips_for_duration(clips, 60)
+        self.assertEqual([clip["path"] for clip in selected], ["a", "c"])
+        self.assertEqual(total, 60)
+
+    def test_select_empty_when_all_too_long(self):
+        selected, total = select_clips_for_duration([{"path": "a", "score": 99, "duration": 90}], 60)
+        self.assertEqual(selected, [])
+        self.assertEqual(total, 0)
+
+    def test_pack_uses_filename_scores(self):
+        paths = [
+            Path("uploads/uuid_87_000_Visual_highlight_1.mp4"),
+            Path("uploads/uuid_40_001_Visual_highlight_2.mp4"),
+            Path("uploads/uuid_81_002_Visual_highlight_3.mp4"),
+        ]
+        with patch("app.probe_local_clip_duration", return_value=10):
+            picked, total = pack_local_files_for_target(paths, 20)
+        self.assertEqual(total, 20)
+        self.assertTrue(str(picked[0]).endswith("87_000_Visual_highlight_1.mp4"))
+        self.assertTrue(str(picked[1]).endswith("81_002_Visual_highlight_3.mp4"))
+
+    def test_resolved_local_files_accepts_category_relative_path(self):
+        folder = UPLOAD_DIR / "dogs_sep12"
+        folder.mkdir(exist_ok=True)
+        path = folder / "87_000_Visual_highlight_1.mp4"
+        path.write_bytes(b"0" * 80)
+        self.addCleanup(lambda: path.exists() and path.unlink())
+        self.addCleanup(lambda: folder.exists() and not any(folder.iterdir()) and folder.rmdir())
+        request = ScrapeRequest(
+            source="local",
+            mode="single",
+            auto_video=False,
+            local_files=["dogs_sep12/87_000_Visual_highlight_1.mp4"],
+        )
+        resolved = resolved_local_files(request)
+        self.assertEqual(Path(resolved[0]).name, "87_000_Visual_highlight_1.mp4")
+        self.assertEqual(Path(resolved[0]).parent.name, "dogs_sep12")
+
+    def test_upload_material_query_category_writes_to_folder(self):
+        from fastapi.testclient import TestClient
+        client = TestClient(fastapi_app)
+        folder = UPLOAD_DIR / "querycat_test"
+        response = client.post(
+            "/api/upload/material?category=querycat_test",
+            files={"file": ("clip.mp4", b"0" * 80, "video/mp4")},
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["path"], "querycat_test/clip.mp4")
+        stored = UPLOAD_DIR / data["path"]
+        self.addCleanup(lambda: stored.exists() and stored.unlink())
+        self.addCleanup(lambda: folder.exists() and not any(folder.iterdir()) and folder.rmdir())
+        self.assertTrue(stored.is_file())
+        self.assertEqual(stored.name, "clip.mp4")
+        self.assertEqual(stored.parent.name, "querycat_test")
 
 
 class PathSafetyAndMediaTests(unittest.TestCase):

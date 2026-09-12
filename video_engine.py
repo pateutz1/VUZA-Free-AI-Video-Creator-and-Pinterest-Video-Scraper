@@ -640,14 +640,20 @@ class VideoEngine:
             sentence = item["sentence"]
             keyword = item["keyword"]
             audio_path = str(self.temp_dir / f"speech_{i}.mp3")
+            keep_full = bool(settings and getattr(settings, "keep_source_duration", False))
+            voice_name = (getattr(settings, "voice", None) or "none").strip().lower()
+            skip_tts = keep_full and voice_name == "none"
 
-            if not os.path.exists(audio_path) or os.path.getsize(audio_path) <= 0:
-                raise RuntimeError(f"Missing TTS for scene {i + 1}: {audio_path}")
-
-            # Create Audio Clip
-            audio_clip = AudioFileClip(audio_path)
-            speech_duration = max(float(audio_clip.duration), 0.8)
-            duration = speech_duration
+            if skip_tts:
+                audio_clip = None
+                speech_duration = 0.0
+                duration = 0.8
+            else:
+                if not os.path.exists(audio_path) or os.path.getsize(audio_path) <= 0:
+                    raise RuntimeError(f"Missing TTS for scene {i + 1}: {audio_path}")
+                audio_clip = AudioFileClip(audio_path)
+                speech_duration = max(float(audio_clip.duration), 0.8)
+                duration = speech_duration
 
             explicit_files = [
                 str(Path(f)) for f in item.get("_files", [])
@@ -688,6 +694,7 @@ class VideoEngine:
                 preferred_files = preferred_files[:max(1, assets_cap)]
             segment_seconds = getattr(settings, "clip_duration", None) or (4 if use_video_slots else 3)
             segment_seconds = max(2, min(12, float(segment_seconds)))
+            keep_full = bool(settings and getattr(settings, "keep_source_duration", False))
 
             ratio = settings.ratio if settings else "9:16"
             w, h = 1080, 1920
@@ -751,7 +758,11 @@ class VideoEngine:
                 preferred_pool = preferred_files
 
             num_segments = 1
-            if video_mode:
+            if video_mode and keep_full:
+                num_segments = len(preferred_pool)
+                segment_duration = 0
+                visual_target = 0
+            elif video_mode:
                 num_segments, segment_duration, visual_target = scene_visual_plan(
                     speech_duration, len(preferred_pool), segment_seconds
                 )
@@ -766,7 +777,15 @@ class VideoEngine:
                 visual_target = duration
             parts = []
             used = []
-            if video_mode:
+            if video_mode and keep_full:
+                for file_path in preferred_pool:
+                    part = build_visual_clip(file_path, 1e9, allow_loop=False)
+                    if part is None:
+                        continue
+                    parts.append(part)
+                    used.append(file_path)
+                visual_target = sum(float(p.duration or 0) for p in parts)
+            elif video_mode:
                 source_offsets = {source_key(path): 0.0 for path in preferred_pool}
                 covered = 0.0
                 for segment_index in range(num_segments):
@@ -829,12 +848,13 @@ class VideoEngine:
                     key = source_key(file_path)
                     used_source_keys.append(key)
                     used_source_set.add(key)
-                if speech_duration > scene_duration + 0.05:
+                if audio_clip is not None and speech_duration > scene_duration + 0.05:
                     raise RuntimeError(
                         f"Scene {i + 1} visual coverage {scene_duration:.2f}s is shorter than "
                         f"narration {speech_duration:.2f}s"
                     )
-                audio_clip = pad_audio_to(audio_clip, scene_duration)
+                if audio_clip is not None:
+                    audio_clip = pad_audio_to(audio_clip, scene_duration)
                 duration = scene_duration
 
             try:
@@ -878,7 +898,8 @@ class VideoEngine:
             except Exception as e:
                 print(f"Post-transition resize error: {e}")
 
-            visual_clip = visual_clip.with_audio(audio_clip)
+            if audio_clip is not None:
+                visual_clip = visual_clip.with_audio(audio_clip)
 
             # Add Subtitles
             if settings and settings.subtitles:

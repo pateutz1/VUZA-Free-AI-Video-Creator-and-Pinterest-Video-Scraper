@@ -255,10 +255,12 @@
                             <input type="text" id="query" placeholder="Search stock: dark corridor, rain at night, empty hallway"
                             autocomplete="off">
                     </div>
-                    <div class="url-scraper">
-                        <label for="local-files"><i class="fas fa-folder-open"></i> Local uploads (optional)</label>
+                    <div id="local-library" class="url-scraper hidden">
+                        <label for="local-files"><i class="fas fa-folder-open"></i> Upload clips</label>
                         <input type="file" id="local-files" multiple accept="image/*,video/mp4,video/webm,video/quicktime">
-                        <p class="settings-note">Used when source is Local. Files stay in the uploads folder.</p>
+                        <p id="local-batch-label" class="settings-note"></p>
+                        <label for="target-duration">Video length (sec)</label>
+                        <input type="number" id="target-duration" class="input" min="5" max="600" step="1" placeholder="e.g. 60">
                     </div>
                 </div>
 
@@ -759,7 +761,7 @@
     </div> <!-- end page-layout -->
 
     <div id="toast" class="toast hidden"></div>
-    <script src="/static/script.js?v=9.2"></script>
+    <script src="/static/script.js?v=9.9"></script>
 </body>
 
 </html>

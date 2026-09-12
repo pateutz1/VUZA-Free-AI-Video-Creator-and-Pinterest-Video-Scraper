@@ -8,7 +8,8 @@ import random
 import sys
 import time
 import uuid
-from fastapi import FastAPI, HTTPException, BackgroundTasks, File, Form, UploadFile
+from datetime import datetime
+from fastapi import FastAPI, HTTPException, BackgroundTasks, File, Form, Query, UploadFile
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
@@ -144,6 +145,8 @@ class ScrapeRequest(BaseModel):
     yt_upload: bool = False
     publish_confirmed: bool = False
     local_files: Optional[List[str]] = None
+    local_category: Optional[str] = None
+    target_duration: Optional[int] = None
     api_keys: Optional[ApiKeys] = None
     keywords: Optional[List[str]] = None
     provider_fallback: bool = False
@@ -203,7 +206,12 @@ VALID_MEDIA_TYPES = {"photo", "video"}
 VALID_MODES = {"single", "script"}
 VALID_TRANSITIONS = {"none", "fade", "zoom_in", "zoom_out", "slide"}
 ALLOWED_UPLOAD_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".m4v", ".webm"}
+ALLOWED_VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm"}
 ALLOWED_MUSIC_SUFFIXES = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg"}
+UNCATEGORIZED_CATEGORY = "uncategorized"
+LOCAL_TARGET_MIN = 5
+LOCAL_TARGET_MAX = 600
+_VIRAL_SCORE_RE = re.compile(r"(?:^|_)(\d{1,3})_\d{3}_")
 MUSIC_SOURCES = ("none", "random", "custom", "coverr", "mixkit", "sonilo", "auto-fallback")
 
 # ── Routes ──
@@ -681,17 +689,22 @@ async def scrape_url_endpoint(request: ScrapeUrlRequest):
     return {"script": script}
 
 @app.post("/api/upload/material")
-async def upload_material(file: UploadFile = File(...)):
+async def upload_material(
+    file: UploadFile = File(...),
+    category: str = Query(default=UNCATEGORIZED_CATEGORY),
+):
     filename = sanitize_upload_filename(file.filename or "upload.bin")
     suffix = Path(filename).suffix.lower()
     if suffix not in ALLOWED_UPLOAD_SUFFIXES:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {suffix or 'unknown'}.")
-    dest = UPLOAD_DIR / f"{uuid.uuid4().hex}_{filename}"
+    dest_dir, rel = local_category_dest(category)
+    dest = unique_dest_path(dest_dir, filename)
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
     dest.write_bytes(content)
-    return {"path": dest.name, "url": "/uploads/" + dest.name}
+    stored = f"{rel}/{dest.name}" if rel else dest.name
+    return {"path": stored, "url": "/uploads/" + stored, "category": rel or UNCATEGORIZED_CATEGORY}
 
 @app.post("/api/upload/music")
 async def upload_music(file: UploadFile = File(...)):
@@ -706,6 +719,48 @@ async def upload_music(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Uploaded music file is empty.")
     dest.write_bytes(content)
     return {"path": dest.name, "name": filename}
+
+@app.get("/api/local/categories")
+def list_local_categories():
+    return {"categories": local_category_names()}
+
+class CategoryCreateRequest(BaseModel):
+    name: str = ""
+    names: Optional[List[str]] = None
+
+@app.post("/api/local/categories")
+def create_local_category(request: CategoryCreateRequest):
+    name = sanitize_local_category(request.name)
+    if name == UNCATEGORIZED_CATEGORY:
+        raise HTTPException(status_code=400, detail="Choose a category name.")
+    (UPLOAD_DIR / name).mkdir(parents=True, exist_ok=True)
+    return {"name": name}
+
+@app.post("/api/local/categories/auto")
+def create_auto_local_category(request: CategoryCreateRequest):
+    name = auto_local_category_name(request.names or [])
+    (UPLOAD_DIR / name).mkdir(parents=True, exist_ok=True)
+    return {"name": name}
+
+@app.get("/api/local/clips")
+def list_local_clips(category: str = UNCATEGORIZED_CATEGORY):
+    category = sanitize_local_category(category)
+    folder = UPLOAD_DIR if category == UNCATEGORIZED_CATEGORY else UPLOAD_DIR / category
+    clips = []
+    if folder.exists():
+        for path in sorted(folder.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in ALLOWED_UPLOAD_SUFFIXES:
+                continue
+            rel = path.name if category == UNCATEGORIZED_CATEGORY else f"{category}/{path.name}"
+            clips.append({
+                "path": rel,
+                "name": path.name,
+                "url": "/uploads/" + rel.replace("\\", "/"),
+                "score": parse_viral_score(path.name),
+                "duration": probe_local_clip_duration(path),
+            })
+    clips.sort(key=lambda item: (-item["score"], item["name"]))
+    return {"category": category, "clips": clips}
 
 @app.post("/api/tts/preview")
 async def tts_preview(request: VoicePreviewRequest):
@@ -756,6 +811,120 @@ def sanitize_upload_filename(filename):
     name = Path(filename or "upload.bin").name
     name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
     return name[:80] or "upload.bin"
+
+def unique_dest_path(dest_dir, filename):
+    dest = Path(dest_dir) / filename
+    if not dest.exists():
+        return dest
+    stem = dest.stem
+    suffix = dest.suffix
+    index = 2
+    while True:
+        candidate = dest.with_name(f"{stem}_{index}{suffix}")
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+def sanitize_local_category(name):
+    raw = (name or "").strip().lower()
+    if not raw or raw == UNCATEGORIZED_CATEGORY:
+        return UNCATEGORIZED_CATEGORY
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", raw)[:48]
+    return cleaned or UNCATEGORIZED_CATEGORY
+
+def category_slug_from_filename(filename):
+    stem = Path(filename or "clips").name
+    stem = Path(stem).stem
+    stem = re.sub(r"^[0-9a-f]{32}_", "", stem, flags=re.I)
+    stem = re.sub(r"^\d{1,3}_\d{3}_", "", stem)
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", stem).strip("._-")
+    return (cleaned[:24] or "clips").lower()
+
+def auto_local_category_name(filenames, when=None):
+    stamp = (when or datetime.now()).strftime("%d%m%Y%H%M")
+    names = [name for name in (filenames or []) if (name or "").strip()]
+    source = random.choice(names) if names else "clips"
+    return f"{stamp}_{category_slug_from_filename(source)}"
+
+def local_category_dest(category):
+    name = sanitize_local_category(category)
+    if name == UNCATEGORIZED_CATEGORY:
+        return UPLOAD_DIR, ""
+    folder = UPLOAD_DIR / name
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder, name
+
+_AUTO_CATEGORY_RE = re.compile(r"^\d{12}_[A-Za-z0-9._-]+$")
+
+def local_category_names():
+    if not UPLOAD_DIR.exists():
+        return []
+    return sorted(
+        child.name
+        for child in UPLOAD_DIR.iterdir()
+        if child.is_dir() and _AUTO_CATEGORY_RE.match(child.name)
+    )
+
+def local_upload_relpath(name):
+    text = (name or "").strip().replace("\\", "/")
+    parts = [part for part in text.split("/") if part and part not in (".", "..")]
+    if not parts:
+        raise ValueError("empty path is not allowed")
+    if len(parts) == 1:
+        return Path(parts[0]).name
+    if len(parts) == 2:
+        return f"{sanitize_local_category(parts[0])}/{Path(parts[1]).name}"
+    raise ValueError("path is outside the allowed directory")
+
+def parse_viral_score(filename):
+    match = _VIRAL_SCORE_RE.search(Path(filename or "").name)
+    if not match:
+        return 0
+    score = int(match.group(1))
+    return score if 0 <= score <= 100 else 0
+
+def probe_local_clip_duration(path):
+    path = Path(path)
+    if path.suffix.lower() not in ALLOWED_VIDEO_SUFFIXES:
+        return 0.0
+    try:
+        from moviepy import VideoFileClip
+        clip = VideoFileClip(str(path), audio=False)
+        try:
+            return max(0.0, float(clip.duration or 0))
+        finally:
+            clip.close()
+    except Exception:
+        return 0.0
+
+def select_clips_for_duration(clips, target):
+    limit = float(target or 0)
+    ranked = sorted(
+        clips or [],
+        key=lambda item: (-int(item.get("score") or 0), -float(item.get("duration") or 0), str(item.get("path") or "")),
+    )
+    selected = []
+    total = 0.0
+    for clip in ranked:
+        duration = float(clip.get("duration") or 0)
+        if duration <= 0:
+            continue
+        if total + duration <= limit + 1e-6:
+            selected.append(clip)
+            total += duration
+    return selected, total
+
+def pack_local_files_for_target(paths, target):
+    clips = []
+    for path in paths or []:
+        item = Path(path)
+        clips.append({
+            "path": str(item),
+            "score": parse_viral_score(item.name),
+            "duration": probe_local_clip_duration(item),
+        })
+    selected, total = select_clips_for_duration(clips, target)
+    return [clip["path"] for clip in selected], total
 
 def make_scraper(src, output_dir, api_keys=None):
     keys = api_keys or ApiKeys()
@@ -815,6 +984,14 @@ def validate_scrape_request_options(request):
     if request.source == "local":
         if not resolved_local_files(request):
             raise RuntimeError("Local source requires at least one uploaded media file.")
+        if request.target_duration is not None:
+            try:
+                target = int(request.target_duration)
+            except (TypeError, ValueError):
+                raise RuntimeError(f"Video length must be between {LOCAL_TARGET_MIN} and {LOCAL_TARGET_MAX} seconds.")
+            if target < LOCAL_TARGET_MIN or target > LOCAL_TARGET_MAX:
+                raise RuntimeError(f"Video length must be between {LOCAL_TARGET_MIN} and {LOCAL_TARGET_MAX} seconds.")
+            request.target_duration = target
     elif request.mode != "script" and not (request.query or "").strip():
         raise RuntimeError("Single search requires a topic query.")
     if request.mode == "script":
@@ -822,7 +999,7 @@ def validate_scrape_request_options(request):
             raise RuntimeError("Script mode requires at least one narration script.")
     if request.auto_video:
         settings = request.video_settings or VideoSettings()
-        if (settings.voice or "").strip().lower() == "none":
+        if (settings.voice or "").strip().lower() == "none" and request.source != "local":
             raise RuntimeError("Auto video requires a TTS voice. Turn off auto video for asset-only mode.")
         if (settings.transition or "fade") not in VALID_TRANSITIONS:
             raise RuntimeError("Invalid clip transition. Choose none, fade, zoom_in, zoom_out, or slide.")
@@ -930,9 +1107,9 @@ def resolved_local_files(request):
     resolved = []
     for name in names:
         try:
-            resolved.append(resolve_path_within_directory(str(UPLOAD_DIR), Path(name).name))
+            resolved.append(resolve_path_within_directory(str(UPLOAD_DIR), local_upload_relpath(name)))
         except ValueError:
-            raise RuntimeError(f"Local upload is invalid or outside the uploads folder: {Path(name).name}.")
+            raise RuntimeError(f"Local upload is invalid or outside the uploads folder: {name}.")
     return resolved
 
 _UNSET = object()
@@ -2154,19 +2331,21 @@ async def run_video_assembly(
         getattr(api_keys, "azure_speech_region", "") or "",
     )
     voice = settings.voice if settings.voice != "none" else None
-    if not voice:
+    skip_tts = bool(getattr(settings, "keep_source_duration", False)) and not voice
+    if not voice and not skip_tts:
         raise RuntimeError("Auto video requires a TTS voice; voice=none cannot produce one narration file per scene.")
 
-    sem = asyncio.Semaphore(3)
+    if not skip_tts:
+        sem = asyncio.Semaphore(3)
 
-    async def sem_voiceover(text, i):
-        async with sem:
-            return await engine.generate_voiceover(
-                text, i, voice=voice, language=settings.language,
-                voice_rate=settings.voice_rate, voice_volume=settings.voice_volume,
-            )
-    await asyncio.gather(*[sem_voiceover(item["sentence"], idx) for idx, item in enumerate(keyword_data)])
-    validate_tts_files(engine, len(keyword_data))
+        async def sem_voiceover(text, i):
+            async with sem:
+                return await engine.generate_voiceover(
+                    text, i, voice=voice, language=settings.language,
+                    voice_rate=settings.voice_rate, voice_volume=settings.voice_volume,
+                )
+        await asyncio.gather(*[sem_voiceover(item["sentence"], idx) for idx, item in enumerate(keyword_data)])
+        validate_tts_files(engine, len(keyword_data))
 
     settings.vibe = vibe
     try:
@@ -2394,6 +2573,32 @@ async def run_scrape(request: ScrapeRequest):
                     rel_paths.append(str(path))
             scraping_status["results"] = [{"keyword": query or "local", "files": rel_paths}]
             scraping_status["message"] = "Done"
+            if request.auto_video:
+                file_paths = [str(path) for path in valid_paths]
+                if request.target_duration:
+                    file_paths, packed_total = pack_local_files_for_target(file_paths, request.target_duration)
+                    if not file_paths:
+                        raise RuntimeError(
+                            f"No checked clip is {request.target_duration}s or shorter. "
+                            "Pick a longer target, or shorter clips."
+                        )
+                    print(f"  Local pack: {len(file_paths)} clip(s), {packed_total:.1f}s / {request.target_duration}s")
+                keyword_data = [{
+                    "sentence": (query or "").strip() or "Local clips",
+                    "keyword": query or "local",
+                    "_files": file_paths,
+                }]
+                assets = max(count, len(file_paths))
+                try:
+                    settings.assets_per_scene = assets
+                    settings.keep_source_duration = True
+                except Exception:
+                    object.__setattr__(settings, "assets_per_scene", assets)
+                    object.__setattr__(settings, "keep_source_duration", True)
+                await run_video_assembly(
+                    keyword_data, project_path, project_name, media_type, settings, api_keys,
+                    request.vibe, yt_upload=request.yt_upload, publish_confirmed=request.publish_confirmed,
+                )
 
         set_status("success", progress=100)
     except Exception as e:

@@ -717,7 +717,51 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         updateProviderFallbackVisibility();
         updatePrimaryButtonText();
+        updateLocalLibraryVisibility();
     }
+
+    function getLocalCategory() {
+        return localStorage.getItem('vuza_local_category') || '';
+    }
+
+    function rememberLocalCategory(name) {
+        if (name) localStorage.setItem('vuza_local_category', name);
+        const label = document.getElementById('local-batch-label');
+        if (label) label.textContent = name ? `This batch: ${name}` : '';
+    }
+
+    function updateLocalLibraryVisibility() {
+        const panel = document.getElementById('local-library');
+        if (!panel) return;
+        const show = getSelectedSource() === 'local';
+        panel.classList.toggle('hidden', !show);
+        if (show) {
+            rememberLocalCategory(getLocalCategory());
+            loadLocalClips();
+        }
+    }
+
+    let lastBatchFiles = [];
+
+    async function loadLocalClips() {
+        const category = getLocalCategory();
+        lastBatchFiles = [];
+        if (!category) return;
+        try {
+            const response = await fetch(`/api/local/clips?category=${encodeURIComponent(category)}`);
+            if (!response.ok) return;
+            const data = await response.json();
+            lastBatchFiles = (data.clips || []).map((clip) => clip.path);
+        } catch (error) {
+            lastBatchFiles = [];
+        }
+    }
+
+    document.getElementById('local-files')?.addEventListener('change', async () => {
+        if (getSelectedSource() !== 'local') return;
+        const uploaded = await uploadNewLocalFiles();
+        if (uploaded.length) await loadLocalClips();
+    });
 
     document.getElementById('source-select')?.addEventListener('change', onSourceOrAutoVideoChange);
     document.querySelectorAll('input[name="auto_video"]').forEach(input => {
@@ -1106,21 +1150,40 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    async function uploadLocalFiles() {
+    async function uploadNewLocalFiles() {
         const input = document.getElementById('local-files');
         if (!input || !input.files || input.files.length === 0) return [];
+        const files = Array.from(input.files);
+        const created = await fetch('/api/local/categories/auto', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ names: files.map((file) => file.name) }),
+        });
+        if (!created.ok) {
+            throw new Error(await readErrorMessage(created, 'Could not create category'));
+        }
+        const category = (await created.json()).name;
+        rememberLocalCategory(category);
         const names = [];
-        for (const file of input.files) {
+        for (const file of files) {
             const body = new FormData();
             body.append('file', file);
-            const response = await fetch('/api/upload/material', { method: 'POST', body });
+            const response = await fetch(`/api/upload/material?category=${encodeURIComponent(category)}`, { method: 'POST', body });
             if (!response.ok) {
                 throw new Error(await readErrorMessage(response, 'Upload failed'));
             }
             const data = await response.json();
             names.push(data.path);
         }
+        input.value = '';
+        rememberLocalCategory(category);
         return names;
+    }
+
+    async function uploadLocalFiles() {
+        await uploadNewLocalFiles();
+        if (!lastBatchFiles.length) await loadLocalClips();
+        return lastBatchFiles.slice();
     }
 
     scrapeBtn.addEventListener('click', async () => {
@@ -1164,7 +1227,7 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        if (autoVideo && voice === 'none') {
+        if (autoVideo && voice === 'none' && source !== 'local') {
             showToast('Auto video needs a TTS voice. Turn off auto video for asset-only mode.', 'error');
             return;
         }
@@ -1226,6 +1289,10 @@ document.addEventListener('DOMContentLoaded', () => {
                     media_type: mediaType, count,
                     mode: currentMode, vibe,
                     provider_fallback: providerFallback,
+                    local_category: source === 'local' ? getLocalCategory() : '',
+                    target_duration: source === 'local' && document.getElementById('target-duration')?.value
+                        ? numVal('target-duration', null)
+                        : null,
                     local_files: localFiles,
                     video_settings: {
                         ratio, voice, subtitles, language,

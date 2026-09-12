@@ -2430,5 +2430,5 @@ async def start_scrape(request: ScrapeRequest, background_tasks: BackgroundTasks
     return {"message": "Started", "task_id": task_id}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
 

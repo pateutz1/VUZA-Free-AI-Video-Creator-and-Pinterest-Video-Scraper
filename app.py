@@ -846,6 +846,16 @@ def auto_local_category_name(filenames, when=None):
     source = random.choice(names) if names else "clips"
     return f"{stamp}_{category_slug_from_filename(source)}"
 
+def local_output_project_name(request, local_files=None):
+    name = sanitize_local_category(getattr(request, "local_category", None) or "")
+    if name != UNCATEGORIZED_CATEGORY:
+        return name
+    for path in local_files or []:
+        parent = Path(path).parent.name
+        if parent and parent != UPLOAD_DIR.name and _AUTO_CATEGORY_RE.match(parent):
+            return parent
+    return "local"
+
 def local_category_dest(category):
     name = sanitize_local_category(category)
     if name == UNCATEGORIZED_CATEGORY:
@@ -2321,8 +2331,13 @@ async def run_video_assembly(
     Shared by the single-pass flow and the post-review /api/assemble phase."""
     label = f" {progress_label}" if progress_label else ""
     validate_scene_images(keyword_data, project_path)
-    scraping_status["message"] = f"Generating voiceover{label}..."
-    engine = load_video_engine()(output_dir=project_path.parent)
+    keep_full = bool(getattr(settings, "keep_source_duration", False))
+    voice = settings.voice if settings.voice != "none" else None
+    skip_tts = keep_full and not voice
+    if not skip_tts:
+        scraping_status["message"] = f"Generating voiceover{label}..."
+    output_root = project_path if keep_full else project_path.parent
+    engine = load_video_engine()(output_dir=output_root, create_temp=not skip_tts)
     if api_keys.eleven_key:
         engine.set_eleven_key(api_keys.eleven_key)
     engine.tts_server = getattr(settings, "tts_server", "azure-tts-v1") or "azure-tts-v1"
@@ -2330,8 +2345,6 @@ async def run_video_assembly(
         getattr(api_keys, "azure_speech_key", "") or "",
         getattr(api_keys, "azure_speech_region", "") or "",
     )
-    voice = settings.voice if settings.voice != "none" else None
-    skip_tts = bool(getattr(settings, "keep_source_duration", False)) and not voice
     if not voice and not skip_tts:
         raise RuntimeError("Auto video requires a TTS voice; voice=none cannot produce one narration file per scene.")
 
@@ -2552,9 +2565,13 @@ async def run_scrape(request: ScrapeRequest):
                     scraping_status["message"] = f"Assets saved to {project_name}/ (video assembly off)"
         else:
             query = request.query
-            project_name = re.sub(r'[^\w\-]', '_', query or "local").lower()
-            project_path = DOWNLOAD_DIR / project_name / media_type
-            project_path.mkdir(parents=True, exist_ok=True)
+            if source == "local":
+                project_name = local_output_project_name(request, local_files)
+                project_path = DOWNLOAD_DIR / project_name
+            else:
+                project_name = re.sub(r'[^\w\-]', '_', query or "local").lower()
+                project_path = DOWNLOAD_DIR / project_name / media_type
+                project_path.mkdir(parents=True, exist_ok=True)
 
             scraping_status["message"] = f"Searching “{query or 'local uploads'}”..."
             res_files = await universal_search(

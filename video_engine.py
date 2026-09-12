@@ -421,11 +421,12 @@ class SubtitleHelper:
         return joined
 
 class VideoEngine:
-    def __init__(self, output_dir):
+    def __init__(self, output_dir, create_temp=True):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir = self.output_dir / "temp"
-        self.temp_dir.mkdir(exist_ok=True)
+        if create_temp:
+            self.temp_dir.mkdir(exist_ok=True)
         self.eleven_key = None
         self.azure_speech_key = None
         self.azure_speech_region = None

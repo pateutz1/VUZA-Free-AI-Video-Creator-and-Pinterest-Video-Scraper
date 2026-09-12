@@ -16,6 +16,7 @@ from app import (
     ALLOWED_UPLOAD_SUFFIXES,
     ApiKeys,
     auto_local_category_name,
+    local_output_project_name,
     MIXKIT_MUSIC_DOWNLOAD_DIR,
     MIXKIT_MUSIC_MOODS,
     ScrapeRequest,
@@ -1104,6 +1105,19 @@ class LocalClipSelectTests(unittest.TestCase):
         )
         self.assertTrue(name.startswith("120920261001_"))
         self.assertTrue(name.endswith("visual_highlight_2") or name.endswith("visual_highlight_1"))
+
+    def test_local_output_project_name_uses_upload_folder(self):
+        request = ScrapeRequest(
+            source="local",
+            mode="single",
+            auto_video=False,
+            local_category="120920261017_animals_are_the_cutest_i",
+            local_files=["clip.mp4"],
+        )
+        self.assertEqual(
+            local_output_project_name(request),
+            "120920261017_animals_are_the_cutest_i",
+        )
 
     def test_parse_viral_score_from_highlight_name(self):
         self.assertEqual(parse_viral_score("87_000_Visual_highlight_1.mp4"), 87)

@@ -1888,3 +1888,13 @@ body {
     opacity: 0;
     overflow: hidden;
 }
+
+.leftover-dropdown {
+    z-index: 40;
+}
+
+.leftover-dropdown .themed-dropdown-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}

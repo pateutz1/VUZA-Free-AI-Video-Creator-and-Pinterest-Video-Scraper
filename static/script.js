@@ -385,7 +385,7 @@ document.addEventListener('DOMContentLoaded', () => {
         'yt-client-id', 'yt-client-secret', 'eleven-key',
         'azure-speech-key', 'azure-speech-region',
         'query', 'url-input', 'topic-input', 'keywords-input', 'script',
-        'local-files', 'music-upload', 'ai-title', 'ai-desc', 'ai-hashtags', 'ai-thumb-prompt',
+        'local-files', 'leftover-category', 'music-upload', 'ai-title', 'ai-desc', 'ai-hashtags', 'ai-thumb-prompt',
     ]);
     const RANGE_LABELS = {
         count: ['count-val', (v) => v],
@@ -739,7 +739,37 @@ document.addEventListener('DOMContentLoaded', () => {
         const show = getSelectedSource() === 'local';
         if (panel) panel.classList.toggle('hidden', !show);
         if (stockQuery) stockQuery.classList.toggle('hidden', show);
-        if (show) loadLocalClips();
+        if (show) {
+            loadLeftoverCategories();
+            loadLocalClips();
+        }
+    }
+
+    async function loadLeftoverCategories() {
+        const select = document.getElementById('leftover-category');
+        if (!select) return;
+        const current = select.value;
+        try {
+            const response = await fetch('/api/local/categories');
+            const data = response.ok ? await response.json() : { categories: [] };
+            const categories = data.categories || [];
+            select.innerHTML = '<option value="">None — new upload only</option>' +
+                categories.map((name) => `<option value="${name}">${name}</option>`).join('');
+            if (categories.includes(current)) select.value = current;
+            rebuildThemedSelect(select);
+        } catch (error) {
+            select.innerHTML = '<option value="">None — new upload only</option>';
+            rebuildThemedSelect(select);
+        }
+    }
+
+    async function leftoverClipPaths() {
+        const category = document.getElementById('leftover-category')?.value || '';
+        if (!category) return [];
+        const response = await fetch(`/api/local/clips?category=${encodeURIComponent(category)}`);
+        if (!response.ok) return [];
+        const data = await response.json();
+        return (data.clips || []).map((clip) => clip.path);
     }
 
     let lastBatchFiles = [];
@@ -1214,7 +1244,8 @@ document.addEventListener('DOMContentLoaded', () => {
     async function uploadLocalFiles() {
         await uploadNewLocalFiles();
         if (!lastBatchFiles.length) await loadLocalClips();
-        return lastBatchFiles.slice();
+        const leftovers = await leftoverClipPaths();
+        return [...new Set(leftovers.concat(lastBatchFiles))];
     }
 
     scrapeBtn.addEventListener('click', async () => {
@@ -1291,7 +1322,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (source === 'local') {
                 localFiles = await uploadLocalFiles();
                 if (localFiles.length === 0) {
-                    showToast('Choose at least one local file, or pick another source.', 'error');
+                    showToast('Upload clips or pick a leftover folder.', 'error');
                     setLoading(false);
                     return;
                 }
@@ -1320,7 +1351,9 @@ document.addEventListener('DOMContentLoaded', () => {
                     media_type: mediaType, count,
                     mode: currentMode, vibe,
                     provider_fallback: providerFallback,
-                    local_category: source === 'local' ? getLocalCategory() : '',
+                    local_category: source === 'local'
+                        ? (getLocalCategory() || document.getElementById('leftover-category')?.value || '')
+                        : '',
                     target_duration: source === 'local' && document.getElementById('target-duration')?.value
                         ? numVal('target-duration', null)
                         : null,
@@ -1422,6 +1455,9 @@ document.addEventListener('DOMContentLoaded', () => {
                     showToast(status.error || status.message || 'Generation failed', 'error');
                 } else {
                     showToast('Done', 'success');
+                    currentLocalCategory = '';
+                    lastBatchFiles = [];
+                    loadLeftoverCategories();
                 }
             }
         } catch (err) {

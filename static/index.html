@@ -9,7 +9,7 @@
         content="VUZA free AI video creator: turn a topic or script into stock footage, voiceover, subtitles, and a 9:16 short.">
     <meta name="keywords"
         content="VUZA, free ai video creator, faceless video generator, money printer tool, pinterest video scraper, pinterest scraper, free pictory ai alternative, free invideo alternative, moneyprinter turbo, pexels video downloader, pixabay scraper, edge tts, ai voiceover, auto subtitles, open source video tool, python video creator, script to video, tiktok video maker, youtube shorts creator, instagram reels, ai automation, free video generation, content creation tool">
-    <link rel="stylesheet" href="/static/style.css?v=5.7">
+    <link rel="stylesheet" href="/static/style.css?v=5.9">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap"
         rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
@@ -270,6 +270,18 @@
                             <input type="file" id="local-files" class="local-file-input" multiple accept="image/*,video/mp4,video/webm,video/quicktime">
                         </div>
                         <p id="local-batch-label" class="settings-note"></p>
+                        <label for="leftover-category">Leftover clips</label>
+                        <div class="source-dropdown leftover-dropdown">
+                            <select id="leftover-category" class="source-select-native" tabindex="-1" aria-hidden="true">
+                                <option value="">None — new upload only</option>
+                            </select>
+                            <button type="button" class="source-dropdown-toggle" aria-expanded="false" aria-haspopup="listbox">
+                                <span class="themed-dropdown-label">None — new upload only</span>
+                                <i class="fas fa-chevron-down source-dropdown-caret"></i>
+                            </button>
+                            <ul class="source-dropdown-menu" role="listbox" hidden></ul>
+                        </div>
+                        <p class="settings-note">Used clips move to downloads. Leftovers stay for the next video.</p>
                         <label for="target-duration">Finished video length</label>
                         <div class="input-wrapper">
                             <i class="fas fa-clock input-icon"></i>
@@ -775,7 +787,7 @@
     </div> <!-- end page-layout -->
 
     <div id="toast" class="toast hidden"></div>
-    <script src="/static/script.js?v=9.10"></script>
+    <script src="/static/script.js?v=9.12"></script>
 </body>
 
 </html>

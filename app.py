@@ -6,6 +6,7 @@ import inspect
 import json
 import random
 import sys
+import shutil
 import time
 import uuid
 from datetime import datetime
@@ -722,7 +723,7 @@ async def upload_music(file: UploadFile = File(...)):
 
 @app.get("/api/local/categories")
 def list_local_categories():
-    return {"categories": local_category_names()}
+    return {"categories": leftover_local_categories()}
 
 class CategoryCreateRequest(BaseModel):
     name: str = ""
@@ -874,6 +875,27 @@ def local_category_names():
         for child in UPLOAD_DIR.iterdir()
         if child.is_dir() and _AUTO_CATEGORY_RE.match(child.name)
     )
+
+def leftover_local_categories():
+    names = []
+    for name in local_category_names():
+        folder = UPLOAD_DIR / name
+        if any(path.is_file() and path.suffix.lower() in ALLOWED_UPLOAD_SUFFIXES for path in folder.iterdir()):
+            names.append(name)
+    return names
+
+def move_local_clips_to_project(paths, project_name):
+    dest_dir = DOWNLOAD_DIR / project_name / "video"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    moved = []
+    for raw in paths or []:
+        src = Path(raw)
+        if not src.is_file():
+            continue
+        dest = unique_dest_path(dest_dir, src.name)
+        shutil.move(str(src), str(dest))
+        moved.append(str(dest))
+    return moved
 
 def local_upload_relpath(name):
     text = (name or "").strip().replace("\\", "/")
@@ -2600,6 +2622,9 @@ async def run_scrape(request: ScrapeRequest):
                             "Pick a longer target, or shorter clips."
                         )
                     print(f"  Local pack: {len(file_paths)} clip(s), {packed_total:.1f}s / {request.target_duration}s")
+                file_paths = move_local_clips_to_project(file_paths, project_name)
+                if not file_paths:
+                    raise RuntimeError("Could not move the selected clips into the project video folder.")
                 keyword_data = [{
                     "sentence": (query or "").strip() or "Local clips",
                     "keyword": query or "local",

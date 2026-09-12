@@ -10,13 +10,17 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import BackgroundTasks, HTTPException
 
+import shutil
 from datetime import datetime
 
 from app import (
     ALLOWED_UPLOAD_SUFFIXES,
     ApiKeys,
+    DOWNLOAD_DIR,
     auto_local_category_name,
+    leftover_local_categories,
     local_output_project_name,
+    move_local_clips_to_project,
     MIXKIT_MUSIC_DOWNLOAD_DIR,
     MIXKIT_MUSIC_MOODS,
     ScrapeRequest,
@@ -1105,6 +1109,24 @@ class LocalClipSelectTests(unittest.TestCase):
         )
         self.assertTrue(name.startswith("120920261001_"))
         self.assertTrue(name.endswith("visual_highlight_2") or name.endswith("visual_highlight_1"))
+
+    def test_move_selected_clips_leaves_unused_in_uploads(self):
+        category = UPLOAD_DIR / "120920261100_keep_left"
+        category.mkdir(exist_ok=True)
+        used = category / "87_000_Visual_highlight_1.mp4"
+        left = category / "40_001_Visual_highlight_2.mp4"
+        used.write_bytes(b"0" * 80)
+        left.write_bytes(b"0" * 80)
+        dest = DOWNLOAD_DIR / "120920261100_keep_left" / "video"
+        self.addCleanup(lambda: used.exists() and used.unlink())
+        self.addCleanup(lambda: left.exists() and left.unlink())
+        self.addCleanup(lambda: category.exists() and not any(category.iterdir()) and category.rmdir())
+        moved = move_local_clips_to_project([str(used)], "120920261100_keep_left")
+        self.addCleanup(lambda: dest.exists() and shutil.rmtree(dest.parent, ignore_errors=True))
+        self.assertEqual(Path(moved[0]).parent.name, "video")
+        self.assertFalse(used.exists())
+        self.assertTrue(left.exists())
+        self.assertIn("120920261100_keep_left", leftover_local_categories())
 
     def test_local_output_project_name_uses_upload_folder(self):
         request = ScrapeRequest(

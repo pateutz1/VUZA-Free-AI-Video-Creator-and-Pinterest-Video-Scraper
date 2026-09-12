@@ -939,22 +939,43 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    function packClipsToDuration(clips, limit) {
+        const ranked = [...(clips || [])].sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0));
+        const picked = [];
+        let total = 0;
+        for (const clip of ranked) {
+            const duration = Number(clip.duration) || 0;
+            if (duration <= 0 || total + duration > limit + 1e-6) continue;
+            picked.push(clip);
+            total += duration;
+        }
+        return { picked, total };
+    }
+
+    async function leftoverFillForRemaining(excludePaths, excludeCategory, remaining) {
+        const used = new Set(excludePaths || []);
+        const candidates = (await leftoverClips('__all__')).filter((clip) => (
+            !used.has(clip.path) && (!excludeCategory || !clip.path.startsWith(`${excludeCategory}/`))
+        ));
+        return packClipsToDuration(candidates, remaining);
+    }
+
     async function maybeConfirmLocalFallback(job, target) {
         if (!target) return job;
         const primary = await durationForPaths(job.localFiles);
-        const leftoverDur = await durationForPaths(job.leftoverFiles);
-        if (primary + leftoverDur + 1e-6 >= target) return job;
-        let fill = (job.leftoverFiles || []).slice();
-        if (!fill.length) {
-            const used = new Set(job.localFiles);
-            const current = job.outputCategory || getLocalCategory();
-            fill = (await leftoverClips('__all__'))
-                .filter((clip) => !used.has(clip.path) && (!current || !clip.path.startsWith(`${current}/`)))
-                .map((clip) => clip.path);
-        }
-        const available = Math.round(primary + (fill.length ? await durationForPaths(fill) : 0));
+        if (primary + 1e-6 >= target) return { ...job, leftoverFiles: [] };
+        const current = job.outputCategory || getLocalCategory();
+        const packed = await leftoverFillForRemaining(
+            job.localFiles,
+            current,
+            Math.max(0, target - primary),
+        );
+        const fill = packed.picked.map((clip) => clip.path);
+        const mode = document.getElementById('leftover-category')?.value || '';
+        if (mode === '__all__') return { ...job, leftoverFiles: fill };
+        const available = Math.round(primary + packed.total);
         const message = fill.length
-            ? `This selection is about ${Math.round(primary)}s. Target is ${target}s. Approve to add leftover clips from other folders. If still short, generate about ${Math.max(available, Math.round(primary))}s.`
+            ? `This selection is about ${Math.round(primary)}s. Target is ${target}s. Approve to add ${fill.length} leftover clip(s) from other folders. Unused leftover clips stay in uploads. If still short, generate about ${available}s.`
             : `This selection is about ${Math.round(primary)}s. Target is ${target}s. No other leftover clips. Approve to generate a shorter video, or cancel.`;
         const ok = await confirmLocalFallback(message);
         if (!ok) return null;

@@ -2704,7 +2704,10 @@ async def run_scrape(request: ScrapeRequest):
                             f"No checked clip is {request.target_duration}s or shorter. "
                             "Pick a longer target, or shorter clips."
                         )
-                    print(f"  Local pack: {len(file_paths)} clip(s), {packed_total:.1f}s / {request.target_duration}s")
+                    print(
+                        f"  Local pack: {len(file_paths)} clip(s), {packed_total:.1f}s / {request.target_duration}s"
+                    )
+                    print("  Packed files: " + ", ".join(Path(path).name for path in file_paths))
                 elif fill_paths:
                     file_paths = file_paths + fill_paths
                 file_paths = move_local_clips_to_project(file_paths, project_name)

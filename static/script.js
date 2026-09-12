@@ -742,7 +742,51 @@ document.addEventListener('DOMContentLoaded', () => {
         if (show) {
             loadLeftoverCategories();
             loadLocalClips();
+        } else {
+            refreshLeftoverSidebar();
         }
+    }
+
+    function escapeHtml(text) {
+        return String(text)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    function leftoverClipLabel(count) {
+        const n = Number(count) || 0;
+        return n === 1 ? '1 clip' : `${n} clips`;
+    }
+
+    function formatClipDuration(seconds) {
+        const n = Number(seconds) || 0;
+        if (n < 60) return `${Math.round(n)}s`;
+        const minutes = Math.floor(n / 60);
+        const rest = Math.round(n % 60);
+        return `${minutes}:${String(rest).padStart(2, '0')}`;
+    }
+
+    function normalizeLeftoverCategories(raw) {
+        return (raw || []).map((item) => (
+            typeof item === 'string' ? { name: item, count: 0 } : item
+        )).filter((item) => item && item.name);
+    }
+
+    async function withLeftoverCounts(categories) {
+        const needCounts = categories.some((item) => !item.count);
+        if (!needCounts) return categories;
+        return Promise.all(categories.map(async (item) => {
+            if (item.count) return item;
+            try {
+                const response = await fetch(`/api/local/clips?category=${encodeURIComponent(item.name)}`);
+                const data = response.ok ? await response.json() : { clips: [] };
+                return { ...item, count: (data.clips || []).length };
+            } catch (error) {
+                return item;
+            }
+        }));
     }
 
     async function loadLeftoverCategories() {
@@ -752,15 +796,78 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             const response = await fetch('/api/local/categories');
             const data = response.ok ? await response.json() : { categories: [] };
-            const categories = data.categories || [];
+            const categories = await withLeftoverCounts(normalizeLeftoverCategories(data.categories));
+            const names = categories.map((item) => item.name);
             select.innerHTML = '<option value="">None — new upload only</option>' +
-                categories.map((name) => `<option value="${name}">${name}</option>`).join('');
-            if (categories.includes(current)) select.value = current;
+                categories.map((item) => (
+                    `<option value="${escapeHtml(item.name)}">${escapeHtml(item.name)} — ${leftoverClipLabel(item.count)}</option>`
+                )).join('');
+            select.value = names.includes(current) ? current : '';
             rebuildThemedSelect(select);
         } catch (error) {
             select.innerHTML = '<option value="">None — new upload only</option>';
             rebuildThemedSelect(select);
         }
+        await refreshLeftoverSidebar();
+    }
+
+    async function refreshLeftoverSidebar() {
+        const aside = document.getElementById('leftover-sidebar');
+        const list = document.getElementById('leftover-clip-list');
+        const title = document.getElementById('leftover-sidebar-title');
+        if (!aside || !list) return;
+        const category = document.getElementById('leftover-category')?.value || '';
+        const show = getSelectedSource() === 'local' && !!category;
+        if (!show) {
+            aside.classList.add('hidden');
+            list.innerHTML = '';
+            return;
+        }
+        if (title) title.textContent = category;
+        try {
+            const response = await fetch(`/api/local/clips?category=${encodeURIComponent(category)}`);
+            const data = response.ok ? await response.json() : { clips: [] };
+            const clips = data.clips || [];
+            if (!clips.length) {
+                aside.classList.add('hidden');
+                list.innerHTML = '';
+                return;
+            }
+            aside.classList.remove('hidden');
+            list.innerHTML = clips.map((clip) => {
+                const name = escapeHtml(clip.name || '');
+                const url = escapeHtml(clip.url || '');
+                return `<button type="button" class="leftover-clip-btn" data-url="${url}" data-name="${name}">
+                    <span class="leftover-clip-name">${name}</span>
+                    <span class="leftover-clip-meta">${formatClipDuration(clip.duration)}</span>
+                </button>`;
+            }).join('');
+        } catch (error) {
+            aside.classList.add('hidden');
+            list.innerHTML = '';
+        }
+    }
+
+    function openLeftoverPlayer(url, name) {
+        const overlay = document.getElementById('leftover-player-overlay');
+        const video = document.getElementById('leftover-player-video');
+        const title = document.getElementById('leftover-player-title');
+        if (!overlay || !video || !url) return;
+        if (title) title.textContent = name || '';
+        video.src = url;
+        overlay.classList.remove('hidden');
+        video.play().catch(() => {});
+    }
+
+    function closeLeftoverPlayer() {
+        const overlay = document.getElementById('leftover-player-overlay');
+        const video = document.getElementById('leftover-player-video');
+        if (video) {
+            video.pause();
+            video.removeAttribute('src');
+            video.load();
+        }
+        if (overlay) overlay.classList.add('hidden');
     }
 
     async function leftoverClipPaths() {
@@ -822,6 +929,22 @@ document.addEventListener('DOMContentLoaded', () => {
             input.dispatchEvent(new Event('change'));
         });
     }
+
+    document.getElementById('leftover-category')?.addEventListener('change', () => {
+        refreshLeftoverSidebar();
+    });
+    document.getElementById('leftover-clip-list')?.addEventListener('click', (event) => {
+        const btn = event.target.closest('.leftover-clip-btn');
+        if (!btn) return;
+        openLeftoverPlayer(btn.dataset.url, btn.dataset.name);
+    });
+    document.getElementById('leftover-player-close')?.addEventListener('click', closeLeftoverPlayer);
+    document.getElementById('leftover-player-overlay')?.addEventListener('click', (event) => {
+        if (event.target.id === 'leftover-player-overlay') closeLeftoverPlayer();
+    });
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') closeLeftoverPlayer();
+    });
 
     document.getElementById('source-select')?.addEventListener('change', onSourceOrAutoVideoChange);
     document.querySelectorAll('input[name="auto_video"]').forEach(input => {

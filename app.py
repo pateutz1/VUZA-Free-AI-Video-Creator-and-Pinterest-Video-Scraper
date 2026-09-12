@@ -723,7 +723,7 @@ async def upload_music(file: UploadFile = File(...)):
 
 @app.get("/api/local/categories")
 def list_local_categories():
-    return {"categories": leftover_local_categories()}
+    return {"categories": leftover_category_counts()}
 
 class CategoryCreateRequest(BaseModel):
     name: str = ""
@@ -883,6 +883,18 @@ def leftover_local_categories():
         if any(path.is_file() and path.suffix.lower() in ALLOWED_UPLOAD_SUFFIXES for path in folder.iterdir()):
             names.append(name)
     return names
+
+def leftover_category_counts():
+    items = []
+    for name in leftover_local_categories():
+        folder = UPLOAD_DIR / name
+        count = sum(
+            1
+            for path in folder.iterdir()
+            if path.is_file() and path.suffix.lower() in ALLOWED_UPLOAD_SUFFIXES
+        )
+        items.append({"name": name, "count": count})
+    return items
 
 def move_local_clips_to_project(paths, project_name):
     dest_dir = DOWNLOAD_DIR / project_name / "video"

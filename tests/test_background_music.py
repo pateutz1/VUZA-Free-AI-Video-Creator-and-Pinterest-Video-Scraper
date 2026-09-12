@@ -35,6 +35,7 @@ from app import (
     normalized_script_inputs,
     parse_viral_score,
     pack_local_files_for_target,
+    pack_local_files_priority,
     resolve_path_within_directory,
     resolved_local_files,
     select_clips_for_duration,
@@ -1128,6 +1129,18 @@ class LocalClipSelectTests(unittest.TestCase):
         self.assertTrue(left.exists())
         self.assertIn("120920261100_keep_left", leftover_local_categories())
 
+    def test_move_last_clip_deletes_empty_upload_category(self):
+        category = UPLOAD_DIR / "120920261200_empty_after"
+        category.mkdir(exist_ok=True)
+        used = category / "87_000_Visual_highlight_1.mp4"
+        used.write_bytes(b"0" * 80)
+        dest = DOWNLOAD_DIR / "120920261200_empty_after" / "video"
+        self.addCleanup(lambda: dest.exists() and shutil.rmtree(dest.parent, ignore_errors=True))
+        self.addCleanup(lambda: category.exists() and shutil.rmtree(category, ignore_errors=True))
+        move_local_clips_to_project([str(used)], "120920261200_empty_after")
+        self.assertFalse(category.exists())
+        self.assertNotIn("120920261200_empty_after", leftover_local_categories())
+
     def test_local_output_project_name_uses_upload_folder(self):
         request = ScrapeRequest(
             source="local",
@@ -1179,6 +1192,27 @@ class LocalClipSelectTests(unittest.TestCase):
         self.assertEqual(total, 20)
         self.assertTrue(str(picked[0]).endswith("87_000_Visual_highlight_1.mp4"))
         self.assertTrue(str(picked[1]).endswith("81_002_Visual_highlight_3.mp4"))
+
+    def test_pack_priority_keeps_uploads_over_higher_score_leftovers(self):
+        primary = [Path("uploads/new/40_000_parrot.mp4")]
+        fill = [Path("uploads/old/99_000_animal.mp4")]
+        with patch("app.probe_local_clip_duration", return_value=10):
+            picked, total = pack_local_files_priority(primary, fill, 10)
+        self.assertEqual(total, 10)
+        self.assertTrue(str(picked[0]).endswith("40_000_parrot.mp4"))
+        self.assertEqual(len(picked), 1)
+
+    def test_pack_priority_fills_remaining_from_leftovers(self):
+        primary = [Path("uploads/new/40_000_parrot.mp4")]
+        fill = [
+            Path("uploads/old/50_000_animal.mp4"),
+            Path("uploads/old/90_000_better.mp4"),
+        ]
+        with patch("app.probe_local_clip_duration", return_value=10):
+            picked, total = pack_local_files_priority(primary, fill, 20)
+        self.assertEqual(total, 20)
+        self.assertTrue(str(picked[0]).endswith("40_000_parrot.mp4"))
+        self.assertTrue(str(picked[1]).endswith("90_000_better.mp4"))
 
     def test_resolved_local_files_accepts_category_relative_path(self):
         folder = UPLOAD_DIR / "dogs_sep12"

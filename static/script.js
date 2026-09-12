@@ -799,13 +799,15 @@ document.addEventListener('DOMContentLoaded', () => {
             const categories = await withLeftoverCounts(normalizeLeftoverCategories(data.categories));
             const names = categories.map((item) => item.name);
             select.innerHTML = '<option value="">None — new upload only</option>' +
+                '<option value="__all__">Upload clips + leftover clips</option>' +
                 categories.map((item) => (
                     `<option value="${escapeHtml(item.name)}">${escapeHtml(item.name)} — ${leftoverClipLabel(item.count)}</option>`
                 )).join('');
-            select.value = names.includes(current) ? current : '';
+            select.value = (current === '__all__' || names.includes(current)) ? current : '';
             rebuildThemedSelect(select);
         } catch (error) {
-            select.innerHTML = '<option value="">None — new upload only</option>';
+            select.innerHTML = '<option value="">None — new upload only</option>' +
+                '<option value="__all__">Upload clips + leftover clips</option>';
             rebuildThemedSelect(select);
         }
         await refreshLeftoverSidebar();
@@ -817,17 +819,21 @@ document.addEventListener('DOMContentLoaded', () => {
         const title = document.getElementById('leftover-sidebar-title');
         if (!aside || !list) return;
         const category = document.getElementById('leftover-category')?.value || '';
-        const show = getSelectedSource() === 'local' && !!category;
+        const show = getSelectedSource() === 'local' && !!category && category !== '__all__';
         if (!show) {
             aside.classList.add('hidden');
             list.innerHTML = '';
             return;
         }
-        if (title) title.textContent = category;
+        if (title) title.textContent = category === '__all__' ? 'All leftover clips' : category;
         try {
             const response = await fetch(`/api/local/clips?category=${encodeURIComponent(category)}`);
             const data = response.ok ? await response.json() : { clips: [] };
-            const clips = data.clips || [];
+            const currentUpload = getLocalCategory();
+            const clips = (data.clips || []).filter((clip) => {
+                const path = clip.path || '';
+                return !currentUpload || !path.startsWith(`${currentUpload}/`);
+            });
             if (!clips.length) {
                 aside.classList.add('hidden');
                 list.innerHTML = '';
@@ -870,10 +876,10 @@ document.addEventListener('DOMContentLoaded', () => {
         if (overlay) overlay.classList.add('hidden');
     }
 
-    async function leftoverClipPaths() {
-        const category = document.getElementById('leftover-category')?.value || '';
-        if (!category) return [];
-        const response = await fetch(`/api/local/clips?category=${encodeURIComponent(category)}`);
+    async function leftoverClipPaths(category) {
+        const name = category || document.getElementById('leftover-category')?.value || '';
+        if (!name) return [];
+        const response = await fetch(`/api/local/clips?category=${encodeURIComponent(name)}`);
         if (!response.ok) return [];
         const data = await response.json();
         return (data.clips || []).map((clip) => clip.path);
@@ -1364,11 +1370,28 @@ document.addEventListener('DOMContentLoaded', () => {
         return names;
     }
 
-    async function uploadLocalFiles() {
+    async function collectLocalJobFiles() {
         await uploadNewLocalFiles();
         if (!lastBatchFiles.length) await loadLocalClips();
-        const leftovers = await leftoverClipPaths();
-        return [...new Set(leftovers.concat(lastBatchFiles))];
+        const mode = document.getElementById('leftover-category')?.value || '';
+        const uploaded = lastBatchFiles.slice();
+        if (!mode) {
+            return { localFiles: uploaded, leftoverFiles: [], outputCategory: getLocalCategory() };
+        }
+        if (mode === '__all__') {
+            const all = await leftoverClipPaths('__all__');
+            const current = getLocalCategory();
+            const fill = all.filter((path) => !uploaded.includes(path) && (!current || !path.startsWith(`${current}/`)));
+            if (uploaded.length) {
+                return { localFiles: uploaded, leftoverFiles: fill, outputCategory: current };
+            }
+            return { localFiles: fill, leftoverFiles: [], outputCategory: '' };
+        }
+        return {
+            localFiles: await leftoverClipPaths(mode),
+            leftoverFiles: [],
+            outputCategory: mode,
+        };
     }
 
     scrapeBtn.addEventListener('click', async () => {
@@ -1442,9 +1465,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
         try {
             let localFiles = [];
+            let leftoverFiles = [];
+            let outputCategory = '';
             if (source === 'local') {
-                localFiles = await uploadLocalFiles();
-                if (localFiles.length === 0) {
+                const job = await collectLocalJobFiles();
+                localFiles = job.localFiles;
+                leftoverFiles = job.leftoverFiles;
+                outputCategory = job.outputCategory;
+                if (localFiles.length === 0 && leftoverFiles.length === 0) {
                     showToast('Upload clips or pick a leftover folder.', 'error');
                     setLoading(false);
                     return;
@@ -1474,13 +1502,12 @@ document.addEventListener('DOMContentLoaded', () => {
                     media_type: mediaType, count,
                     mode: currentMode, vibe,
                     provider_fallback: providerFallback,
-                    local_category: source === 'local'
-                        ? (getLocalCategory() || document.getElementById('leftover-category')?.value || '')
-                        : '',
+                    local_category: source === 'local' ? outputCategory : '',
                     target_duration: source === 'local' && document.getElementById('target-duration')?.value
                         ? numVal('target-duration', null)
                         : null,
                     local_files: localFiles,
+                    leftover_files: leftoverFiles,
                     video_settings: {
                         ratio, voice, subtitles, language,
                         tts_server: document.getElementById('tts-server')?.value || 'azure-tts-v1',

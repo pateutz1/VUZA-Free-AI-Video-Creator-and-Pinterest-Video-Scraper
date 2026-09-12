@@ -146,6 +146,7 @@ class ScrapeRequest(BaseModel):
     yt_upload: bool = False
     publish_confirmed: bool = False
     local_files: Optional[List[str]] = None
+    leftover_files: Optional[List[str]] = None
     local_category: Optional[str] = None
     target_duration: Optional[int] = None
     api_keys: Optional[ApiKeys] = None
@@ -210,6 +211,7 @@ ALLOWED_UPLOAD_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".m
 ALLOWED_VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm"}
 ALLOWED_MUSIC_SUFFIXES = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg"}
 UNCATEGORIZED_CATEGORY = "uncategorized"
+ALL_LEFTOVER_CATEGORY = "__all__"
 LOCAL_TARGET_MIN = 5
 LOCAL_TARGET_MAX = 600
 _VIRAL_SCORE_RE = re.compile(r"(?:^|_)(\d{1,3})_\d{3}_")
@@ -745,6 +747,9 @@ def create_auto_local_category(request: CategoryCreateRequest):
 
 @app.get("/api/local/clips")
 def list_local_clips(category: str = UNCATEGORIZED_CATEGORY):
+    raw = (category or "").strip()
+    if raw == ALL_LEFTOVER_CATEGORY:
+        return {"category": ALL_LEFTOVER_CATEGORY, "clips": leftover_clip_items()}
     category = sanitize_local_category(category)
     folder = UPLOAD_DIR if category == UNCATEGORIZED_CATEGORY else UPLOAD_DIR / category
     clips = []
@@ -896,18 +901,63 @@ def leftover_category_counts():
         items.append({"name": name, "count": count})
     return items
 
+def leftover_clip_items():
+    clips = []
+    for name in leftover_local_categories():
+        folder = UPLOAD_DIR / name
+        for path in sorted(folder.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in ALLOWED_UPLOAD_SUFFIXES:
+                continue
+            rel = f"{name}/{path.name}"
+            clips.append({
+                "path": rel,
+                "name": path.name,
+                "url": "/uploads/" + rel.replace("\\", "/"),
+                "score": parse_viral_score(path.name),
+                "duration": probe_local_clip_duration(path),
+            })
+    clips.sort(key=lambda item: (-item["score"], item["name"]))
+    return clips
+
 def move_local_clips_to_project(paths, project_name):
     dest_dir = DOWNLOAD_DIR / project_name / "video"
     dest_dir.mkdir(parents=True, exist_ok=True)
     moved = []
+    parents = []
     for raw in paths or []:
         src = Path(raw)
         if not src.is_file():
             continue
+        parents.append(src.parent)
         dest = unique_dest_path(dest_dir, src.name)
         shutil.move(str(src), str(dest))
         moved.append(str(dest))
+    remove_empty_upload_categories(parents)
     return moved
+
+def remove_empty_upload_categories(folders):
+    try:
+        upload_root = UPLOAD_DIR.resolve()
+    except OSError:
+        return
+    seen = set()
+    for folder in folders or []:
+        path = Path(folder)
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved in seen or resolved.parent != upload_root:
+            continue
+        if not _AUTO_CATEGORY_RE.match(resolved.name) or not resolved.is_dir():
+            continue
+        seen.add(resolved)
+        try:
+            if any(resolved.iterdir()):
+                continue
+            resolved.rmdir()
+        except OSError:
+            continue
 
 def local_upload_relpath(name):
     text = (name or "").strip().replace("\\", "/")
@@ -969,6 +1019,14 @@ def pack_local_files_for_target(paths, target):
         })
     selected, total = select_clips_for_duration(clips, target)
     return [clip["path"] for clip in selected], total
+
+def pack_local_files_priority(primary_paths, fill_paths, target):
+    picked, total = pack_local_files_for_target(primary_paths, target)
+    remaining = float(target or 0) - total
+    if remaining <= 1e-6 or not fill_paths:
+        return picked, total
+    extra, extra_total = pack_local_files_for_target(fill_paths, remaining)
+    return picked + extra, total + extra_total
 
 def make_scraper(src, output_dir, api_keys=None):
     keys = api_keys or ApiKeys()
@@ -1146,15 +1204,22 @@ def group_scenes_to_clip_budget(keyword_data, count, clip_duration):
     return grouped
 
 
-def resolved_local_files(request):
-    names = [name for name in (request.local_files or []) if (name or "").strip()]
+def resolve_upload_relpaths(names):
     resolved = []
-    for name in names:
+    for name in names or []:
+        if not (name or "").strip():
+            continue
         try:
             resolved.append(resolve_path_within_directory(str(UPLOAD_DIR), local_upload_relpath(name)))
         except ValueError:
             raise RuntimeError(f"Local upload is invalid or outside the uploads folder: {name}.")
     return resolved
+
+def resolved_local_files(request):
+    return resolve_upload_relpaths(request.local_files)
+
+def resolved_leftover_files(request):
+    return resolve_upload_relpaths(getattr(request, "leftover_files", None))
 
 _UNSET = object()
 
@@ -2626,14 +2691,22 @@ async def run_scrape(request: ScrapeRequest):
             scraping_status["message"] = "Done"
             if request.auto_video:
                 file_paths = [str(path) for path in valid_paths]
+                fill_paths = [str(path) for path in resolved_leftover_files(request)]
                 if request.target_duration:
-                    file_paths, packed_total = pack_local_files_for_target(file_paths, request.target_duration)
+                    if fill_paths:
+                        file_paths, packed_total = pack_local_files_priority(
+                            file_paths, fill_paths, request.target_duration
+                        )
+                    else:
+                        file_paths, packed_total = pack_local_files_for_target(file_paths, request.target_duration)
                     if not file_paths:
                         raise RuntimeError(
                             f"No checked clip is {request.target_duration}s or shorter. "
                             "Pick a longer target, or shorter clips."
                         )
                     print(f"  Local pack: {len(file_paths)} clip(s), {packed_total:.1f}s / {request.target_duration}s")
+                elif fill_paths:
+                    file_paths = file_paths + fill_paths
                 file_paths = move_local_clips_to_project(file_paths, project_name)
                 if not file_paths:
                     raise RuntimeError("Could not move the selected clips into the project video folder.")

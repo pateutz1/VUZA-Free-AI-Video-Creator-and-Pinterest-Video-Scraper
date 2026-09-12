@@ -1927,9 +1927,11 @@ body {
 .leftover-panel-body h3 {
     font-size: 0.72rem;
     font-weight: 700;
-    word-break: break-all;
     margin-bottom: 10px;
     color: var(--secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .leftover-clip-list {
@@ -1942,9 +1944,10 @@ body {
 
 .leftover-clip-btn {
     display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 2px;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
     width: 100%;
     text-align: left;
     padding: 8px 10px;
@@ -1960,14 +1963,20 @@ body {
 }
 
 .leftover-clip-name {
+    flex: 1;
+    min-width: 0;
     font-size: 0.68rem;
     font-weight: 600;
-    word-break: break-all;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .leftover-clip-meta {
-    font-size: 0.6rem;
-    color: var(--text-muted);
+    flex-shrink: 0;
+    font-size: 0.78rem;
+    font-weight: 800;
+    color: var(--secondary);
 }
 
 .leftover-empty {

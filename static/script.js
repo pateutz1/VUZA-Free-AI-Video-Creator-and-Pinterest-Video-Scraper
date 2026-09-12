@@ -720,25 +720,26 @@ document.addEventListener('DOMContentLoaded', () => {
         updateLocalLibraryVisibility();
     }
 
+    let currentLocalCategory = '';
+    localStorage.removeItem('vuza_local_category');
+
     function getLocalCategory() {
-        return localStorage.getItem('vuza_local_category') || '';
+        return currentLocalCategory;
     }
 
     function rememberLocalCategory(name) {
-        if (name) localStorage.setItem('vuza_local_category', name);
+        currentLocalCategory = name || '';
         const label = document.getElementById('local-batch-label');
-        if (label) label.textContent = name ? `This batch: ${name}` : '';
+        if (label) label.textContent = '';
     }
 
     function updateLocalLibraryVisibility() {
         const panel = document.getElementById('local-library');
-        if (!panel) return;
+        const stockQuery = document.getElementById('stock-query-block');
         const show = getSelectedSource() === 'local';
-        panel.classList.toggle('hidden', !show);
-        if (show) {
-            rememberLocalCategory(getLocalCategory());
-            loadLocalClips();
-        }
+        if (panel) panel.classList.toggle('hidden', !show);
+        if (stockQuery) stockQuery.classList.toggle('hidden', show);
+        if (show) loadLocalClips();
     }
 
     let lastBatchFiles = [];
@@ -760,8 +761,37 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('local-files')?.addEventListener('change', async () => {
         if (getSelectedSource() !== 'local') return;
         const uploaded = await uploadNewLocalFiles();
-        if (uploaded.length) await loadLocalClips();
+        if (uploaded.length) {
+            await loadLocalClips();
+            const label = document.getElementById('local-batch-label');
+            if (label) label.textContent = `${uploaded.length} clips uploaded`;
+        }
     });
+
+    document.getElementById('local-browse-btn')?.addEventListener('click', () => {
+        document.getElementById('local-files')?.click();
+    });
+    const dropzone = document.getElementById('local-dropzone');
+    if (dropzone) {
+        ['dragenter', 'dragover'].forEach((eventName) => {
+            dropzone.addEventListener(eventName, (event) => {
+                event.preventDefault();
+                dropzone.classList.add('is-dragover');
+            });
+        });
+        ['dragleave', 'drop'].forEach((eventName) => {
+            dropzone.addEventListener(eventName, (event) => {
+                event.preventDefault();
+                dropzone.classList.remove('is-dragover');
+            });
+        });
+        dropzone.addEventListener('drop', (event) => {
+            const input = document.getElementById('local-files');
+            if (!input || !event.dataTransfer?.files?.length) return;
+            input.files = event.dataTransfer.files;
+            input.dispatchEvent(new Event('change'));
+        });
+    }
 
     document.getElementById('source-select')?.addEventListener('change', onSourceOrAutoVideoChange);
     document.querySelectorAll('input[name="auto_video"]').forEach(input => {
@@ -882,6 +912,7 @@ document.addEventListener('DOMContentLoaded', () => {
             updateCaptionPositionUi();
             updateProviderFallbackVisibility();
             updatePrimaryButtonText();
+            updateLocalLibraryVisibility();
         } finally {
             restoringPanel = false;
         }
